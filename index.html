@@ -186,12 +186,61 @@ function fieldFactor(oaa, framingRuns) {
   return Math.max(0.90, Math.min(1.10, factor));
 }
 
+// All 30 parks. Factors are run-environment multipliers (1.00 = neutral),
+// consistent with the original seed values; new entries follow the same scale.
 const PARKS = {
-  "Neutral": 1.0, "Coors": 1.18, "Sutter Health": 1.11, "Wrigley": 1.04,
-  "Camden": 1.08, "Fenway": 1.05, "Great American": 1.06, "Citizens Bank": 1.06,
-  "Yankee": 1.03, "Angel Stadium": 0.98, "Petco": 0.95, "Oracle": 0.94,
-  "T-Mobile": 0.95, "Kauffman": 0.96, "Dodger": 0.98,
+  "Neutral": 1.0,
+  "Coors": 1.18, "Sutter Health": 1.11, "Camden": 1.08, "Great American": 1.06,
+  "Citizens Bank": 1.06, "Fenway": 1.05, "Wrigley": 1.04, "Chase": 1.04,
+  "Yankee": 1.03, "Rate Field": 1.03, "Truist": 1.02, "Rogers Centre": 1.02,
+  "American Family": 1.02, "Daikin": 1.01, "Nationals Park": 1.00, "Globe Life": 0.99,
+  "Target": 0.99, "Progressive": 0.99, "Angel Stadium": 0.98, "Dodger": 0.98,
+  "Citi": 0.97, "Comerica": 0.97, "Busch": 0.97, "loanDepot": 0.97,
+  "Steinbrenner": 0.97, "PNC": 0.96, "Kauffman": 0.96, "Petco": 0.95,
+  "T-Mobile": 0.95, "Oracle": 0.94,
 };
+
+// Home team -> park, so slate scans and Bet of the Day price the actual
+// building instead of assuming Neutral (which was the scan's main accuracy gap:
+// a Coors game and an Oracle game are ~24% apart in run environment).
+const TEAM_PARK = {
+  "Rockies": "Coors", "Athletics": "Sutter Health", "Orioles": "Camden",
+  "Reds": "Great American", "Phillies": "Citizens Bank", "Red Sox": "Fenway",
+  "Cubs": "Wrigley", "Diamondbacks": "Chase", "Yankees": "Yankee",
+  "White Sox": "Rate Field", "Braves": "Truist", "Blue Jays": "Rogers Centre",
+  "Brewers": "American Family", "Astros": "Daikin", "Nationals": "Nationals Park",
+  "Rangers": "Globe Life", "Twins": "Target", "Guardians": "Progressive",
+  "Angels": "Angel Stadium", "Dodgers": "Dodger", "Mets": "Citi",
+  "Tigers": "Comerica", "Cardinals": "Busch", "Marlins": "loanDepot",
+  "Rays": "Steinbrenner", "Pirates": "PNC", "Royals": "Kauffman",
+  "Padres": "Petco", "Mariners": "T-Mobile", "Giants": "Oracle",
+};
+// Baseball runs on Eastern time: a 10:15pm ET first pitch on the west coast is
+// still THAT day's slate, and MLB's own schedule API buckets by ET. The app used
+// UTC, which rolled the day over at 8pm ET — the slate vanished exactly during
+// prime time, and late games got filed under tomorrow. Everything day-shaped
+// now goes through here.
+function etDayKey(d = new Date()) {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit" }).format(d);
+}
+
+// Age of a stamp in whole days; null if never stamped.
+function daysOld(iso) {
+  if (!iso) return null;
+  const d = Math.floor((Date.now() - new Date(iso + "T12:00:00Z").getTime()) / 86400000);
+  return d < 0 ? 0 : d;
+}
+
+function parkForTeam(teamName) {
+  // Whole-word match: every word of the mapped name must appear in the given
+  // name. Keeps "SF Giants" -> Oracle while making "Red Sox"/"White Sox"
+  // impossible to cross-wire. Unknown names fall back to Neutral.
+  const tw = normName(teamName).split(" ");
+  for (const [team, park] of Object.entries(TEAM_PARK)) {
+    if (normName(team).split(" ").every((w) => tw.includes(w))) return park;
+  }
+  return "Neutral";
+}
 
 // ---------------------------------------------------------------------------
 // math helpers
@@ -954,7 +1003,11 @@ function consensusFromOddsApi(events) {
     const modal = +Object.entries(counts).sort((a, b) => b[1] - a[1])[0][0];
     const at = quotes.filter((q) => q.point === modal);
     const med = (arr) => { const x = [...arr].sort((a, b) => a - b); return x[Math.floor(x.length / 2)]; };
-    out.push({ away: ev.away_team, home: ev.home_team, line: modal, over: med(at.map((q) => q.over)), under: med(at.map((q) => q.under)), books: quotes.length, awayP: "", homeP: "" });
+    // Each event carries its own first pitch. The feed returns every upcoming
+    // game with a line — tonight's AND tomorrow's — so a game must be filed
+    // under ITS day, not the day you happened to pull.
+    out.push({ away: ev.away_team, home: ev.home_team, line: modal, over: med(at.map((q) => q.over)), under: med(at.map((q) => q.under)), books: quotes.length, awayP: "", homeP: "",
+      date: ev.commence_time ? etDayKey(new Date(ev.commence_time)) : null, start: ev.commence_time || null });
   }
   return out;
 }
@@ -1040,6 +1093,12 @@ function App() {
 // ===========================================================================
 const CHANGELOG = [
   { date: "2026-07-16", items: [
+    "FIXED (serious): the app derived 'today' in UTC, so after 8pm ET it believed it was tomorrow — the slate would vanish during prime time and late west-coast games were filed under the wrong day. Every date now uses Eastern time, the same convention MLB schedules by.",
+    "A live pull now files each game under ITS OWN date. The odds feed returns tomorrow's lines too; they used to be dumped onto today's board. One pull can now seed several boards at once — and tomorrow's opener is recorded the moment it appears, which is what makes line movement measurable.",
+    "All 30 ballparks added with run-environment factors; slate scans and Bet of the Day now price the home team's actual park instead of assuming Neutral — the scan's biggest accuracy gap, closed.",
+    "Stats pastes are now detected FIRST (by their header row) and can no longer be misread as an odds line.",
+    "Pasted stats auto-apply to each player's own team and report exactly who was touched (e.g. Mets (2), Blue Jays (1)).",
+    "Every import is date-stamped. The Data Scout now flags 14-day form older than a week — stale 'recent' form misleads more than none, because the engine deliberately trusts it more.",
     "Backup & restore: one tap exports the ledger, slate archive, teams, and Brain history to a file (API keys deliberately excluded); restore re-imports it.",
     "Stats import added to the Database tab — paste or drop Savant CSVs (season or 14-day) without leaving the research view.",
     "This journal added to the home page.",
@@ -1108,7 +1167,7 @@ function Backup() {
     const blob = new Blob([JSON.stringify(payload)], { type: "application/json" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
-    a.download = `ingenuity-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    a.download = `ingenuity-backup-${etDayKey()}.json`;
     document.body.appendChild(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(a.href), 5000);
     const n = Object.keys(payload.data).length;
@@ -1212,7 +1271,7 @@ function Terminal({ onHome }) {
     (async () => {
       if (!away.name || !home.name) return;
       const day = await store.get("ingenuity:slate:day", null);
-      if (!day || day.date !== new Date().toISOString().slice(0, 10)) return;
+      if (!day || day.date !== etDayKey()) return;
       const match = (slateName, dbName) => {
         const a = normName(slateName), b = normName(dbName);
         return a && b && (a.includes(b) || b.includes(a));
@@ -1325,7 +1384,7 @@ function Terminal({ onHome }) {
       : `${side} ${(Math.max(pW, 1 - pW) * 100).toFixed(1)}%`;
     const g = {
       id: Date.now(),
-      date: new Date().toISOString().slice(0, 10),
+      date: etDayKey(),
       matchup: `${r.awayName} @ ${r.homeName}`,
       park: r.park,
       model: Math.round(r.mean * 100) / 100,
@@ -1630,8 +1689,7 @@ function Database({ teams, saveTeams, loaded }) {
 // LINEUP FETCHER — MLB Stats API (free, no key)
 // ---------------------------------------------------------------------------
 function yesterdayISO() {
-  const d = new Date(Date.now() - 24 * 3600 * 1000);
-  return d.toISOString().slice(0, 10);
+  return etDayKey(new Date(Date.now() - 24 * 3600 * 1000));
 }
 // quick wOBA proxy when only OBP/SLG are available (MLB API doesn't publish wOBA)
 function estWoba(obp, slg) {
@@ -2203,7 +2261,7 @@ function Ledger({ onHome }) {
       : betForm.result === "L" ? -stake
       : 0; // push or pending
     const bet = {
-      date: betForm.date || new Date().toISOString().slice(0, 10),
+      date: betForm.date || etDayKey(),
       loggedAt: Date.now(), // when YOU entered it — lets the ledger surface your own entries
       src: "manual",
       desc, type: betForm.type,
@@ -2432,7 +2490,7 @@ function Ledger({ onHome }) {
           </div>
 
           <div className="lg-form">
-            <F l="Date" v={betForm.date} on={(v) => setBetForm({ ...betForm, date: v })} ph={new Date().toISOString().slice(0, 10)} />
+            <F l="Date" v={betForm.date} on={(v) => setBetForm({ ...betForm, date: v })} ph={etDayKey()} />
             <F l={betForm.type === "parlay" ? "Parlay label (optional)" : "Bet description"}
                v={betForm.desc} on={(v) => setBetForm({ ...betForm, desc: v })}
                ph={betForm.type === "parlay" ? "Tuesday 3-leg" : "CHC/BAL Under 9.5"} />
@@ -2686,9 +2744,11 @@ function applyStatRows(rows, teams, mode = "season") {
         recent: paSum ? (wSum / paSum).toFixed(3) : t.recent,
         recentPA: paSum ? String(Math.round(paSum)) : t.recentPA,
         recentBbk: bbkPA ? (bbkSum / bbkPA).toFixed(1) : t.recentBbk,
+        recentAsOf: etDayKey(),
       };
     });
-    return { next: nextR, hitters: matched, pitchers: 0, mode: "recent" };
+    const teamsTouched = nextR.filter((t, i2) => t !== teams[i2]).map((t) => ({ name: t.name, n: 0 })).sort();
+    return { next: nextR, hitters: matched, pitchers: 0, mode: "recent", teamsTouched };
   }
 
   let hitters = 0, pitchers = 0;
@@ -2746,9 +2806,22 @@ function applyStatRows(rows, teams, mode = "season") {
       pen: penB ? (penW / penB).toFixed(3) : t.pen, penBf: penB ? String(Math.round(penB)) : t.penBf,
       penBarrel: cqB ? (barrelW / cqB).toFixed(1) : t.penBarrel,
       penHardHit: cqB ? (hardHitW / cqB).toFixed(1) : t.penHardHit,
+      statsAsOf: etDayKey(),
     };
   });
-  return { next, hitters, pitchers };
+  // Which teams did the players in this paste belong to? Each player updates
+  // his OWN team — paste Lindor, Soto, and Bichette together and the Mets get
+  // two, the Blue Jays one. No single-team guessing.
+  const teamsTouched = [];
+  next.forEach((t, i2) => {
+    if (t === teams[i2]) return;
+    let cnt = 0;
+    (t.players || []).forEach((pl, j) => { if (pl !== (teams[i2].players || [])[j]) cnt++; });
+    (t.rotation || []).forEach((pt, j) => { if (pt !== (teams[i2].rotation || [])[j]) cnt++; });
+    teamsTouched.push({ name: t.name, n: cnt });
+  });
+  teamsTouched.sort((a, b) => b.n - a.n);
+  return { next, hitters, pitchers, teamsTouched };
 }
 
 function savantCsvToRows(csv) {
@@ -2790,15 +2863,18 @@ function SmartImport({ teams, saveTeams, onGameLine }) {
   const [inputKey, setInputKey] = useState(0); // remount the file input to truly clear it
 
   const applyRows = async (rows, label) => {
-    const { next, hitters, pitchers } = applyStatRows(rows, teams, timeframe);
+    const { next, hitters, pitchers, teamsTouched } = applyStatRows(rows, teams, timeframe);
     await saveTeams(next);
+    const teamList = (teamsTouched || []).slice(0, 6).map((t) => t.n ? `${t.name} (${t.n})` : t.name).join(", ")
+      + ((teamsTouched || []).length > 6 ? ` +${teamsTouched.length - 6} more` : "");
     if (timeframe === "recent") {
-      const touched = next.filter((t, i) => t !== teams[i]).length;
-      setMsg(hitters || touched
-        ? `${label}: read as LAST-14-DAY form — ${hitters} hitters matched across ${touched} team${touched === 1 ? "" : "s"}. Season numbers untouched; this fills recent wOBA and BB%−K% only.`
+      setMsg(hitters || (teamsTouched || []).length
+        ? `${label}: read as LAST-14-DAY form — ${hitters} hitters recognized, applied to ${teamsTouched.length} team${teamsTouched.length === 1 ? "" : "s"}: ${teamList}. Season numbers untouched.`
         : `${label}: no players matched your rosters, so no recent form was set. Load lineups first, or switch to Season.`);
     } else {
-      setMsg(`${label}: updated ${hitters} hitters and ${pitchers} pitchers. Team wOBA and bullpens recomputed — the next projection uses the new numbers.`);
+      setMsg((teamsTouched || []).length
+        ? `${label}: ${hitters} hitters and ${pitchers} pitchers recognized and applied to ${teamsTouched.length} team${teamsTouched.length === 1 ? "" : "s"}: ${teamList}. Team wOBA, bullpens, and freshness stamps updated.`
+        : `${label}: parsed, but no players matched your rosters — check name spellings against the Database tab.`);
     }
   };
 
@@ -2860,9 +2936,26 @@ If none of these: {"kind":"unknown"}` },
     setBusy(false);
   };
 
+  // Does this paste look like player statistics rather than a game/odds line?
+  // Stat exports lead with a header row naming stat columns. Checking this FIRST
+  // fixes the old routing bug where a stats paste got fed to the odds parser and
+  // came back "not a game line".
+  const looksLikeStats = (t) => {
+    const head = (t.split("\n")[0] || "").toLowerCase();
+    return ["woba", "est_woba", "xwoba", "era", "xera", "bb_percent", "k_percent", "barrel", "hard_hit", "last_name"].some((h) => head.includes(h));
+  };
+
   const handleText = async () => {
     setBusy(true); setMsg("");
     try {
+      // Player stats first — a stats paste must never be read as odds.
+      if (looksLikeStats(text)) {
+        const { rows, headers } = savantCsvToRows(text);
+        if (rows) { await applyRows(rows, `Stats parsed (${rows.length} players)`); setText(""); logInterp("csv-paste", true, rows.length + " rows"); }
+        else { setMsg(`That looks like a stats table but no usable columns were found. Include the header row (woba / est_woba, era / xera, bb_percent, k_percent). Headers found: ${headers.slice(0, 6).join(", ") || "none"}.`); logInterp("csv-paste", false, "stat header, no columns"); }
+        setBusy(false);
+        return;
+      }
       // A game line (has "@" or "at" plus a total) auto-fills the projection.
       const short = parseShorthand(text, teams);
       const slateParsed = short ? [short] : parseSlateText(text).games.filter((g) => g.away && g.home);
@@ -3107,7 +3200,7 @@ function BoardChart({ games, rows, onPick }) {
 const SLATE_ARCHIVE_DAYS = 90; // keep a season's worth of boards; a day is ~3KB
 
 function SlateHub() {
-  const todayKey = new Date().toISOString().slice(0, 10);
+  const todayKey = etDayKey();
   const [slate, setSlate] = useState(null); // { date, games: [{away, home, awayP, homeP, line, over, under, openLine.., proj?}] }
   const [viewDate, setViewDate] = useState(todayKey); // the day the whole board is focused on
   const [archDates, setArchDates] = useState([]);
@@ -3200,7 +3293,7 @@ function SlateHub() {
       } else {
         const fresh = has(o.line);
         games.push({ away: o.away, home: o.home, awayP: o.awayP || "", homeP: o.homeP || "",
-          line: o.line, over: o.over, under: o.under,
+          line: o.line, over: o.over, under: o.under, start: o.start || null,
           openLine: fresh ? o.line : "", openOver: fresh ? o.over : "", openUnder: fresh ? o.under : "",
           openTs: fresh ? stamp : "", lastTs: stamp });
       }
@@ -3324,9 +3417,24 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
       const parsed = consensusFromOddsApi(events);
       if (!parsed.length) { setMsg("The feed returned no MLB totals right now (off-day or all games started)."); }
       else {
-        await saveSlate(mergeOdds(slate, parsed));
+        // Bucket by each game's own ET date. One pull can seed several boards —
+        // tomorrow's lines land on tomorrow's board with their opener recorded,
+        // which is exactly what makes line movement measurable later.
+        const byDay = {};
+        for (const g of parsed) { const d = g.date || todayKey; (byDay[d] = byDay[d] || []).push(g); }
+        const arch = await store.get("ingenuity:slate:archive", {});
+        const days = Object.keys(byDay).sort();
+        for (const d of days) {
+          const base = d === (slate?.date) ? slate : (arch[d] || null);
+          await saveSlate(mergeOdds(base, byDay[d], d));
+        }
+        // leave the user looking at the day they were already on
+        const back = arch[viewDate] || (viewDate === todayKey ? null : null);
+        const fresh = await store.get("ingenuity:slate:archive", {});
+        if (fresh[viewDate]) setSlate(fresh[viewDate]);
         const remaining = r.headers.get("x-requests-remaining");
-        setMsg(`Live market pulled: ${parsed.length} games, consensus across up to ${Math.max(...parsed.map((g) => g.books))} books.${remaining ? ` ${remaining} API requests left this month.` : ""} Fetch matchups (step 1) to attach probable pitchers.`);
+        const spread = days.map((d) => `${byDay[d].length} on ${d}${d === todayKey ? " (today)" : ""}`).join(", ");
+        setMsg(`Live market pulled: ${parsed.length} game${parsed.length === 1 ? "" : "s"} across ${days.length} day${days.length === 1 ? "" : "s"} — ${spread}. Each is saved to its own board.${remaining ? ` ${remaining} API requests left this month.` : ""} Fetch matchups (step 1) to attach probable pitchers.`);
       }
     } catch (e) { setMsg(`Live pull failed: ${e.message}`); }
     setBusy("");
@@ -3369,8 +3477,9 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
         continue;
       }
       const over = parseFloat(g.over) || -110, under = parseFloat(g.under) || -110;
+      const homePark = parkForTeam(H.name);
       const r = projectGame({
-        park: "Neutral", line, temp: null, windOut: null,
+        park: homePark, line, temp: null, windOut: null,
         awayOff: a.off, awayXoff: a.xoff, awayPA: a.pa, awayRecent: a.recent, awayRecentPA: a.recentPA, awayRecentBbk: a.recentBbk, awaySP: a.sp, awaySPbf: a.spBf, awaySPip: a.spIp, awaySPera: a.spEra, awayPen: a.pen, awayPenBf: a.penBf, awayPenBarrel: a.penBarrel, awayPenHardHit: a.penHardHit, awayOAA: a.oaa, awayFraming: a.framing,
         homeOff: h.off, homeXoff: h.xoff, homePA: h.pa, homeRecent: h.recent, homeRecentPA: h.recentPA, homeRecentBbk: h.recentBbk, homeSP: h.sp, homeSPbf: h.spBf, homeSPip: h.spIp, homeSPera: h.spEra, homePen: h.pen, homePenBf: h.penBf, homePenBarrel: h.penBarrel, homePenHardHit: h.penHardHit, homeOAA: h.oaa, homeFraming: h.framing,
       }, 8000);
@@ -3668,7 +3777,7 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
 // that exact shape have actually returned.
 // ===========================================================================
 function BetOfTheDay() {
-  const todayKey = new Date().toISOString().slice(0, 10);
+  const todayKey = etDayKey();
   const [slate, setSlate] = useState(null);
   const [teams, setTeams] = useState([]);
   const [botd, setBotd] = useState(null); // { date, ts, scanned, pick|null, patternPick }
@@ -3729,7 +3838,7 @@ function BetOfTheDay() {
       }
       const line = parseFloat(g.line), over = parseFloat(g.over) || -110, under = parseFloat(g.under) || -110;
       const r = projectGame({
-        park: "Neutral", line, temp: null, windOut: null,
+        park: parkForTeam(H.name), line, temp: null, windOut: null,
         awayOff: a.off, awayXoff: a.xoff, awayPA: a.pa, awayRecent: a.recent, awayRecentPA: a.recentPA, awayRecentBbk: a.recentBbk, awaySP: a.sp, awaySPbf: a.spBf, awaySPip: a.spIp, awaySPera: a.spEra, awayPen: a.pen, awayPenBf: a.penBf, awayPenBarrel: a.penBarrel, awayPenHardHit: a.penHardHit, awayOAA: a.oaa, awayFraming: a.framing,
         homeOff: h.off, homeXoff: h.xoff, homePA: h.pa, homeRecent: h.recent, homeRecentPA: h.recentPA, homeRecentBbk: h.recentBbk, homeSP: h.sp, homeSPbf: h.spBf, homeSPip: h.spIp, homeSPera: h.spEra, homePen: h.pen, homePenBf: h.penBf, homePenBarrel: h.penBarrel, homePenHardHit: h.penHardHit, homeOAA: h.oaa, homeFraming: h.framing,
       }, 8000);
@@ -3980,6 +4089,8 @@ function Brain({ onHome }) {
   const [log, setLog] = useState([]);
   const [games, setGames] = useState([]);
   const [teamsMissing, setTeamsMissing] = useState(0);
+  const [staleRecent, setStaleRecent] = useState(0);
+  const [seasonAge, setSeasonAge] = useState(null);
   const [slateScan, setSlateScan] = useState(null);
   const [interpLog, setInterpLog] = useState([]);
   const [aiBusy, setAiBusy] = useState(false);
@@ -4007,6 +4118,10 @@ function Brain({ onHome }) {
         if (total > 0 && done / total < 0.5) thin++;
       }
       setTeamsMissing(teams.length ? thin : 0);
+      // staleness: 14-day form older than a week misleads; season stats age slowly
+      setStaleRecent(teams.filter((t) => (t.recent || t.recentBbk) && (daysOld(t.recentAsOf) == null || daysOld(t.recentAsOf) > 7)).length);
+      const ages = teams.map((t) => daysOld(t.statsAsOf)).filter((d) => d != null);
+      setSeasonAge(ages.length ? Math.min(...ages) : null);
       setSlateScan(await store.get("ingenuity:brain:slateScan", null));
       setInterpLog(await store.get("ingenuity:brain:interpLog", []));
       // persist the imported history + profile for recollection by any module
@@ -4103,11 +4218,15 @@ Respond ONLY with JSON, no markdown fences, exactly this shape:
     },
     {
       id: "scout", glyph: "\u25C8", name: "Data Scout", role: "Watches roster & stat freshness",
-      tone: teamsMissing > 6 ? "alert" : teamsMissing > 0 ? "warn" : "ok",
-      status: teamsMissing > 6 ? "stale" : teamsMissing > 0 ? "partial" : "fresh",
-      read: teamsMissing > 0
-        ? `${teamsMissing} of 30 teams have under half their roster's stats filled. Pull fresh CSVs and paste them in the Terminal, Lineups tab; the Scout flags which teams are thin.`
-        : `All 30 rosters carry stats. Seed version ${CFG.SEED_VERSION} loaded. Refresh from Baseball Savant when the season number moves.`,
+      tone: teamsMissing > 6 || staleRecent > 6 ? "alert" : teamsMissing > 0 || staleRecent > 0 || seasonAge > 21 ? "warn" : "ok",
+      status: teamsMissing > 6 || staleRecent > 6 ? "stale" : teamsMissing > 0 || staleRecent > 0 ? "partial" : "fresh",
+      read: staleRecent > 0
+        ? `${staleRecent} team${staleRecent === 1 ? "'s" : "s'"} 14-day form is over a week old — a "recent" window that already closed. The engine trusts recent form MORE than season stats by design, so stale form misleads harder than no form. Re-import a fresh 14-day CSV or clear it.`
+        : teamsMissing > 0
+          ? `${teamsMissing} of 30 teams have under half their roster's stats filled. Pull fresh CSVs and paste them in the Terminal, Lineups tab; the Scout flags which teams are thin.`
+          : seasonAge != null && seasonAge > 21
+            ? `Season stats haven't been refreshed in ${seasonAge} days. They drift slowly, but a refresh from Savant is due.`
+            : `All 30 rosters carry stats${seasonAge != null ? `, refreshed ${seasonAge === 0 ? "today" : seasonAge + "d ago"}` : ""}. Recent form is either fresh or absent — nothing stale is steering the model.`,
     },
     {
       id: "risk", glyph: "\u25B2", name: "Risk Warden", role: "Guards against your own patterns",
