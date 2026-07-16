@@ -1093,6 +1093,7 @@ function App() {
 // ===========================================================================
 const CHANGELOG = [
   { date: "2026-07-16", items: [
+    "FIXED (dangerous): the odds feed also serves IN-PLAY games, and the app didn't check. A live total on a game already underway (e.g. 5.5 with four innings left) would overwrite the stored pregame line, and the 9-inning model would then 'find' a huge fake edge against it — and could crown it Bet of the Day. Pulls now request pre-match games only, started games freeze at their last pregame number, and both the scanner and Bet of the Day refuse anything past first pitch.",
     "FIXED (serious): the app derived 'today' in UTC, so after 8pm ET it believed it was tomorrow — the slate would vanish during prime time and late west-coast games were filed under the wrong day. Every date now uses Eastern time, the same convention MLB schedules by.",
     "A live pull now files each game under ITS OWN date. The odds feed returns tomorrow's lines too; they used to be dumped onto today's board. One pull can now seed several boards at once — and tomorrow's opener is recorded the moment it appears, which is what makes line movement measurable.",
     "All 30 ballparks added with run-environment factors; slate scans and Bet of the Day now price the home team's actual park instead of assuming Neutral — the scan's biggest accuracy gap, closed.",
@@ -3271,6 +3272,10 @@ function SlateHub() {
     const games = cur ? [...cur.games] : [];
     const stamp = new Date().toISOString().slice(11, 16);
     const has = (v) => v !== "" && v != null && !isNaN(parseFloat(v));
+    // First pitch passed = anything the market says now is a LIVE number.
+    // Belt and braces alongside commenceTimeFrom: freeze started games at their
+    // last pregame line rather than letting a live total masquerade as one.
+    const started = (iso) => (iso ? new Date(iso).getTime() <= Date.now() : false);
     for (const o of parsed) {
       if (o.err) continue;
       const gi = games.findIndex((g) => {
@@ -3279,6 +3284,11 @@ function SlateHub() {
       });
       if (gi >= 0) {
         const g0 = games[gi];
+        if (started(g0.start || o.start)) {
+          // underway: keep the pregame number exactly as it was
+          games[gi] = { ...g0, inPlay: true, start: g0.start || o.start || null, awayP: o.awayP || g0.awayP, homeP: o.homeP || g0.homeP };
+          continue;
+        }
         const line = has(o.line) ? o.line : g0.line;
         const over = has(o.over) ? o.over : g0.over;
         const under = has(o.under) ? o.under : g0.under;
@@ -3291,6 +3301,10 @@ function SlateHub() {
           openTs: openingNow ? stamp : g0.openTs,
           lastTs: stamp };
       } else {
+        // A game we've never seen that has ALREADY started can only give us a
+        // live line. There's no pregame number to recover, and a pregame model
+        // can't research a game in progress — leave it off the board entirely.
+        if (started(o.start)) continue;
         const fresh = has(o.line);
         games.push({ away: o.away, home: o.home, awayP: o.awayP || "", homeP: o.homeP || "",
           line: o.line, over: o.over, under: o.under, start: o.start || null,
@@ -3406,7 +3420,13 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
       await store.set("ingenuity:oddsapi:key", key);
       let r;
       try {
-        r = await fetch(`https://api.the-odds-api.com/v4/sports/baseball_mlb/odds?regions=us&markets=totals&oddsFormat=american&apiKey=${encodeURIComponent(key)}`);
+        // commenceTimeFrom=now → pre-match games only. The feed also serves
+        // IN-PLAY odds, and a live total (e.g. 5.5 with four innings left) is a
+        // different animal from a pregame total. Letting one in would make the
+        // 9-inning model "find" a huge edge against a number that isn't
+        // describing a 9-inning game.
+        const fromNow = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+        r = await fetch(`https://api.the-odds-api.com/v4/sports/baseball_mlb/odds?regions=us&markets=totals&oddsFormat=american&commenceTimeFrom=${fromNow}&apiKey=${encodeURIComponent(key)}`);
       } catch (netErr) {
         throw new Error("Network error reaching the-odds-api.com — check your connection and try again. The paste box below always works as a fallback.");
       }
@@ -3470,6 +3490,10 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
       if (isNaN(line)) { out.push({ ...g, status: "skip", err: "no total set" }); continue; }
       const A = matchTeamDb(g.away, teams), H = matchTeamDb(g.home, teams);
       if (!A || !H) { out.push({ ...g, status: "skip", err: `no DB match for ${!A ? g.away : g.home}` }); continue; }
+      if (g.inPlay || (g.start && new Date(g.start).getTime() <= Date.now())) {
+        out.push({ ...g, status: "skip", err: "first pitch has passed — this model prices 9 innings, not a game in progress" });
+        continue;
+      }
       const a = buildSide(A, g.awayP), h = buildSide(H, g.homeP);
       if (!a.resolved || !h.resolved) {
         const why = (!g.awayP || !g.homeP) ? "probable starter not posted" : "starter not in your database";
@@ -3730,6 +3754,9 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
                   <div className="sg-teams">
                     <span className="sg-match">{g.away} @ {g.home}</span>
                     <span className="sg-pitchers">{g.awayP || "TBD"} vs {g.homeP || "TBD"}</span>
+                    {(g.inPlay || (g.start && new Date(g.start).getTime() <= Date.now())) && (
+                      <span className="sg-inplay">● in play · line frozen at last pregame number</span>
+                    )}
                     {g.openLine !== "" && g.openLine != null && g.line !== "" && parseFloat(g.openLine) !== parseFloat(g.line) && (
                       <span className={"sg-move " + (parseFloat(g.line) > parseFloat(g.openLine) ? "up" : "down")}>
                         opened {g.openLine} → {g.line} {parseFloat(g.line) > parseFloat(g.openLine) ? "▲" : "▼"}
@@ -3829,6 +3856,7 @@ function BetOfTheDay() {
         }
         return { off: num(t.off) ?? CFG.LEAGUE_WOBA, xoff: num(t.xoff), pa: num(t.pa) ?? 600, recent: num(t.recent), recentPA: num(t.recentPA), recentBbk: num(t.recentBbk), sp, spBf, spIp, spEra, pen: num(t.pen) ?? 0.318, penBf: num(t.penBf) ?? 800, penBarrel: num(t.penBarrel), penHardHit: num(t.penHardHit), oaa: num(t.oaa), framing: num(t.framing), resolved };
       };
+      if (g.inPlay || (g.start && new Date(g.start).getTime() <= Date.now())) continue; // underway — not a pregame question
       const a = side(A, g.awayP), h = side(H, g.homeP);
       // A "bet of the day" built on a guessed starter is a made-up number wearing
       // a confidence score. Sit the game out and say so.
@@ -4809,6 +4837,7 @@ const CSS = `
 .slate-research { background: rgba(95,217,232,0.07); border: 1px solid var(--line); border-left: 3px solid var(--cyan); border-radius: 9px; padding: 11px 14px; font-size: 12.5px; color: var(--ink-dim); line-height: 1.55; margin-bottom: 12px; }
 .slate-research strong { color: var(--cyan); }
 .slate-chip.move { background: rgba(245,196,81,0.12); color: var(--amber); }
+.sg-inplay { display: block; font-size: 10.5px; color: var(--rust); margin-top: 3px; font-weight: 500; }
 .sg-move { font-size: 11px; margin-top: 3px; }
 .sg-move.up { color: var(--amber); }
 .sg-move.down { color: var(--cyan); }
