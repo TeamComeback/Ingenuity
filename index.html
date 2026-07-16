@@ -75,6 +75,22 @@ const DEFAULT_CFG = {
   ERA_TO_RA: 1.08, // earned → total runs allowed
   CALIBRATION_OFFSET: 0, // brain-tunable: runs added/removed from every projected total
   SEED_VERSION: 3, // bump when seeded stats are refreshed
+
+  // v1.4 — deeper-stat pass: xwOBA offense gap, stabilization-aware recency,
+  // bullpen contact quality, defense, framing. Same "process stat first,
+  // results stat as the check" philosophy as the existing pitcher blend.
+  OFFENSE_XWOBA_WEIGHT: 0.55, // team xwOBA vs actual wOBA (offense true-talent)
+  LEAGUE_BBK: -13.0,          // league-average BB% − K% (plate discipline)
+  BBK_TO_WOBA_SCALE: 0.0035,  // wOBA pts per 1-pt BB%-K% deviation from league
+  RECENT_PROCESS_WEIGHT: 0.5, // weight on recent BB%-K% (stabilizes ~60 PA — trustworthy fast)
+  RECENT_RESULT_WEIGHT: 0.2,  // weight on recent raw wOBA (needs 200+ PA — still noisy at 14d)
+  LEAGUE_BARREL: 8.0,         // league-average barrel% allowed
+  LEAGUE_HARDHIT: 35.0,       // league-average hard-hit% allowed
+  BARREL_TO_WOBA_SCALE: 0.010,   // wOBA pts per 1-pt barrel% deviation
+  HARDHIT_TO_WOBA_SCALE: 0.004,  // wOBA pts per 1-pt hard-hit% deviation
+  PEN_CONTACT_WEIGHT: 0.4,    // bullpen: barrel/hard-hit-derived quality vs raw xwOBA
+  DEFENSE_OAA_SCALE: 0.0025,  // fractional runs shift per team OAA
+  FRAMING_FACTOR_SCALE: 0.0015, // fractional runs shift per catcher framing run
 };
 
 // Live config = defaults + brain overrides (persisted, human-approved).
@@ -89,6 +105,9 @@ const BRAIN_TUNABLES = {
   WEATHER_MAX_BOOST:    { min: 0,    max: 0.15, desc: "Cap on temp+wind run boost" },
   PITCHER_XWOBA_WEIGHT: { min: 0.3,  max: 1.0,  desc: "xwOBA vs ERA-equivalent in pitcher rating" },
   CALIBRATION_OFFSET:   { min: -1.5, max: 1.5,  desc: "Global runs bias correction on totals" },
+  OFFENSE_XWOBA_WEIGHT: { min: 0.2,  max: 1.0,  desc: "xwOBA vs actual wOBA in offense true-talent" },
+  PEN_CONTACT_WEIGHT:   { min: 0,    max: 0.8,  desc: "Barrel/hard-hit vs xwOBA in bullpen rating" },
+  DEFENSE_OAA_SCALE:    { min: 0,    max: 0.006, desc: "Runs impact per team OAA" },
 };
 
 function applyBrainParams(overrides) {
@@ -119,6 +138,54 @@ function effectivePitcherWoba(xwoba, era) {
   return CFG.PITCHER_XWOBA_WEIGHT * x + (1 - CFG.PITCHER_XWOBA_WEIGHT) * eW;
 }
 
+// Offense true-talent estimate: blend actual wOBA with xwOBA, same "process
+// first, results as the check" logic as the pitcher side. xwOBA isolates
+// contact quality from sequencing/luck (BABIP, clutch) — the regression
+// candidates (over/under their record) show up in this gap.
+function effectiveOffenseWoba(off, xoff) {
+  const o = parseFloat(off), x = parseFloat(xoff);
+  if (isNaN(x)) return isNaN(o) ? CFG.LEAGUE_WOBA : o;
+  if (isNaN(o)) return x;
+  return CFG.OFFENSE_XWOBA_WEIGHT * x + (1 - CFG.OFFENSE_XWOBA_WEIGHT) * o;
+}
+
+// BB%−K% (plate discipline) → wOBA-equivalent. Stabilizes far faster (~60 PA)
+// than wOBA itself (~200+ PA), so it's the trustworthy part of a 14-day window.
+function bbkToWoba(bbk) {
+  const b = parseFloat(bbk);
+  if (isNaN(b)) return null;
+  return CFG.LEAGUE_WOBA + CFG.BBK_TO_WOBA_SCALE * (b - CFG.LEAGUE_BBK);
+}
+
+// Bullpen batted-ball-quality proxy from barrel%/hard-hit% allowed — the
+// fastest-reacting signal to bullpen fatigue, ahead of xwOBA itself updating.
+function contactQualityToWoba(barrel, hardHit) {
+  const b = parseFloat(barrel), h = parseFloat(hardHit);
+  if (isNaN(b) && isNaN(h)) return null;
+  let woba = CFG.LEAGUE_WOBA;
+  if (!isNaN(b)) woba += CFG.BARREL_TO_WOBA_SCALE * (b - CFG.LEAGUE_BARREL);
+  if (!isNaN(h)) woba += CFG.HARDHIT_TO_WOBA_SCALE * (h - CFG.LEAGUE_HARDHIT);
+  return woba;
+}
+function effectivePenWoba(pen, barrel, hardHit) {
+  const p = parseFloat(pen);
+  const cq = contactQualityToWoba(barrel, hardHit);
+  if (cq == null) return isNaN(p) ? CFG.LEAGUE_WOBA : p;
+  if (isNaN(p)) return cq;
+  return CFG.PEN_CONTACT_WEIGHT * cq + (1 - CFG.PEN_CONTACT_WEIGHT) * p;
+}
+
+// Defense (OAA) + catcher framing: both shift how contact/counts resolve
+// independent of the pitcher or park. Combined into one small multiplier,
+// same role as park/weather but tied to the fielding team, not the stadium.
+function fieldFactor(oaa, framingRuns) {
+  const o = parseFloat(oaa), f = parseFloat(framingRuns);
+  let factor = 1;
+  if (!isNaN(o)) factor *= (1 - o * CFG.DEFENSE_OAA_SCALE);
+  if (!isNaN(f)) factor *= (1 - f * CFG.FRAMING_FACTOR_SCALE);
+  return Math.max(0.90, Math.min(1.10, factor));
+}
+
 const PARKS = {
   "Neutral": 1.0, "Coors": 1.18, "Sutter Health": 1.11, "Wrigley": 1.04,
   "Camden": 1.08, "Fenway": 1.05, "Great American": 1.06, "Citizens Bank": 1.06,
@@ -133,11 +200,19 @@ function regress(rate, n, phantom, league = CFG.LEAGUE_WOBA) {
   if (rate == null || n == null) return rate ?? league;
   return (rate * n + league * phantom) / (n + phantom);
 }
-function blendRecent(season, seasonPA, recent, recentPA) {
-  if (recent == null || recent === "" || isNaN(recent)) return season;
-  let w = CFG.RECENT_FORM_WEIGHT;
-  if (recentPA != null && recentPA < 40) w *= recentPA / 40;
-  return recent * w + season * (1 - w);
+// Recency blend, stabilization-aware: BB%-K% (process) is trustworthy at 14
+// days; raw wOBA (results — BABIP/sequencing-driven) mostly isn't. Falls back
+// to the old flat blend if only raw recent wOBA is supplied (legacy teams).
+function blendRecent(season, seasonPA, recent, recentPA, recentBbk) {
+  const rw = parseFloat(recent), rb = bbkToWoba(recentBbk);
+  const haveW = !isNaN(rw), haveB = rb != null;
+  if (!haveW && !haveB) return season;
+  const scale = (recentPA != null && recentPA < 40) ? recentPA / 40 : 1;
+  if (haveB && !haveW) { const w = CFG.RECENT_PROCESS_WEIGHT * scale; return rb * w + season * (1 - w); }
+  if (haveW && !haveB) { const w = CFG.RECENT_FORM_WEIGHT * scale; return rw * w + season * (1 - w); }
+  const wp = CFG.RECENT_PROCESS_WEIGHT * scale, wr = CFG.RECENT_RESULT_WEIGHT * scale;
+  const wSeason = Math.max(0, 1 - wp - wr);
+  return rb * wp + rw * wr + season * wSeason;
 }
 function weatherFactor(temp, windOut) {
   let boost = 0;
@@ -177,7 +252,7 @@ function randPoisson(lambda) {
   return Math.max(0, Math.round(lambda + Math.sqrt(lambda) * randn()));
 }
 
-function simulateSide(offW, oppSP, oppSPip, oppPen, park, n, gameFactor, sideScale) {
+function simulateSide(offW, oppSP, oppSPip, oppPen, park, fld, n, gameFactor, sideScale) {
   const runs = new Float64Array(n);
   for (let i = 0; i < n; i++) {
     let sip = oppSPip + randn() * CFG.STARTER_IP_SD;
@@ -188,7 +263,7 @@ function simulateSide(offW, oppSP, oppSPip, oppPen, park, n, gameFactor, sideSca
       const pa = ip * CFG.PA_PER_INNING;
       return ((m - CFG.LEAGUE_WOBA) / CFG.WOBA_SCALE + CFG.LEAGUE_RUNS_PER_PA) * pa;
     };
-    let lam = (mrun(oppSP, sip) + mrun(oppPen, penIp)) * park * sideScale + CFG.CALIBRATION_OFFSET / 2;
+    let lam = (mrun(oppSP, sip) + mrun(oppPen, penIp)) * park * fld * sideScale + CFG.CALIBRATION_OFFSET / 2;
     lam *= gameFactor[i]; // shared run-environment draw — correlates the two sides
     lam *= randGamma(CFG.OVERDISP_SHAPE_SIDE) / CFG.OVERDISP_SHAPE_SIDE;
     runs[i] = randPoisson(Math.max(0, lam)); // integer runs, negative-binomial dispersion
@@ -198,18 +273,21 @@ function simulateSide(offW, oppSP, oppSPip, oppPen, park, n, gameFactor, sideSca
 
 function projectGame(g, nOverride) {
   const park = (PARKS[g.park] ?? 1.0) * weatherFactor(g.temp, g.windOut);
-  const awayOff = regress(blendRecent(g.awayOff, g.awayPA, g.awayRecent, g.awayRecentPA), g.awayPA, CFG.REG_OFFENSE_PA);
-  const homeOff = regress(blendRecent(g.homeOff, g.homePA, g.homeRecent, g.homeRecentPA), g.homePA, CFG.REG_OFFENSE_PA);
+  const awayOff = regress(blendRecent(effectiveOffenseWoba(g.awayOff, g.awayXoff), g.awayPA, g.awayRecent, g.awayRecentPA, g.awayRecentBbk), g.awayPA, CFG.REG_OFFENSE_PA);
+  const homeOff = regress(blendRecent(effectiveOffenseWoba(g.homeOff, g.homeXoff), g.homePA, g.homeRecent, g.homeRecentPA, g.homeRecentBbk), g.homePA, CFG.REG_OFFENSE_PA);
   const awaySP = regress(effectivePitcherWoba(g.awaySP, g.awaySPera), g.awaySPbf, CFG.REG_STARTER_BF);
   const homeSP = regress(effectivePitcherWoba(g.homeSP, g.homeSPera), g.homeSPbf, CFG.REG_STARTER_BF);
-  const awayPen = regress(g.awayPen, g.awayPenBf, CFG.REG_BULLPEN_BF);
-  const homePen = regress(g.homePen, g.homePenBf, CFG.REG_BULLPEN_BF);
+  const awayPen = regress(effectivePenWoba(g.awayPen, g.awayPenBarrel, g.awayPenHardHit), g.awayPenBf, CFG.REG_BULLPEN_BF);
+  const homePen = regress(effectivePenWoba(g.homePen, g.homePenBarrel, g.homePenHardHit), g.homePenBf, CFG.REG_BULLPEN_BF);
+  // fielding side's D/framing applies to the OPPOSING lineup it faces
+  const homeField = fieldFactor(g.homeOAA, g.homeFraming);
+  const awayField = fieldFactor(g.awayOAA, g.awayFraming);
   const n = nOverride || CFG.N_SIMS;
   // one shared run-environment draw per simulated game (v1.2)
   const gameFactor = new Float64Array(n);
   for (let i = 0; i < n; i++) gameFactor[i] = randGamma(CFG.OVERDISP_SHAPE_GAME) / CFG.OVERDISP_SHAPE_GAME;
-  const awayRuns = simulateSide(awayOff, homeSP, g.homeSPip, homePen, park, n, gameFactor, 1);
-  const homeRuns = simulateSide(homeOff, awaySP, g.awaySPip, awayPen, park, n, gameFactor, CFG.HOME_BAT_FACTOR);
+  const awayRuns = simulateSide(awayOff, homeSP, g.homeSPip, homePen, park, homeField, n, gameFactor, 1);
+  const homeRuns = simulateSide(homeOff, awaySP, g.awaySPip, awayPen, park, awayField, n, gameFactor, CFG.HOME_BAT_FACTOR);
   const totals = new Float64Array(n); // integer-valued: sides are Poisson draws
   for (let i = 0; i < n; i++) totals[i] = awayRuns[i] + homeRuns[i];
   const mean = (a) => a.reduce((s, x) => s + x, 0) / a.length;
@@ -373,8 +451,9 @@ const HISTORY_VERSION = 4;
 // players: [{ name, woba, pa }], rotation: [{ name, xwoba, bf }]
 // ---------------------------------------------------------------------------
 const EMPTY_TEAM = {
-  name: "", off: "", pa: "", recent: "", recentPA: "",
-  sp: "", spBf: "", spIp: "5.0", spEra: "", pen: "", penBf: "800",
+  name: "", off: "", xoff: "", pa: "", recent: "", recentPA: "", recentBbk: "",
+  sp: "", spBf: "", spIp: "5.0", spEra: "", pen: "", penBf: "800", penBarrel: "", penHardHit: "",
+  oaa: "", framing: "",
   players: [], rotation: [],
 };
 
@@ -941,6 +1020,8 @@ function App() {
           </div>
           <BetOfTheDay />
           <SlateHub />
+          <Backup />
+          <Journal />
           <p className="home-foot">Research instrument. Projections and records are only as good as the data entered. Not betting advice.</p>
         </div>
       )}
@@ -949,6 +1030,125 @@ function App() {
       {view === "ledger" && <Ledger onHome={() => setView("home")} />}
       {view === "brain" && <Brain onHome={() => setView("home")} />}
     </div>
+  );
+}
+
+// ===========================================================================
+// CHANGELOG — the visible journal. One entry per build day, written when the
+// code changes, shipped inside the file itself so it can never drift from
+// what's actually deployed. Newest first.
+// ===========================================================================
+const CHANGELOG = [
+  { date: "2026-07-16", items: [
+    "Backup & restore: one tap exports the ledger, slate archive, teams, and Brain history to a file (API keys deliberately excluded); restore re-imports it.",
+    "Stats import added to the Database tab — paste or drop Savant CSVs (season or 14-day) without leaving the research view.",
+    "This journal added to the home page.",
+  ]},
+  { date: "2026-07-15", items: [
+    "Bring-your-own Claude API key: AI recalibration and screenshot import now work in the hosted build (Brain → AI recalibration).",
+    "Catch-up grading: on every open the app fetches real MLB finals for archived boards and scores the model's frozen projections. Accuracy panel with honest sample-size gating (no tuning under ~30 graded games).",
+    "Board chart: the whole slate on one axis — book line vs model, tap a row for detail, candidates ringed at 4+ pts.",
+    "Slate archive: every day's board saved for 90 days; day picker with research mode; opening odds snapshotted so line movement is visible.",
+    "Bet-of-the-day and the scanner now refuse games without a confirmed starter instead of silently projecting a team-average arm.",
+    "Manual bets: newest-first, tagged '✎ yours', filterable; 14-day stats mode fills recent form without touching season numbers.",
+    "Engine v1.4: offense xwOBA blend, stabilization-aware recent form (BB%−K%), bullpen barrel/hard-hit, defense (OAA) + framing factor.",
+  ]},
+  { date: "2026-07-14", items: [
+    "Standalone build (index.html) for GitHub Pages: live odds pull and MLB pitcher fetch work; storage moved to the browser.",
+    "Complete betting record integrated: all 2,640 bets including 41 cash-outs, 10 voids, 2 pending. Honest lifetime: −$2,639.71, −7.15% ROI.",
+    "Date encoding fixed to match the tracker (2026: 691–1215 exactly); every bet keeps its description.",
+    "Bet type field (ML / spread / O/U / TT / prop) on manual bets.",
+  ]},
+];
+
+function Journal() {
+  const [openAll, setOpenAll] = useState(false);
+  const shown = openAll ? CHANGELOG : CHANGELOG.slice(0, 1);
+  return (
+    <section className="jr">
+      <div className="jr-head">
+        <h2>Change journal</h2>
+        <button className="ing-ghost" onClick={() => setOpenAll(!openAll)}>{openAll ? "Latest only" : `All ${CHANGELOG.length} days`}</button>
+      </div>
+      {shown.map((d) => (
+        <div className="jr-day" key={d.date}>
+          <span className="jr-date">{d.date}</span>
+          <ul>{d.items.map((it, i) => <li key={i}>{it}</li>)}</ul>
+        </div>
+      ))}
+      <p className="jr-note">Every change ships with a dated entry here — if behavior surprises you, check this first, then tell me which entry it traces to.</p>
+    </section>
+  );
+}
+
+// ===========================================================================
+// BACKUP — the ledger only stays honest if it survives. iOS gives no guarantee
+// browser storage lasts (low disk, cleared history), so this exports everything
+// you've built to a real file. API keys are deliberately NOT included: a backup
+// gets shared, synced, and forgotten in ways a key never should be.
+// ===========================================================================
+const BACKUP_KEYS = [
+  "ingenuity:teams", "ingenuity:ledger:games", "ingenuity:ledger:bets",
+  "ingenuity:slate:day", "ingenuity:slate:archive", "ingenuity:history:bets",
+  "ingenuity:brain:params", "ingenuity:brain:log", "ingenuity:brain:interpLog",
+  "ingenuity:brain:slateScan", "ingenuity:brain:slateAccuracy", "ingenuity:botd",
+  "ingenuity:history:version", "ingenuity:seedVersion",
+];
+
+function Backup() {
+  const [msg, setMsg] = useState("");
+  const [inputKey, setInputKey] = useState(0);
+
+  const doExport = async () => {
+    const payload = { app: "ingenuity", exported: new Date().toISOString(), data: {} };
+    for (const k of BACKUP_KEYS) {
+      const v = await store.get(k, undefined);
+      if (v !== undefined) payload.data[k] = v;
+    }
+    const blob = new Blob([JSON.stringify(payload)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `ingenuity-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    const n = Object.keys(payload.data).length;
+    setMsg(`Exported ${n} stores. Save the file to iCloud Drive (Files app) — that's the copy that survives.`);
+  };
+
+  const doRestore = async (file) => {
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const payload = JSON.parse(text);
+      if (payload.app !== "ingenuity" || !payload.data) throw new Error("not an Ingenuity backup file");
+      let n = 0;
+      for (const [k, v] of Object.entries(payload.data)) {
+        if (BACKUP_KEYS.includes(k)) { await store.set(k, v); n++; }
+      }
+      setMsg(`Restored ${n} stores from ${payload.exported ? payload.exported.slice(0, 10) : "backup"}. Reload the app (close fully and reopen) to see it everywhere.`);
+    } catch (e) {
+      setMsg(`Restore failed — ${e.message}. Nothing was changed.`);
+    }
+    setInputKey((k) => k + 1);
+  };
+
+  return (
+    <section className="bk">
+      <div className="bk-head">
+        <h2>Backup</h2>
+        <button className="ing-run small" onClick={doExport}>Export everything</button>
+      </div>
+      <p className="bk-note">
+        Your manual bets, slate archive, graded results, and team edits live in this browser's storage — and iOS can clear that
+        (low disk space, clearing history). One tap exports it all to a file; keep it in iCloud Drive. API keys are never included.
+        Restoring merges a backup back in.
+      </p>
+      <label className="bk-restore">
+        Restore from backup file
+        <input key={inputKey} type="file" accept=".json,application/json" onChange={(e) => doRestore(e.target.files[0])} />
+      </label>
+      {msg && <p className="ing-hint">{msg}</p>}
+    </section>
   );
 }
 
@@ -1088,14 +1288,16 @@ function Terminal({ onHome }) {
       const A = resolveSP(away), H = resolveSP(home);
       const g = {
         park, line: num(line), temp: num(temp), windOut: num(windOut),
-        awayOff: num(A.off) ?? CFG.LEAGUE_WOBA, awayPA: num(A.pa) ?? 600,
-        awayRecent: num(A.recent), awayRecentPA: num(A.recentPA),
-        awaySP: num(A.sp) ?? 0.32, awaySPbf: num(A.spBf) ?? 200, awaySPip: num(A.spIp) ?? 5,
-        awayPen: num(A.pen) ?? 0.318, awayPenBf: num(A.penBf) ?? 800,
-        homeOff: num(H.off) ?? CFG.LEAGUE_WOBA, homePA: num(H.pa) ?? 600,
-        homeRecent: num(H.recent), homeRecentPA: num(H.recentPA),
-        homeSP: num(H.sp) ?? 0.32, homeSPbf: num(H.spBf) ?? 200, homeSPip: num(H.spIp) ?? 5,
-        homePen: num(H.pen) ?? 0.318, homePenBf: num(H.penBf) ?? 800,
+        awayOff: num(A.off) ?? CFG.LEAGUE_WOBA, awayXoff: num(A.xoff), awayPA: num(A.pa) ?? 600,
+        awayRecent: num(A.recent), awayRecentPA: num(A.recentPA), awayRecentBbk: num(A.recentBbk),
+        awaySP: num(A.sp) ?? 0.32, awaySPbf: num(A.spBf) ?? 200, awaySPip: num(A.spIp) ?? 5, awaySPera: num(A.spEra),
+        awayPen: num(A.pen) ?? 0.318, awayPenBf: num(A.penBf) ?? 800, awayPenBarrel: num(A.penBarrel), awayPenHardHit: num(A.penHardHit),
+        awayOAA: num(A.oaa), awayFraming: num(A.framing),
+        homeOff: num(H.off) ?? CFG.LEAGUE_WOBA, homeXoff: num(H.xoff), homePA: num(H.pa) ?? 600,
+        homeRecent: num(H.recent), homeRecentPA: num(H.recentPA), homeRecentBbk: num(H.recentBbk),
+        homeSP: num(H.sp) ?? 0.32, homeSPbf: num(H.spBf) ?? 200, homeSPip: num(H.spIp) ?? 5, homeSPera: num(H.spEra),
+        homePen: num(H.pen) ?? 0.318, homePenBf: num(H.penBf) ?? 800, homePenBarrel: num(H.penBarrel), homePenHardHit: num(H.penHardHit),
+        homeOAA: num(H.oaa), homeFraming: num(H.framing),
       };
       setResult({
         ...projectGame(g),
@@ -1215,7 +1417,14 @@ function Terminal({ onHome }) {
         </main>
       )}
 
-      {tab === "database" && <Database teams={teams} saveTeams={saveTeams} loaded={loaded} />}
+      {tab === "database" && (
+        <>
+          <div className="ing-db-import">
+            <SmartImport teams={teams} saveTeams={saveTeams} onGameLine={loadGameLine} />
+          </div>
+          <Database teams={teams} saveTeams={saveTeams} loaded={loaded} />
+        </>
+      )}
       {tab === "lineups" && <LineupFetcher teams={teams} saveTeams={saveTeams} />}
 
       <footer className="ing-foot">
@@ -1708,14 +1917,20 @@ function TeamCard({ label, team, setTeam, teams, onLoad }) {
       )}
       <div className="ing-grid2">
         <Field label="wOBA (season)" v={team.off} on={set("off")} />
+        <Field label="xwOBA (season)" v={team.xoff} on={set("xoff")} />
         <Field label="PA" v={team.pa} on={set("pa")} />
         <Field label="wOBA (14d)" v={team.recent} on={set("recent")} />
         <Field label="PA (14d)" v={team.recentPA} on={set("recentPA")} />
+        <Field label="Recent BB%−K%" v={team.recentBbk} on={set("recentBbk")} />
         <Field label="SP xwOBA" v={team.sp} on={set("sp")} />
         <Field label="SP batters faced" v={team.spBf} on={set("spBf")} />
         <Field label="SP innings" v={team.spIp} on={set("spIp")} />
         <Field label="SP ERA (skill blend)" v={team.spEra} on={set("spEra")} />
         <Field label="Bullpen xwOBA" v={team.pen} on={set("pen")} />
+        <Field label="Bullpen barrel% allowed" v={team.penBarrel} on={set("penBarrel")} />
+        <Field label="Bullpen hard-hit% allowed" v={team.penHardHit} on={set("penHardHit")} />
+        <Field label="Team OAA (defense)" v={team.oaa} on={set("oaa")} />
+        <Field label="Catcher framing (runs)" v={team.framing} on={set("framing")} />
       </div>
     </div>
   );
@@ -1728,15 +1943,21 @@ function TeamForm({ team, setTeam }) {
       <input className="ing-teamname" value={team.name} onChange={set("name")} placeholder="Team name" />
       <div className="ing-grid2">
         <Field label="wOBA (season)" v={team.off} on={set("off")} />
+        <Field label="xwOBA (season)" v={team.xoff} on={set("xoff")} />
         <Field label="PA" v={team.pa} on={set("pa")} />
         <Field label="wOBA (14d)" v={team.recent} on={set("recent")} />
         <Field label="PA (14d)" v={team.recentPA} on={set("recentPA")} />
+        <Field label="Recent BB%−K%" v={team.recentBbk} on={set("recentBbk")} />
         <Field label="SP xwOBA" v={team.sp} on={set("sp")} />
         <Field label="SP batters faced" v={team.spBf} on={set("spBf")} />
         <Field label="SP innings" v={team.spIp} on={set("spIp")} />
         <Field label="SP ERA (skill blend)" v={team.spEra} on={set("spEra")} />
         <Field label="Bullpen xwOBA" v={team.pen} on={set("pen")} />
         <Field label="Bullpen batters faced" v={team.penBf} on={set("penBf")} />
+        <Field label="Bullpen barrel% allowed" v={team.penBarrel} on={set("penBarrel")} />
+        <Field label="Bullpen hard-hit% allowed" v={team.penHardHit} on={set("penHardHit")} />
+        <Field label="Team OAA (defense)" v={team.oaa} on={set("oaa")} />
+        <Field label="Catcher framing (runs)" v={team.framing} on={set("framing")} />
       </div>
     </div>
   );
@@ -1918,7 +2139,7 @@ const BLANK_GAME = {
   decision: "PASS", betDetail: "", final: "", outcome: "", note: "",
 };
 const BLANK_BET = {
-  date: "", desc: "", type: "straight", odds: "", stake: "", closing: "",
+  date: "", desc: "", type: "straight", market: "O/U", odds: "", stake: "", closing: "",
   legs: [{ desc: "", odds: "" }, { desc: "", odds: "" }],
   modelCall: "MANUAL", result: "PENDING", notes: "",
 };
@@ -1930,6 +2151,7 @@ function Ledger({ onHome }) {
   const [form, setForm] = useState({ ...BLANK_GAME });
   const [betForm, setBetForm] = useState({ ...BLANK_BET });
   const [loaded, setLoaded] = useState(false);
+  const [betFilter, setBetFilter] = useState("all"); // all | manual
 
   useEffect(() => {
     (async () => {
@@ -1982,7 +2204,10 @@ function Ledger({ onHome }) {
       : 0; // push or pending
     const bet = {
       date: betForm.date || new Date().toISOString().slice(0, 10),
+      loggedAt: Date.now(), // when YOU entered it — lets the ledger surface your own entries
+      src: "manual",
       desc, type: betForm.type,
+      market: betForm.market,
       legs,
       odds: isParlay ? (d != null ? decToAm(d) : null) : (betForm.odds === "" ? null : parseFloat(betForm.odds)),
       dec: d,
@@ -1997,6 +2222,7 @@ function Ledger({ onHome }) {
     };
     saveBets([...bets, bet]);
     setBetForm({ ...BLANK_BET, legs: [{ desc: "", odds: "" }, { desc: "", odds: "" }] });
+    setBetFilter("manual"); // land on Record showing your own entries
     setTab("record");
   };
 
@@ -2024,6 +2250,17 @@ function Ledger({ onHome }) {
   const net = Math.round(bets.reduce((s, b) => s + (b.net || 0), 0) * 100) / 100;
   const modelBets = bets.filter((b) => b.modelCall === "MODEL LEAN");
   const againstBets = bets.filter((b) => b.modelCall !== "MODEL LEAN");
+  const manualCount = bets.filter((b) => b.src === "manual").length;
+  // Newest first so a bet you just logged is at the TOP, not buried under the seeds.
+  // Carry the original index so settleBet still targets the right row.
+  const shownBets = bets
+    .map((b, i) => ({ b, i }))
+    .filter(({ b }) => betFilter === "all" || b.src === "manual")
+    .sort((x, y) => {
+      const d = String(y.b.date || "").localeCompare(String(x.b.date || ""));
+      if (d !== 0) return d;
+      return (y.b.loggedAt || 0) - (x.b.loggedAt || 0);
+    });
   const passes = games.filter((g) => g.decision.startsWith("PASS") && !g.decision.includes("BET"));
   const modelErrGames = games.filter((g) => g.model != null && g.final != null);
   const avgErr = modelErrGames.length
@@ -2094,12 +2331,27 @@ function Ledger({ onHome }) {
           </section>
 
           <section className="lg-betlist">
-            <h2>Every bet</h2>
-            {bets.map((b, i) => (
-              <div className="lg-bet" key={i}>
-                <span className="lg-bet-date">{b.date}</span>
+            <div className="lg-betlist-head">
+              <h2>Every bet <span className="lg-count">{bets.length}</span></h2>
+              <div className="lg-filter">
+                <button className={betFilter === "all" ? "on" : ""} onClick={() => setBetFilter("all")}>All</button>
+                <button className={betFilter === "manual" ? "on" : ""} onClick={() => setBetFilter("manual")}>
+                  Logged by you{manualCount ? ` · ${manualCount}` : ""}
+                </button>
+              </div>
+            </div>
+            {betFilter === "manual" && !manualCount && (
+              <p className="lg-hint">No manually logged bets yet. Use the <b>Add bet</b> tab — they'll appear here at the top, newest first.</p>
+            )}
+            {shownBets.map(({ b, i }) => (
+              <div className={"lg-bet" + (b.src === "manual" ? " mine" : "")} key={i}>
+                <span className="lg-bet-date">
+                  {b.date}
+                  {b.src === "manual" && <span className="lg-mine-tag">✎ yours</span>}
+                </span>
                 <div className="lg-bet-body">
                   <span className="lg-bet-desc">
+                    {b.market && <span className="lg-mkt">{b.market}</span>}
                     {b.desc}
                     {b.type === "parlay" && <span className="lg-parlay-tag"> PARLAY {b.odds ? `· ${b.odds}` : ""}</span>}
                   </span>
@@ -2184,6 +2436,17 @@ function Ledger({ onHome }) {
             <F l={betForm.type === "parlay" ? "Parlay label (optional)" : "Bet description"}
                v={betForm.desc} on={(v) => setBetForm({ ...betForm, desc: v })}
                ph={betForm.type === "parlay" ? "Tuesday 3-leg" : "CHC/BAL Under 9.5"} />
+
+            <label className="lg-f"><span>Bet type</span>
+              <select value={betForm.market} onChange={(e) => setBetForm({ ...betForm, market: e.target.value })}>
+                <option value="ML">Moneyline</option>
+                <option value="Spread">Spread / run line</option>
+                <option value="O/U">Total — over/under</option>
+                <option value="TT">Team total</option>
+                <option value="Prop">Player prop</option>
+                <option value="Other">Mixed / other</option>
+              </select>
+            </label>
 
             {betForm.type === "straight" && (
               <label className="lg-f"><span>American odds</span>
@@ -2353,16 +2616,8 @@ async function prepImageForAI(file) {
 // NOTE: this environment's API bridge requires max_tokens to be exactly 1000
 // — other values are rejected ("Invalid response format").
 async function callVisionJSON(blocks) {
-  if (typeof STANDALONE !== "undefined" && STANDALONE) throw new Error("AI image import isn't available in the standalone build — it needs the in-artifact bridge. Use the paste box instead; it reads the same boards.");
-  const resp = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 1000, messages: [{ role: "user", content: blocks }] }),
-  });
-  let data;
-  try { data = await resp.json(); }
-  catch { throw new Error(`API returned a non-JSON response (HTTP ${resp.status})`); }
+  const data = await callClaudeAPI({ model: "claude-sonnet-4-6", max_tokens: 1000, messages: [{ role: "user", content: blocks }] });
   if (data.error) throw new Error(typeof data.error === "string" ? data.error : data.error.message || data.error.type || "API error");
-  if (!resp.ok) throw new Error(`API error HTTP ${resp.status}`);
   const raw = (data.content || []).map((c) => c.text || "").join("").trim();
   const a = raw.indexOf("{"), b = raw.lastIndexOf("}");
   if (a === -1 || b === -1) throw new Error("model returned no JSON" + (raw ? ` — got: "${raw.slice(0, 80)}"` : " (empty reply)"));
@@ -2390,7 +2645,14 @@ function parseCsvText(text) {
 
 // Apply a list of {name, woba?, xwoba?, pa?, era?, xera?} rows to the team DB.
 // Hitters get the 55/45 xwOBA/wOBA blend; pitchers get xwOBA + ERA-blend.
-function applyStatRows(rows, teams) {
+//
+// mode "season" (default) → writes career/season truth: player wOBA, team off/pa,
+//   rotation xwOBA/ERA, bullpen. This is the long-run talent picture.
+// mode "recent"  → writes ONLY the team-level 14-day form fields (recent,
+//   recentPA, recentBbk) and never touches season numbers. Recent windows are
+//   small samples; overwriting season talent with 14 days of noise is exactly
+//   the mistake the stabilization logic exists to prevent.
+function applyStatRows(rows, teams, mode = "season") {
   const byName = new Map();
   for (const r of rows) { const k = normName(r.name); if (k) byName.set(k, r); }
   const lastIdx = new Map();
@@ -2401,34 +2663,90 @@ function applyStatRows(rows, teams) {
     const hit = lastIdx.get(n.split(" ").pop());
     return hit && hit.k[0] === n[0] ? hit.v : null;
   };
+  // ---- recent (14-day) mode: team-level form only ----
+  if (mode === "recent") {
+    let matched = 0;
+    const nextR = teams.map((t) => {
+      let wSum = 0, paSum = 0, bbkSum = 0, bbkPA = 0, hit = 0;
+      for (const pl of (t.players || [])) {
+        const st = look(pl.name);
+        if (!st) continue;
+        const pa = st.pa != null ? st.pa : 40; // short windows: assume a modest sample
+        if (st.woba != null || st.xwoba != null) {
+          // small sample → lean harder on xwOBA, which stabilizes faster than results
+          const w = st.woba != null && st.xwoba != null ? 0.65 * st.xwoba + 0.35 * st.woba : (st.xwoba ?? st.woba);
+          wSum += w * pa; paSum += pa; hit++;
+        }
+        if (st.bb != null && st.k != null) { bbkSum += (st.bb - st.k) * pa; bbkPA += pa; }
+      }
+      if (!hit && !bbkPA) return t;
+      matched += hit;
+      return {
+        ...t,
+        recent: paSum ? (wSum / paSum).toFixed(3) : t.recent,
+        recentPA: paSum ? String(Math.round(paSum)) : t.recentPA,
+        recentBbk: bbkPA ? (bbkSum / bbkPA).toFixed(1) : t.recentBbk,
+      };
+    });
+    return { next: nextR, hitters: matched, pitchers: 0, mode: "recent" };
+  }
+
   let hitters = 0, pitchers = 0;
   const next = teams.map((t) => {
     let changed = false;
     const players = (t.players || []).map((pl) => {
       const st = look(pl.name);
       if (!st) return pl;
+      let out = pl;
       if (st.woba != null || st.xwoba != null) {
         const w = st.woba != null && st.xwoba != null ? 0.55 * st.xwoba + 0.45 * st.woba : (st.xwoba ?? st.woba);
         hitters++; changed = true;
-        return { ...pl, woba: w.toFixed(3), pa: st.pa != null ? String(Math.round(st.pa)) : pl.pa };
+        out = { ...out, woba: w.toFixed(3), pa: st.pa != null ? String(Math.round(st.pa)) : pl.pa };
       }
-      return pl;
+      // BB%-K% (plate discipline) — the fast-stabilizing recent-form signal
+      if (st.bb != null && st.k != null) {
+        changed = true;
+        out = { ...out, bbk: (st.bb - st.k).toFixed(1), pa: st.pa != null ? String(Math.round(st.pa)) : out.pa };
+      }
+      return out;
     });
     const rotation = (t.rotation || []).map((pt) => {
       const st = look(pt.name);
       if (!st) return pt;
+      let out = pt;
       if (st.xwoba != null || st.era != null || st.xera != null) {
         pitchers++; changed = true;
         const eb = st.era != null && st.xera != null ? ((st.era + st.xera) / 2).toFixed(2) : st.xera != null ? st.xera.toFixed(2) : st.era != null ? st.era.toFixed(2) : pt.era;
-        return { ...pt, xwoba: st.xwoba != null ? st.xwoba.toFixed(3) : pt.xwoba, bf: st.pa != null ? String(Math.round(st.pa)) : pt.bf, era: eb };
+        out = { ...out, xwoba: st.xwoba != null ? st.xwoba.toFixed(3) : pt.xwoba, bf: st.pa != null ? String(Math.round(st.pa)) : pt.bf, era: eb };
       }
-      return pt;
+      // barrel%/hard-hit% allowed — contact-quality-against, the fastest-reacting bullpen-fatigue signal
+      if (st.barrel != null) { changed = true; out = { ...out, barrel: st.barrel.toFixed(1) }; }
+      if (st.hardHit != null) { changed = true; out = { ...out, hardHit: st.hardHit.toFixed(1) }; }
+      return out;
     });
     if (!changed) return t;
     const { off, pa } = lineupToTeamOffense(players);
-    let penW = 0, penB = 0;
-    for (const r of rotation) { const b = parseFloat(r.bf), x = parseFloat(r.xwoba); if (!isNaN(b) && !isNaN(x) && b > 0 && b < 250) { penW += x * b; penB += b; } }
-    return { ...t, players, rotation, off: off ?? t.off, pa: off != null ? String(pa) : t.pa, pen: penB ? (penW / penB).toFixed(3) : t.pen, penBf: penB ? String(Math.round(penB)) : t.penBf };
+    // PA-weighted team BB%-K%, same aggregation pattern as offense wOBA
+    let bbkW = 0, bbkPA = 0;
+    for (const p of players) { const b = parseFloat(p.bbk), n2 = parseFloat(p.pa); if (!isNaN(b) && !isNaN(n2) && n2 > 0) { bbkW += b * n2; bbkPA += n2; } }
+    let penW = 0, penB = 0, barrelW = 0, hardHitW = 0, cqB = 0;
+    for (const r of rotation) {
+      const b = parseFloat(r.bf), x = parseFloat(r.xwoba);
+      if (!isNaN(b) && !isNaN(x) && b > 0 && b < 250) { penW += x * b; penB += b; }
+      const brl = parseFloat(r.barrel), hh = parseFloat(r.hardHit);
+      if (!isNaN(b) && b > 0 && b < 250 && (!isNaN(brl) || !isNaN(hh))) {
+        if (!isNaN(brl)) barrelW += brl * b;
+        if (!isNaN(hh)) hardHitW += hh * b;
+        cqB += b;
+      }
+    }
+    return {
+      ...t, players, rotation, off: off ?? t.off, pa: off != null ? String(pa) : t.pa,
+      recentBbk: bbkPA ? (bbkW / bbkPA).toFixed(1) : t.recentBbk,
+      pen: penB ? (penW / penB).toFixed(3) : t.pen, penBf: penB ? String(Math.round(penB)) : t.penBf,
+      penBarrel: cqB ? (barrelW / cqB).toFixed(1) : t.penBarrel,
+      penHardHit: cqB ? (hardHitW / cqB).toFixed(1) : t.penHardHit,
+    };
   });
   return { next, hitters, pitchers };
 }
@@ -2444,7 +2762,11 @@ function savantCsvToRows(csv) {
   const iX = find(["est_woba", "xwoba", "estimated_woba", "est woba"]);
   const iE = find(["era"]);
   const iXE = find(["xera", "est_era", "x-era"]);
-  if (iX === -1 && iW === -1 && iE === -1) return { rows: null, headers: rows[0] };
+  const iBB = find(["bb_percent", "bb%", "walk_percent", "bb_pct"]);
+  const iK = find(["k_percent", "k%", "strikeout_percent", "k_pct"]);
+  const iBarrel = find(["barrel_batted_rate", "brl_percent", "barrel%", "barrel_pct"]);
+  const iHardHit = find(["hard_hit_percent", "hardhit_percent", "hard_hit%", "hard_hit_pct"]);
+  if (iX === -1 && iW === -1 && iE === -1 && iBB === -1 && iK === -1 && iBarrel === -1 && iHardHit === -1) return { rows: null, headers: rows[0] };
   const out = rows.slice(1).filter((r) => r[iName] && String(r[iName]).trim()).map((r) => {
     const cell = String(r[iName]).trim();
     const parts = cell.includes(",") ? cell.split(",").map((x) => x.trim()) : null;
@@ -2452,13 +2774,15 @@ function savantCsvToRows(csv) {
     return {
       name: parts && parts.length === 2 ? `${parts[1]} ${parts[0]}` : cell,
       pa: num(iPa), woba: num(iW), xwoba: num(iX), era: num(iE), xera: num(iXE),
+      bb: num(iBB), k: num(iK), barrel: num(iBarrel), hardHit: num(iHardHit),
     };
-  }).filter((r) => r.woba != null || r.xwoba != null || r.era != null || r.xera != null);
+  }).filter((r) => r.woba != null || r.xwoba != null || r.era != null || r.xera != null || (r.bb != null && r.k != null) || r.barrel != null || r.hardHit != null);
   return { rows: out.length ? out : null, headers: rows[0] };
 }
 
 function SmartImport({ teams, saveTeams, onGameLine }) {
   const [open, setOpen] = useState(false);
+  const [timeframe, setTimeframe] = useState("season"); // season | recent
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
@@ -2466,9 +2790,16 @@ function SmartImport({ teams, saveTeams, onGameLine }) {
   const [inputKey, setInputKey] = useState(0); // remount the file input to truly clear it
 
   const applyRows = async (rows, label) => {
-    const { next, hitters, pitchers } = applyStatRows(rows, teams);
+    const { next, hitters, pitchers } = applyStatRows(rows, teams, timeframe);
     await saveTeams(next);
-    setMsg(`${label}: updated ${hitters} hitters and ${pitchers} pitchers. Team wOBA and bullpens recomputed — the next projection uses the new numbers.`);
+    if (timeframe === "recent") {
+      const touched = next.filter((t, i) => t !== teams[i]).length;
+      setMsg(hitters || touched
+        ? `${label}: read as LAST-14-DAY form — ${hitters} hitters matched across ${touched} team${touched === 1 ? "" : "s"}. Season numbers untouched; this fills recent wOBA and BB%−K% only.`
+        : `${label}: no players matched your rosters, so no recent form was set. Load lineups first, or switch to Season.`);
+    } else {
+      setMsg(`${label}: updated ${hitters} hitters and ${pitchers} pitchers. Team wOBA and bullpens recomputed — the next projection uses the new numbers.`);
+    }
   };
 
   const stageFile = async (file) => {
@@ -2566,6 +2897,20 @@ If none of these: {"kind":"unknown"}` },
       {open && (
         <div className="ing-import-body">
           <p className="ing-hint">Paste a <strong>game line</strong> to auto-fill this projection — teams, both starters with their stats, line, and prices, all at once. Or drop a Savant CSV to refresh the database, a lineup screenshot to load tonight's order, or an odds-board screenshot to feed Today's Slate. Files stage first — nothing imports until you confirm.</p>
+
+          <div className="ing-tf">
+            <span className="ing-tf-label">Stats timeframe</span>
+            <div className="ing-tf-btns">
+              <button className={timeframe === "season" ? "on" : ""} onClick={() => setTimeframe("season")}>Season</button>
+              <button className={timeframe === "recent" ? "on" : ""} onClick={() => setTimeframe("recent")}>Last 14 days</button>
+            </div>
+          </div>
+          <p className="ing-tf-note">
+            {timeframe === "season"
+              ? "Season mode: sets each player's true-talent line — team wOBA/xwOBA, rotation, bullpen. This is the baseline the model regresses toward."
+              : "14-day mode: fills recent form only (recent wOBA + BB%−K%) and leaves season numbers alone. The engine weights BB%−K% heavier here — it stabilizes at ~60 PA, while raw wOBA over 14 days is still mostly noise."}
+          </p>
+
           <input key={inputKey} type="file" accept=".csv,.txt,.tsv,image/*" onChange={(e) => stageFile(e.target.files[0])} disabled={busy} />
           {staged && (
             <div className="ing-staged">
@@ -2593,9 +2938,179 @@ If none of these: {"kind":"unknown"}` },
 // to the Terminal when those teams are loaded. Scan runs the engine on the
 // whole board against the de-vig market.
 // ===========================================================================
+// ---------------------------------------------------------------------------
+// Claude API caller — one door for both builds.
+// Inside the artifact, Anthropic brokers the call and no key is needed.
+// On a hosted page there's no broker, so the request carries the user's own
+// key plus the header Anthropic requires for direct browser calls. That header
+// is named "dangerous" for a reason: a key in client code is exposed to anyone
+// who can read the page. That's acceptable here and ONLY here, because this is
+// a single-user personal tool and the key never leaves this device.
+// ---------------------------------------------------------------------------
+const AI_KEY_STORE = "ingenuity:anthropic:key";
+
+async function callClaudeAPI(body) {
+  const headers = { "Content-Type": "application/json" };
+  if (typeof STANDALONE !== "undefined" && STANDALONE) {
+    const key = await store.get(AI_KEY_STORE, "");
+    if (!key) {
+      const e = new Error("NO_KEY");
+      e.code = "NO_KEY";
+      throw e;
+    }
+    headers["x-api-key"] = key;
+    headers["anthropic-version"] = "2023-06-01";
+    headers["anthropic-dangerous-direct-browser-access"] = "true";
+  }
+  let resp;
+  try {
+    resp = await fetch("https://api.anthropic.com/v1/messages", { method: "POST", headers, body: JSON.stringify(body) });
+  } catch (e) {
+    const err = new Error("Couldn't reach the Claude API — check your connection.");
+    err.code = "NETWORK";
+    throw err;
+  }
+  if (!resp.ok) {
+    let detail = "";
+    try { detail = (await resp.text()).slice(0, 160); } catch {}
+    const err = new Error(
+      resp.status === 401 ? "Claude API rejected the key (401). Check it's a valid key, pasted whole."
+      : resp.status === 429 ? "Claude API rate limit or no credit on the key (429)."
+      : `Claude API error ${resp.status}. ${detail}`
+    );
+    err.code = "HTTP_" + resp.status;
+    throw err;
+  }
+  return resp.json();
+}
+
+// ===========================================================================
+// BOARD CHART — the whole slate in one glance.
+// Fifteen game cards make you read the board one row at a time. This puts every
+// game on a shared runs axis: the book's number, the model's number, and the
+// gap between them. The outliers ARE the candidates — they stick out visually
+// instead of having to be hunted for. Works on a live scan or a frozen
+// archived board (which carries its own proj), so past days chart too.
+// ===========================================================================
+function shortTeam(n) {
+  const w = String(n || "").trim().split(/\s+/);
+  return w[w.length - 1] || "?";
+}
+
+function BoardChart({ games, rows, onPick }) {
+  const [sort, setSort] = useState("gap"); // gap | board
+  const [sel, setSel] = useState(null);
+
+  const data = games.map((g, i) => {
+    const r = rows?.find((x) => x.away === g.away && x.home === g.home && x.status === "ok");
+    const model = r ? r.model : (g.proj ? g.proj.model : null);
+    const edge = r ? r.edge : (g.proj ? g.proj.edge : null);
+    const line = parseFloat(g.line);
+    return { i, g, model, edge, line: isNaN(line) ? null : line };
+  }).filter((d) => d.model != null && d.line != null);
+
+  if (!data.length) {
+    return (
+      <div className="bc-empty">
+        Run the scan to chart the board — every game's model number against its line, on one axis.
+      </div>
+    );
+  }
+
+  const ordered = [...data].sort((a, b) =>
+    sort === "gap" ? Math.abs(b.model - b.line) - Math.abs(a.model - a.line) : a.i - b.i
+  );
+
+  const W = 340, LABEL = 82, RIGHT = 14;
+  const cx = LABEL, cw = W - LABEL - RIGHT;
+  const rowH = 30, headH = 20;
+  const H = headH + ordered.length * rowH + 6;
+
+  const vals = data.flatMap((d) => [d.model, d.line]);
+  let lo = Math.floor(Math.min(...vals)) - 0.5;
+  let hi = Math.ceil(Math.max(...vals)) + 0.5;
+  if (hi - lo < 2) { hi += 1; lo -= 1; }
+  const X = (v) => cx + ((v - lo) / (hi - lo)) * cw;
+
+  const ticks = [];
+  for (let t = Math.ceil(lo); t <= Math.floor(hi); t++) ticks.push(t);
+
+  const selected = sel != null ? data.find((d) => d.i === sel) : null;
+
+  return (
+    <div className="bc">
+      <div className="bc-head">
+        <span className="bc-title">The board · {data.length} projected</span>
+        <div className="bc-sort">
+          <button className={sort === "gap" ? "on" : ""} onClick={() => setSort("gap")}>By gap</button>
+          <button className={sort === "board" ? "on" : ""} onClick={() => setSort("board")}>Board order</button>
+        </div>
+      </div>
+
+      <svg className="bc-svg" viewBox={`0 0 ${W} ${H}`} role="img" aria-label="Model vs book line for every game on the board">
+        {ticks.map((t) => (
+          <g key={t}>
+            <line x1={X(t)} y1={headH - 6} x2={X(t)} y2={H - 4} stroke="#1c3329" strokeWidth="1" />
+            <text x={X(t)} y={headH - 10} fill="#7a998c" fontSize="8" textAnchor="middle" fontFamily="Archivo, sans-serif">{t}</text>
+          </g>
+        ))}
+
+        {ordered.map((d, k) => {
+          const y = headH + k * rowH + rowH / 2;
+          const gap = d.model - d.line;
+          const over = gap > 0;
+          const hot = Math.abs(d.edge) >= 4;
+          const col = over ? "#f5c451" : "#5fd9e8";
+          const isSel = sel === d.i;
+          return (
+            <g key={d.i} className="bc-row" onClick={() => { const nx = isSel ? null : d.i; setSel(nx); if (onPick) onPick(nx == null ? null : d.g); }} style={{ cursor: "pointer" }}>
+              <rect x="0" y={headH + k * rowH} width={W} height={rowH} fill={isSel ? "rgba(52,230,168,0.07)" : "transparent"} />
+              <text x="4" y={y + 3} fill={isSel ? "#d8e8e0" : "#7a998c"} fontSize="9.5" fontFamily="Archivo, sans-serif">
+                {shortTeam(d.g.away)}@{shortTeam(d.g.home)}
+              </text>
+              <line x1={X(d.line)} y1={y} x2={X(d.model)} y2={y} stroke={col} strokeWidth={hot ? 3 : 1.5} opacity={hot ? 0.9 : 0.45} strokeLinecap="round" />
+              <line x1={X(d.line)} y1={y - 5} x2={X(d.line)} y2={y + 5} stroke="#7a998c" strokeWidth="1.5" />
+              <circle cx={X(d.model)} cy={y} r={hot ? 4.5 : 3} fill={col} opacity={hot ? 1 : 0.6} />
+              {hot && <circle cx={X(d.model)} cy={y} r="7.5" fill="none" stroke={col} strokeWidth="1" opacity="0.35" />}
+            </g>
+          );
+        })}
+      </svg>
+
+      <div className="bc-legend">
+        <span><i className="bc-k-line" /> book line</span>
+        <span><i className="bc-k-over" /> model over</span>
+        <span><i className="bc-k-under" /> model under</span>
+        <span className="bc-k-note">ring = 4+ pt candidate · tap a row</span>
+      </div>
+
+      {selected && (
+        <div className="bc-detail">
+          <strong>{selected.g.away} @ {selected.g.home}</strong>
+          <span>{selected.g.awayP || "TBD"} vs {selected.g.homeP || "TBD"}</span>
+          <span>
+            book <b>{selected.g.line}</b> ({selected.g.over || "-110"}/{selected.g.under || "-110"}) · model <b>{selected.model.toFixed(2)}</b> ·{" "}
+            {selected.model > selected.line ? "over" : "under"} by {Math.abs(selected.model - selected.line).toFixed(2)} runs
+            {selected.edge != null ? ` · ${Math.abs(selected.edge).toFixed(1)} pts vs no-vig` : ""}
+          </span>
+          <span className="bc-detail-note">
+            {Math.abs(selected.edge ?? 0) >= 4
+              ? "Flagged by the scanner — the Terminal's 20k-sim run is the only thing that can confirm it."
+              : "No meaningful gap. The board and the model agree here."}
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+const SLATE_ARCHIVE_DAYS = 90; // keep a season's worth of boards; a day is ~3KB
+
 function SlateHub() {
   const todayKey = new Date().toISOString().slice(0, 10);
-  const [slate, setSlate] = useState(null); // { date, games: [{away, home, awayP, homeP, line, over, under}] }
+  const [slate, setSlate] = useState(null); // { date, games: [{away, home, awayP, homeP, line, over, under, openLine.., proj?}] }
+  const [viewDate, setViewDate] = useState(todayKey); // the day the whole board is focused on
+  const [archDates, setArchDates] = useState([]);
   const [teams, setTeams] = useState([]);
   const [busy, setBusy] = useState("");
   const [msg, setMsg] = useState("");
@@ -2607,8 +3122,22 @@ function SlateHub() {
   const [apiKey, setApiKey] = useState("");
   const [rows, setRows] = useState(null);
   const [lean, setLean] = useState(null);
+  const [acc, setAcc] = useState(null);
+  const [gradeMsg, setGradeMsg] = useState("");
+  const [grading, setGrading] = useState(false);
 
-  const saveSlate = async (next) => { setSlate(next); await store.set("ingenuity:slate:day", next); };
+  // Every board is archived under its own date. Nothing a day produced is ever
+  // overwritten by the next day — that record is what makes hindsight possible.
+  const saveSlate = async (next) => {
+    setSlate(next);
+    if (next.date === todayKey) await store.set("ingenuity:slate:day", next);
+    const arch = await store.get("ingenuity:slate:archive", {});
+    arch[next.date] = next;
+    const keys = Object.keys(arch).sort();
+    while (keys.length > SLATE_ARCHIVE_DAYS) delete arch[keys.shift()];
+    await store.set("ingenuity:slate:archive", arch);
+    setArchDates(Object.keys(arch).sort().reverse());
+  };
 
   useEffect(() => {
     (async () => {
@@ -2618,8 +3147,15 @@ function SlateHub() {
       if (changed) await store.set("ingenuity:teams", merged);
       setTeams(merged);
       setApiKey(await store.get("ingenuity:oddsapi:key", ""));
+      const arch = await store.get("ingenuity:slate:archive", {});
       const day = await store.get("ingenuity:slate:day", null);
-      let cur = day && day.date === todayKey ? day : null;
+      // rescue any pre-archive board still sitting in the old single-slot key
+      if (day && day.date && !arch[day.date]) {
+        arch[day.date] = day;
+        await store.set("ingenuity:slate:archive", arch);
+      }
+      setArchDates(Object.keys(arch).sort().reverse());
+      let cur = arch[todayKey] || (day && day.date === todayKey ? day : null);
       // merge any odds forwarded from a Terminal screenshot import
       const stash = await store.get("ingenuity:slate:odds", "");
       if (stash) {
@@ -2630,26 +3166,46 @@ function SlateHub() {
       } else if (cur) setSlate(cur);
       const scan = await store.get("ingenuity:brain:slateScan", null);
       if (scan && scan.date === todayKey && scan.lean) setLean({ call: null, saved: scan });
+      setAcc(computeAccuracy(arch));
+      gradeArchive(true); // settle up quietly on open — the closest thing to "always working"
     })();
   }, []);
 
-  function mergeOdds(cur, parsed) {
+  // The first real number this board ever saw is kept as the opener and never
+  // touched again; `line` tracks the current market. The gap between them is
+  // where the money went — the raw material for actually measuring CLV.
+  function mergeOdds(cur, parsed, dateKey) {
     const games = cur ? [...cur.games] : [];
+    const stamp = new Date().toISOString().slice(11, 16);
+    const has = (v) => v !== "" && v != null && !isNaN(parseFloat(v));
     for (const o of parsed) {
       if (o.err) continue;
       const gi = games.findIndex((g) => {
         const a = normName(g.away), h = normName(g.home), oa = normName(o.away), oh = normName(o.home);
         return (a.includes(oa) || oa.includes(a)) && (h.includes(oh) || oh.includes(h));
       });
-      const has = (v) => v !== "" && v != null && !isNaN(parseFloat(v));
-      if (gi >= 0) games[gi] = { ...games[gi],
-        line: has(o.line) ? o.line : games[gi].line,
-        over: has(o.over) ? o.over : games[gi].over,
-        under: has(o.under) ? o.under : games[gi].under,
-        awayP: o.awayP || games[gi].awayP, homeP: o.homeP || games[gi].homeP };
-      else games.push({ away: o.away, home: o.home, awayP: o.awayP || "", homeP: o.homeP || "", line: o.line, over: o.over, under: o.under });
+      if (gi >= 0) {
+        const g0 = games[gi];
+        const line = has(o.line) ? o.line : g0.line;
+        const over = has(o.over) ? o.over : g0.over;
+        const under = has(o.under) ? o.under : g0.under;
+        const openingNow = !has(g0.openLine) && has(line); // first time this game got a number
+        games[gi] = { ...g0, line, over, under,
+          awayP: o.awayP || g0.awayP, homeP: o.homeP || g0.homeP,
+          openLine: openingNow ? line : g0.openLine,
+          openOver: openingNow ? over : g0.openOver,
+          openUnder: openingNow ? under : g0.openUnder,
+          openTs: openingNow ? stamp : g0.openTs,
+          lastTs: stamp };
+      } else {
+        const fresh = has(o.line);
+        games.push({ away: o.away, home: o.home, awayP: o.awayP || "", homeP: o.homeP || "",
+          line: o.line, over: o.over, under: o.under,
+          openLine: fresh ? o.line : "", openOver: fresh ? o.over : "", openUnder: fresh ? o.under : "",
+          openTs: fresh ? stamp : "", lastTs: stamp });
+      }
     }
-    return { date: todayKey, games };
+    return { date: dateKey || (cur && cur.date) || todayKey, games };
   }
 
   const fetchMatchups = async () => {
@@ -2785,12 +3341,16 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
   const buildSide = (t, pitcherName) => {
     const num = (v) => (v === "" || v == null ? null : parseFloat(v));
     let sp = num(t.sp) ?? 0.32, spBf = num(t.spBf) ?? 200, spIp = num(t.spIp) ?? 5, spEra = num(t.spEra);
+    // resolved = this exact starter was found in the rotation AND has a real xwOBA.
+    // Otherwise sp silently falls back to a team average. That isn't a weaker
+    // projection — it's a projection of a different game. Callers must refuse it.
+    let resolved = false;
     if (pitcherName && t.rotation) {
       const pn = normName(pitcherName);
       const hit = t.rotation.find((r) => normName(r.name) === pn) || t.rotation.find((r) => pn.includes(normName(r.name).split(" ").pop()));
-      if (hit) { sp = num(hit.xwoba) ?? sp; spBf = num(hit.bf) ?? spBf; spIp = num(hit.ip) ?? spIp; spEra = num(hit.era) ?? spEra; }
+      if (hit) { sp = num(hit.xwoba) ?? sp; spBf = num(hit.bf) ?? spBf; spIp = num(hit.ip) ?? spIp; spEra = num(hit.era) ?? spEra; resolved = num(hit.xwoba) != null; }
     }
-    return { off: num(t.off) ?? CFG.LEAGUE_WOBA, pa: num(t.pa) ?? 600, recent: num(t.recent), recentPA: num(t.recentPA), sp, spBf, spIp, spEra, pen: num(t.pen) ?? 0.318, penBf: num(t.penBf) ?? 800 };
+    return { off: num(t.off) ?? CFG.LEAGUE_WOBA, xoff: num(t.xoff), pa: num(t.pa) ?? 600, recent: num(t.recent), recentPA: num(t.recentPA), recentBbk: num(t.recentBbk), sp, spBf, spIp, spEra, pen: num(t.pen) ?? 0.318, penBf: num(t.penBf) ?? 800, penBarrel: num(t.penBarrel), penHardHit: num(t.penHardHit), oaa: num(t.oaa), framing: num(t.framing), resolved };
   };
 
   const scan = async () => {
@@ -2803,11 +3363,16 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
       const A = matchTeamDb(g.away, teams), H = matchTeamDb(g.home, teams);
       if (!A || !H) { out.push({ ...g, status: "skip", err: `no DB match for ${!A ? g.away : g.home}` }); continue; }
       const a = buildSide(A, g.awayP), h = buildSide(H, g.homeP);
+      if (!a.resolved || !h.resolved) {
+        const why = (!g.awayP || !g.homeP) ? "probable starter not posted" : "starter not in your database";
+        out.push({ ...g, status: "skip", err: why + " — the arm is the biggest input; won't guess it" });
+        continue;
+      }
       const over = parseFloat(g.over) || -110, under = parseFloat(g.under) || -110;
       const r = projectGame({
         park: "Neutral", line, temp: null, windOut: null,
-        awayOff: a.off, awayPA: a.pa, awayRecent: a.recent, awayRecentPA: a.recentPA, awaySP: a.sp, awaySPbf: a.spBf, awaySPip: a.spIp, awaySPera: a.spEra, awayPen: a.pen, awayPenBf: a.penBf,
-        homeOff: h.off, homePA: h.pa, homeRecent: h.recent, homeRecentPA: h.recentPA, homeSP: h.sp, homeSPbf: h.spBf, homeSPip: h.spIp, homeSPera: h.spEra, homePen: h.pen, homePenBf: h.penBf,
+        awayOff: a.off, awayXoff: a.xoff, awayPA: a.pa, awayRecent: a.recent, awayRecentPA: a.recentPA, awayRecentBbk: a.recentBbk, awaySP: a.sp, awaySPbf: a.spBf, awaySPip: a.spIp, awaySPera: a.spEra, awayPen: a.pen, awayPenBf: a.penBf, awayPenBarrel: a.penBarrel, awayPenHardHit: a.penHardHit, awayOAA: a.oaa, awayFraming: a.framing,
+        homeOff: h.off, homeXoff: h.xoff, homePA: h.pa, homeRecent: h.recent, homeRecentPA: h.recentPA, homeRecentBbk: h.recentBbk, homeSP: h.sp, homeSPbf: h.spBf, homeSPip: h.spIp, homeSPera: h.spEra, homePen: h.pen, homePenBf: h.penBf, homePenBarrel: h.penBarrel, homePenHardHit: h.penHardHit, homeOAA: h.oaa, homeFraming: h.framing,
       }, 8000);
       const pW = r.pOver / (r.pOver + r.pUnder);
       const dO = amToDec(over), dU = amToDec(under);
@@ -2822,35 +3387,181 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
     for (const x of scored) if (!top || Math.abs(x.edge) > Math.abs(top.edge)) top = x;
     const call = top && Math.abs(top.edge) >= 4 ? top : null;
     setRows(out); setLean({ call, scanned: scored.length, top });
-    await store.set("ingenuity:brain:slateScan", {
-      date: todayKey, ts: new Date().toISOString().slice(0, 16).replace("T", " "), scanned: scored.length,
-      lean: call ? { matchup: `${call.awayName} @ ${call.homeName}`, side: call.edge > 0 ? "Over" : "Under", line: call.line, edge: +call.edge.toFixed(1), model: +call.model.toFixed(2) } : null,
-    });
+    // Freeze what the model said onto the board itself, so the archived day stays
+    // self-contained: the line it saw, the price it saw, and its own number.
+    // Without this you can never honestly grade a past day.
+    const stamp = new Date().toISOString().slice(11, 16);
+    await saveSlate({ ...slate, games: slate.games.map((g) => {
+      const r = out.find((x) => x.away === g.away && x.home === g.home && x.status === "ok");
+      return r ? { ...g, proj: { model: +r.model.toFixed(2), edge: +r.edge.toFixed(1), pOver: +r.pW.toFixed(3), atLine: r.line, ts: stamp } } : g;
+    }) });
+    // A scan of a past board is research — it must not overwrite today's read.
+    if (viewDate === todayKey) {
+      await store.set("ingenuity:brain:slateScan", {
+        date: todayKey, ts: new Date().toISOString().slice(0, 16).replace("T", " "), scanned: scored.length,
+        lean: call ? { matchup: `${call.awayName} @ ${call.homeName}`, side: call.edge > 0 ? "Over" : "Under", line: call.line, edge: +call.edge.toFixed(1), model: +call.model.toFixed(2) } : null,
+      });
+    }
     setBusy("");
   };
 
+  // How wrong was the model, measured against games that had already been
+  // projected before they were played? Only counts boards carrying a frozen
+  // proj — a number written down after the fact proves nothing.
+  const computeAccuracy = (arch) => {
+    const rows2 = [];
+    for (const d of Object.keys(arch)) {
+      for (const g of (arch[d].games || [])) {
+        if (g.proj && g.final != null) rows2.push({ date: d, away: g.away, home: g.home, model: g.proj.model, line: g.proj.atLine, final: g.final, err: g.final - g.proj.model });
+      }
+    }
+    const n = rows2.length;
+    if (!n) return { n: 0 };
+    const bias = rows2.reduce((s, r) => s + r.err, 0) / n;
+    const mae = rows2.reduce((s, r) => s + Math.abs(r.err), 0) / n;
+    const big = rows2.filter((r) => Math.abs(r.err) > 3.5).length;
+    return { n, bias, mae, big, rows: rows2.sort((a, b) => (a.date < b.date ? 1 : -1)) };
+  };
+
+  // Catch-up grading: a static page can't work while it's closed, so it settles
+  // up the moment it opens. Fetches real finals for archived boards and scores
+  // what the model said at the time.
+  const gradeArchive = async (silent) => {
+    if (!silent) { setGrading(true); setGradeMsg(""); }
+    const arch = await store.get("ingenuity:slate:archive", {});
+    const need = Object.keys(arch)
+      .filter((d) => d < todayKey && (arch[d].games || []).some((g) => g.final == null))
+      .sort().slice(-14); // don't hammer the API; two weeks of catch-up is plenty
+    let got = 0, reached = false;
+    for (const d of need) {
+      try {
+        const r = await fetch(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${d}`);
+        if (!r.ok) continue;
+        const j = await r.json();
+        reached = true;
+        const finals = (j.dates?.[0]?.games || [])
+          .filter((g) => g.status?.abstractGameState === "Final")
+          .map((g) => ({ away: g.teams.away.team.name, home: g.teams.home.team.name,
+                         total: (g.teams.away.score ?? 0) + (g.teams.home.score ?? 0) }));
+        if (!finals.length) continue;
+        arch[d] = { ...arch[d], games: (arch[d].games || []).map((g) => {
+          if (g.final != null) return g;
+          const f = finals.find((x) => {
+            const a = normName(x.away), h = normName(x.home), ga = normName(g.away), gh = normName(g.home);
+            return (a.includes(ga) || ga.includes(a)) && (h.includes(gh) || gh.includes(h));
+          });
+          if (!f) return g;
+          got++;
+          return { ...g, final: f.total };
+        }) };
+      } catch (e) { /* sandbox blocks statsapi; stay quiet and let the panel say so */ }
+    }
+    if (got) await store.set("ingenuity:slate:archive", arch);
+    const a = computeAccuracy(arch);
+    setAcc(a);
+    if (a.n) await store.set("ingenuity:brain:slateAccuracy", { n: a.n, bias: +a.bias.toFixed(3), mae: +a.mae.toFixed(3), big: a.big, ts: new Date().toISOString().slice(0, 16).replace("T", " ") });
+    // refresh the viewed board so any new finals show immediately
+    if (got && arch[viewDate]) setSlate(arch[viewDate]);
+    if (!silent) {
+      setGradeMsg(!reached
+        ? "Couldn't reach the MLB scores API from here. In the hosted app this works; inside the Claude artifact the sandbox blocks it."
+        : got ? `Graded ${got} game${got === 1 ? "" : "s"} against final scores.`
+              : need.length ? "No new finals available yet for the boards on file." : "Every archived board is already graded.");
+      setGrading(false);
+    }
+  };
+
+  const pickDay = async (d) => {
+    setViewDate(d); setRows(null); setLean(null); setMsg("");
+    const arch = await store.get("ingenuity:slate:archive", {});
+    if (d === todayKey) {
+      const day = await store.get("ingenuity:slate:day", null);
+      setSlate(arch[todayKey] || (day && day.date === todayKey ? day : null));
+      const scan = await store.get("ingenuity:brain:slateScan", null);
+      if (scan && scan.date === todayKey && scan.lean) setLean({ call: null, saved: scan });
+    } else {
+      setSlate(arch[d] || null);
+    }
+  };
+
+  const isToday = viewDate === todayKey;
   const games = slate?.games || [];
   const withOdds = games.filter((g) => g.line !== "" && g.line != null).length;
   const withP = games.filter((g) => g.awayP && g.homeP).length;
+  const moved = games.filter((g) => g.openLine !== "" && g.openLine != null && g.line !== "" && parseFloat(g.openLine) !== parseFloat(g.line)).length;
 
   return (
     <section className="slate">
       <div className="slate-head">
-        <h2>Today's Slate — the 6th agent</h2>
-        <span className="botd-sub">{todayKey} · the wide net: stores every game's odds + pitchers for the day, sweeps the board at 8k sims to flag candidates (4+ pt gaps). Confirm any lean in the Terminal, which runs 20k sims and only calls an edge at 7+ pts.</span>
+        <h2>{isToday ? "Today's Slate — the 6th agent" : `Slate archive — ${viewDate}`}</h2>
+        <span className="botd-sub">{viewDate} · the wide net: stores every game's odds + pitchers for the day, sweeps the board at 8k sims to flag candidates (4+ pt gaps). Confirm any lean in the Terminal, which runs 20k sims and only calls an edge at 7+ pts.</span>
       </div>
+
+      {archDates.length > 1 && (
+        <div className="slate-days">
+          <span className="slate-days-label">Board</span>
+          <select value={viewDate} onChange={(e) => pickDay(e.target.value)}>
+            {!archDates.includes(todayKey) && <option value={todayKey}>{todayKey} · today</option>}
+            {archDates.map((d) => <option key={d} value={d}>{d}{d === todayKey ? " · today" : ""}</option>)}
+          </select>
+          {!isToday && <button className="ing-ghost" onClick={() => pickDay(todayKey)}>↩ back to today</button>}
+        </div>
+      )}
+
+      {!isToday && (
+        <div className="slate-research">
+          <strong>Research mode — viewing {viewDate}.</strong> This board is frozen as it was: its odds, its pitchers, and what the model said at the time. Scanning here is for study only; it won't touch today's read or the Brain's record.
+        </div>
+      )}
+
+      <div className="grade">
+        <div className="grade-head">
+          <span className="bc-title">Model accuracy · graded against real finals</span>
+          <button className="ing-ghost" onClick={() => gradeArchive(false)} disabled={grading}>{grading ? "Grading…" : "Grade past boards"}</button>
+        </div>
+        {acc && acc.n > 0 ? (
+          <>
+            <div className="grade-stats">
+              <div><em>Graded</em><strong>{acc.n}</strong></div>
+              <div><em>Mean error</em><strong className={Math.abs(acc.bias) > 0.5 ? "neg" : ""}>{acc.bias > 0 ? "+" : ""}{acc.bias.toFixed(2)} runs</strong></div>
+              <div><em>Avg miss</em><strong>{acc.mae.toFixed(2)} runs</strong></div>
+              <div><em>Big misses</em><strong className={acc.big ? "neg" : ""}>{acc.big}</strong></div>
+            </div>
+            <p className="grade-note">
+              {acc.n < 30
+                ? `Only ${acc.n} graded game${acc.n === 1 ? "" : "s"} — far too few to mean anything. At this sample a mean error of ${acc.bias > 0 ? "+" : ""}${acc.bias.toFixed(2)} is noise, not bias. Keep collecting before changing a single parameter.`
+                : acc.bias > 0.4
+                  ? `The model is running ${acc.bias.toFixed(2)} runs LOW across ${acc.n} games — the same under-projection your ledger caught on hot slates. Worth a calibration look now that the sample supports it.`
+                  : acc.bias < -0.4
+                    ? `The model is running ${Math.abs(acc.bias).toFixed(2)} runs HIGH across ${acc.n} games. Worth a calibration look.`
+                    : `Mean error is ${acc.bias.toFixed(2)} runs across ${acc.n} games — no systematic bias worth chasing. The typical miss is still ${acc.mae.toFixed(2)} runs, which is the honest width of this model's uncertainty.`}
+            </p>
+          </>
+        ) : (
+          <p className="grade-note">
+            Nothing graded yet. Each scan freezes its projection onto that day's board; once the games finish, this settles up against the real final scores
+            and tracks how wrong the model actually was. It needs boards on file first — from Thursday, that starts accumulating on its own.
+          </p>
+        )}
+        {gradeMsg && <p className="ing-hint">{gradeMsg}</p>}
+      </div>
+
+      {games.length > 0 && (rows || games.some((g) => g.proj)) && (
+        <BoardChart games={games} rows={rows} />
+      )}
 
       {games.length > 0 && (
         <div className="slate-chips">
           <span className="slate-chip">{games.length} games</span>
           <span className={"slate-chip " + (withP === games.length ? "good" : "")}>{withP}/{games.length} pitchers</span>
           <span className={"slate-chip " + (withOdds === games.length && games.length ? "good" : "")}>{withOdds}/{games.length} with market</span>
-          <span className="slate-chip good">✓ saved for {todayKey}</span>
+          {moved > 0 && <span className="slate-chip move">{moved} line{moved === 1 ? "" : "s"} moved</span>}
+          <span className="slate-chip good">✓ saved for {viewDate}</span>
         </div>
       )}
 
       <div className="slate-controls">
-        <button className="ing-run small" onClick={fetchMatchups} disabled={!!busy}>{busy === "fetch" ? "Fetching…" : games.length ? "Refresh matchups + pitchers" : "1 · Fetch matchups + pitchers"}</button>
+        <button className="ing-run small" onClick={fetchMatchups} disabled={!!busy || !isToday} title={isToday ? "" : "Live fetch only applies to today's board"}>{busy === "fetch" ? "Fetching…" : games.length ? "Refresh matchups + pitchers" : "1 · Fetch matchups + pitchers"}</button>
         <label className="slate-filebtn">
           {busy === "vision" ? "Reading…" : "2 · Import odds (screenshot / file)"}
           <input key={inputKey} type="file" accept=".csv,.txt,image/*" onChange={(e) => stageFile(e.target.files[0])} disabled={!!busy} hidden />
@@ -2910,6 +3621,12 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
                   <div className="sg-teams">
                     <span className="sg-match">{g.away} @ {g.home}</span>
                     <span className="sg-pitchers">{g.awayP || "TBD"} vs {g.homeP || "TBD"}</span>
+                    {g.openLine !== "" && g.openLine != null && g.line !== "" && parseFloat(g.openLine) !== parseFloat(g.line) && (
+                      <span className={"sg-move " + (parseFloat(g.line) > parseFloat(g.openLine) ? "up" : "down")}>
+                        opened {g.openLine} → {g.line} {parseFloat(g.line) > parseFloat(g.openLine) ? "▲" : "▼"}
+                        {g.openTs ? ` · since ${g.openTs}` : ""}
+                      </span>
+                    )}
                   </div>
                   <button className="sg-remove" onClick={() => removeGame(i)} aria-label="Remove game">✕</button>
                 </div>
@@ -2988,25 +3705,33 @@ function BetOfTheDay() {
     setBusy(true); setMsg("");
     await new Promise((res) => setTimeout(res, 30));
     const scored = [];
+    const skipped = [];
     for (const g of games) {
       const A = matchTeamDb(g.away, teams), H = matchTeamDb(g.home, teams);
       if (!A || !H) continue;
       const num = (v) => (v === "" || v == null ? null : parseFloat(v));
       const side = (t, pName) => {
         let sp = num(t.sp) ?? 0.32, spBf = num(t.spBf) ?? 200, spIp = num(t.spIp) ?? 5, spEra = num(t.spEra);
+        let resolved = false;
         if (pName && t.rotation) {
           const pn = normName(pName);
           const hit = t.rotation.find((r) => normName(r.name) === pn) || t.rotation.find((r) => pn.includes(normName(r.name).split(" ").pop()));
-          if (hit) { sp = num(hit.xwoba) ?? sp; spBf = num(hit.bf) ?? spBf; spIp = num(hit.ip) ?? spIp; spEra = num(hit.era) ?? spEra; }
+          if (hit) { sp = num(hit.xwoba) ?? sp; spBf = num(hit.bf) ?? spBf; spIp = num(hit.ip) ?? spIp; spEra = num(hit.era) ?? spEra; resolved = num(hit.xwoba) != null; }
         }
-        return { off: num(t.off) ?? CFG.LEAGUE_WOBA, pa: num(t.pa) ?? 600, recent: num(t.recent), recentPA: num(t.recentPA), sp, spBf, spIp, spEra, pen: num(t.pen) ?? 0.318, penBf: num(t.penBf) ?? 800 };
+        return { off: num(t.off) ?? CFG.LEAGUE_WOBA, xoff: num(t.xoff), pa: num(t.pa) ?? 600, recent: num(t.recent), recentPA: num(t.recentPA), recentBbk: num(t.recentBbk), sp, spBf, spIp, spEra, pen: num(t.pen) ?? 0.318, penBf: num(t.penBf) ?? 800, penBarrel: num(t.penBarrel), penHardHit: num(t.penHardHit), oaa: num(t.oaa), framing: num(t.framing), resolved };
       };
       const a = side(A, g.awayP), h = side(H, g.homeP);
+      // A "bet of the day" built on a guessed starter is a made-up number wearing
+      // a confidence score. Sit the game out and say so.
+      if (!a.resolved || !h.resolved) {
+        skipped.push({ matchup: `${A.name} @ ${H.name}`, noArm: !g.awayP || !g.homeP });
+        continue;
+      }
       const line = parseFloat(g.line), over = parseFloat(g.over) || -110, under = parseFloat(g.under) || -110;
       const r = projectGame({
         park: "Neutral", line, temp: null, windOut: null,
-        awayOff: a.off, awayPA: a.pa, awayRecent: a.recent, awayRecentPA: a.recentPA, awaySP: a.sp, awaySPbf: a.spBf, awaySPip: a.spIp, awaySPera: a.spEra, awayPen: a.pen, awayPenBf: a.penBf,
-        homeOff: h.off, homePA: h.pa, homeRecent: h.recent, homeRecentPA: h.recentPA, homeSP: h.sp, homeSPbf: h.spBf, homeSPip: h.spIp, homeSPera: h.spEra, homePen: h.pen, homePenBf: h.penBf,
+        awayOff: a.off, awayXoff: a.xoff, awayPA: a.pa, awayRecent: a.recent, awayRecentPA: a.recentPA, awayRecentBbk: a.recentBbk, awaySP: a.sp, awaySPbf: a.spBf, awaySPip: a.spIp, awaySPera: a.spEra, awayPen: a.pen, awayPenBf: a.penBf, awayPenBarrel: a.penBarrel, awayPenHardHit: a.penHardHit, awayOAA: a.oaa, awayFraming: a.framing,
+        homeOff: h.off, homeXoff: h.xoff, homePA: h.pa, homeRecent: h.recent, homeRecentPA: h.recentPA, homeRecentBbk: h.recentBbk, homeSP: h.sp, homeSPbf: h.spBf, homeSPip: h.spIp, homeSPera: h.spEra, homePen: h.pen, homePenBf: h.penBf, homePenBarrel: h.penBarrel, homePenHardHit: h.penHardHit, homeOAA: h.oaa, homeFraming: h.framing,
       }, 8000);
       const pW = r.pOver / (r.pOver + r.pUnder);
       const dO = amToDec(over), dU = amToDec(under);
@@ -3024,7 +3749,10 @@ function BetOfTheDay() {
       if (!best || eff > best.eff) best = { ...x, eff };
     }
     const pick = best && Math.abs(best.edge) >= 4 && best.eff >= 4 ? best : null;
-    const result = { date: todayKey, ts: new Date().toISOString().slice(11, 16), scanned: scored.length, pick, patternPick: patternPickFrom(games) };
+    const noArm = skipped.filter((s) => s.noArm).length;
+    const result = { date: todayKey, ts: new Date().toISOString().slice(11, 16), scanned: scored.length,
+      skipped: skipped.length, noArm, notInDb: skipped.length - noArm,
+      pick, patternPick: patternPickFrom(games) };
     setBotd(result);
     await store.set("ingenuity:botd", result);
     setBusy(false);
@@ -3052,11 +3780,20 @@ function BetOfTheDay() {
           <div className="botd-pick">
             {botd.pick ? (
               <p>
-                <strong>Model's best find: {botd.pick.side.toUpperCase()} {botd.pick.line} — {botd.pick.matchup}</strong> ({botd.pick.pitchers}) at {botd.pick.price > 0 ? "+" : ""}{botd.pick.price} · model {botd.pick.model.toFixed(2)} · {Math.abs(botd.pick.edge).toFixed(1)} pts past the no-vig book{botd.pick.priceOk ? "" : " — but note the price sits outside your profitable band"}. Scanned {botd.scanned} games at {botd.ts}. Confirm it in the Terminal before it means anything.
+                <strong>Model's best find: {botd.pick.side.toUpperCase()} {botd.pick.line} — {botd.pick.matchup}</strong> ({botd.pick.pitchers}) at {botd.pick.price > 0 ? "+" : ""}{botd.pick.price} · model {botd.pick.model.toFixed(2)} · {Math.abs(botd.pick.edge).toFixed(1)} pts past the no-vig book{botd.pick.priceOk ? "" : " — but note the price sits outside your profitable band"}. Scanned {botd.scanned} game{botd.scanned === 1 ? "" : "s"} with confirmed starters at {botd.ts}. Confirm it in the Terminal before it means anything.
+              </p>
+            ) : botd.scanned === 0 ? (
+              <p>
+                <strong>No bet of the day yet — nothing on the board is projectable.</strong> Not one game has both starters confirmed, and the starting pitcher is the single biggest input to a total. The odds feed carries lines and prices but never the probables, so tap <b>Fetch matchups + pitchers</b> in Today's Slate below, then re-run. This is a missing-data answer, not a pass.
               </p>
             ) : (
               <p>
-                <strong>The model's best bet today is the pass.</strong> {botd.scanned} games scanned at {botd.ts}; nothing cleared the bar once your ledger's lessons (longshot penalty, 4+ pt minimum) were applied. That's not a blank — per your own history, the pass has been the most profitable bet you make.
+                <strong>The model's best bet today is the pass.</strong> {botd.scanned} game{botd.scanned === 1 ? "" : "s"} scanned at {botd.ts}; nothing cleared the bar once your ledger's lessons (longshot penalty, 4+ pt minimum) were applied. That's not a blank — per your own history, the pass has been the most profitable bet you make.
+              </p>
+            )}
+            {botd.skipped > 0 && botd.scanned > 0 && (
+              <p className="botd-why">
+                {botd.skipped} of {botd.scanned + botd.skipped} games sat out{botd.noArm ? ` — ${botd.noArm} with no probable starter posted` : ""}{botd.noArm && botd.notInDb ? "," : ""}{botd.notInDb ? ` ${botd.notInDb} whose starter isn't in your database yet` : ""}. Without the arm the model would be pricing a team-average pitcher who isn't throwing — a made-up number, not a rougher one. Fetch pitchers and re-run to widen the net.
               </p>
             )}
             {botd.patternPick && (
@@ -3248,6 +3985,10 @@ function Brain({ onHome }) {
   const [aiBusy, setAiBusy] = useState(false);
   const [aiOut, setAiOut] = useState(null);
   const [aiErr, setAiErr] = useState("");
+  const [aiKey, setAiKey] = useState("");
+  const [keyOpen, setKeyOpen] = useState(false);
+  const [keyMsg, setKeyMsg] = useState("");
+  const hosted = typeof STANDALONE !== "undefined" && STANDALONE;
   const [saved, setSaved] = useState("");
 
   useEffect(() => {
@@ -3297,6 +4038,8 @@ function Brain({ onHome }) {
   };
   const resetAll = () => persist({}, { source: "manual", change: "Reset all parameters to defaults" });
 
+  useEffect(() => { (async () => { setAiKey(await store.get(AI_KEY_STORE, "")); })(); }, []);
+
   // ---- model health from the ledger ----
   const graded = games.filter((g) => g.model != null && g.final != null);
   const bias = graded.length ? graded.reduce((s, g) => s + (g.final - g.model), 0) / graded.length : null;
@@ -3326,19 +4069,15 @@ TUNABLE BOUNDS: ${JSON.stringify(Object.fromEntries(Object.entries(BRAIN_TUNABLE
 
 Respond ONLY with JSON, no markdown fences, exactly this shape:
 {"summary": "2-3 sentence read of model health", "suggestions": [{"param": "NAME", "value": 0.0, "reason": "why, tied to the evidence"}]}`;
-      if (typeof STANDALONE !== "undefined" && STANDALONE) throw new Error("AI self-calibration isn't available in the standalone build — the numeric council (agents 1–6) still runs fully.");
-      const resp = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 1000, messages: [{ role: "user", content: prompt }] }),
-      });
-      const data = await resp.json();
+      const data = await callClaudeAPI({ model: "claude-sonnet-4-6", max_tokens: 1000, messages: [{ role: "user", content: prompt }] });
       const text = (data.content || []).map((c) => c.text || "").join("").replace(/```json|```/g, "").trim();
       const parsed = JSON.parse(text);
       parsed.suggestions = (parsed.suggestions || []).filter((sg) => BRAIN_TUNABLES[sg.param] && !isNaN(parseFloat(sg.value)));
       setAiOut(parsed);
     } catch (e) {
-      setAiErr("Analysis failed — the AI endpoint may be unavailable here. The manual tuner below always works.");
+      setAiErr(e.code === "NO_KEY"
+        ? "AI recalibration needs a Claude API key on this device — add one below. The six numeric agents and the manual tuner run without it."
+        : `Analysis failed — ${e.message} The manual tuner below always works.`);
     }
     setAiBusy(false);
   };
@@ -3528,6 +4267,35 @@ Respond ONLY with JSON, no markdown fences, exactly this shape:
             </button>
           </div>
           {graded.length < 5 && <p className="ing-hint">Needs at least 5 graded projections in the ledger — log games from the terminal and fill in finals.</p>}
+          {hosted && (
+            <div className="br-key">
+              <button className="br-key-toggle" onClick={() => setKeyOpen(!keyOpen)}>
+                {keyOpen ? "▾" : "▸"} Claude API key {aiKey ? "· saved on this device" : "· not set"}
+              </button>
+              {keyOpen && (
+                <div className="br-key-body">
+                  <p className="ing-hint">
+                    This is a hosted page, so there's no Anthropic bridge — AI recalibration and screenshot reading run on <b>your own</b> key.
+                    Get one at <a href="https://console.anthropic.com" target="_blank" rel="noreferrer">console.anthropic.com</a>. A calibration is one small
+                    request (fractions of a cent), but it is billed to you.
+                  </p>
+                  <p className="ing-hint">
+                    <b>Be clear on the trade:</b> the key is stored in this browser and sent straight from your phone to Anthropic. Anyone who can open this
+                    browser can read it. That's an acceptable risk for a personal tool on your own device and nowhere else. The key is never committed to
+                    GitHub — it lives only here.
+                  </p>
+                  <input
+                    className="br-key-input" type="password" value={aiKey} placeholder="sk-ant-..."
+                    onChange={async (e) => { setAiKey(e.target.value); await store.set(AI_KEY_STORE, e.target.value.trim()); setKeyMsg("Saved on this device."); }}
+                  />
+                  <div className="ing-db-actions">
+                    <button className="ing-ghost" onClick={async () => { setAiKey(""); await store.set(AI_KEY_STORE, ""); setKeyMsg("Key cleared from this device."); }}>Forget key</button>
+                    {keyMsg && <span className="ing-importmsg">{keyMsg}</span>}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
           {aiErr && <p className="ing-fetcherr-msg">{aiErr}</p>}
           {aiOut && (
             <div className="br-ai-out">
@@ -3867,6 +4635,78 @@ const CSS = `
 .lg-bet-body { display: flex; flex-direction: column; gap: 3px; }
 .lg-bet-desc { font-weight: 500; }
 .lg-parlay-tag { font-family: 'Archivo'; font-size: 9px; letter-spacing: 0.09em; color: var(--amber); margin-left: 6px; }
+.jr { background: var(--field2); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-top: 14px; }
+.jr-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 10px; }
+.jr-head h2, .bk-head h2 { font-family: 'Archivo'; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; }
+.jr-day { margin-bottom: 12px; }
+.jr-date { font-family: 'Archivo'; font-size: 10px; letter-spacing: 0.1em; color: var(--phos); }
+.jr-day ul { margin: 6px 0 0 16px; }
+.jr-day li { font-size: 12.5px; color: var(--ink); line-height: 1.5; margin-bottom: 4px; }
+.jr-note { font-size: 11px; color: var(--ink-dim); border-top: 1px solid var(--line); padding-top: 9px; margin-top: 4px; }
+.bk { background: var(--field2); border: 1px solid var(--line); border-left: 3px solid var(--amber); border-radius: 12px; padding: 16px; margin-top: 14px; }
+.bk-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 8px; flex-wrap: wrap; }
+.bk-note { font-size: 12px; color: var(--ink-dim); line-height: 1.55; margin-bottom: 10px; }
+.bk-restore { display: flex; flex-direction: column; gap: 6px; font-family: 'Archivo'; font-size: 9.5px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-dim); }
+.ing-db-import { padding: 0 28px; margin-top: 18px; }
+.grade { background: var(--field2); border: 1px solid var(--line); border-radius: 12px; padding: 14px; margin-bottom: 14px; }
+.grade-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+.grade-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 9px; margin-bottom: 9px; }
+@media (max-width: 560px) { .grade-stats { grid-template-columns: 1fr 1fr; } }
+.grade-stats div { display: flex; flex-direction: column; gap: 3px; background: var(--field); border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; }
+.grade-stats em { font-style: normal; font-size: 8.5px; letter-spacing: 0.11em; text-transform: uppercase; color: var(--ink-dim); font-family: 'Archivo'; }
+.grade-stats strong { font-family: 'Archivo'; font-weight: 700; font-size: 17px; }
+.grade-stats strong.neg { color: var(--rust); }
+.grade-note { font-size: 12px; color: var(--ink-dim); line-height: 1.55; }
+.br-key { margin: 10px 0; }
+.br-key-toggle { background: transparent; border: 1px solid var(--line); color: var(--ink-dim); font-family: 'Archivo'; font-size: 10.5px; letter-spacing: 0.07em; text-transform: uppercase; padding: 7px 11px; border-radius: 6px; cursor: pointer; width: 100%; text-align: left; }
+.br-key-body { padding: 12px; border: 1px solid var(--line); border-top: none; border-radius: 0 0 8px 8px; background: var(--field); }
+.br-key-body a { color: var(--cyan); }
+.br-key-input { width: 100%; background: var(--field2); border: 1px solid var(--line); color: var(--ink); padding: 10px 12px; border-radius: 7px; font-family: 'Space Grotesk'; font-size: 14px; margin-bottom: 9px; }
+.br-key-input:focus { outline: none; border-color: var(--phos); box-shadow: 0 0 0 3px rgba(52,230,168,0.12); }
+.bc { background: var(--field2); border: 1px solid var(--line); border-radius: 12px; padding: 14px; margin-bottom: 14px; }
+.bc-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 8px; flex-wrap: wrap; }
+.bc-title { font-family: 'Archivo'; font-size: 10px; letter-spacing: 0.13em; text-transform: uppercase; color: var(--ink-dim); }
+.bc-sort { display: flex; gap: 4px; }
+.bc-sort button { font-family: 'Archivo'; font-size: 9px; letter-spacing: 0.06em; text-transform: uppercase; background: transparent; color: var(--ink-dim); border: 1px solid var(--line); padding: 5px 9px; border-radius: 5px; cursor: pointer; }
+.bc-sort button.on { color: var(--field); background: var(--phos); border-color: var(--phos); font-weight: 600; }
+.bc-svg { width: 100%; height: auto; display: block; touch-action: manipulation; }
+.bc-row:active rect { fill: rgba(52,230,168,0.12); }
+.bc-legend { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-top: 9px; font-size: 10px; color: var(--ink-dim); }
+.bc-legend span { display: inline-flex; align-items: center; gap: 4px; }
+.bc-legend i { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+.bc-k-line { width: 2px !important; height: 11px !important; border-radius: 0 !important; background: var(--ink-dim); }
+.bc-k-over { background: var(--amber); }
+.bc-k-under { background: var(--cyan); }
+.bc-k-note { margin-left: auto; opacity: 0.7; }
+.bc-detail { display: flex; flex-direction: column; gap: 4px; margin-top: 11px; padding: 11px 13px; background: var(--field); border: 1px solid var(--line); border-radius: 9px; font-size: 12.5px; }
+.bc-detail strong { font-size: 14px; }
+.bc-detail span { color: var(--ink-dim); }
+.bc-detail b { color: var(--ink); }
+.bc-detail-note { font-size: 11.5px; opacity: 0.85; padding-top: 3px; }
+.bc-empty { background: var(--field2); border: 1px dashed var(--line); border-radius: 12px; padding: 16px; margin-bottom: 14px; font-size: 12.5px; color: var(--ink-dim); text-align: center; }
+.slate-days { display: flex; align-items: center; gap: 9px; margin-bottom: 10px; flex-wrap: wrap; }
+.slate-days-label { font-family: 'Archivo'; font-size: 9.5px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-dim); }
+.slate-days select { background: var(--field); border: 1px solid var(--line); color: var(--ink); padding: 7px 10px; border-radius: 7px; font-family: 'Space Grotesk'; font-size: 13px; }
+.slate-research { background: rgba(95,217,232,0.07); border: 1px solid var(--line); border-left: 3px solid var(--cyan); border-radius: 9px; padding: 11px 14px; font-size: 12.5px; color: var(--ink-dim); line-height: 1.55; margin-bottom: 12px; }
+.slate-research strong { color: var(--cyan); }
+.slate-chip.move { background: rgba(245,196,81,0.12); color: var(--amber); }
+.sg-move { font-size: 11px; margin-top: 3px; }
+.sg-move.up { color: var(--amber); }
+.sg-move.down { color: var(--cyan); }
+.ing-tf { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 12px 0 6px; flex-wrap: wrap; }
+.ing-tf-label { font-family: 'Archivo'; font-size: 9.5px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-dim); }
+.ing-tf-btns { display: flex; gap: 5px; }
+.ing-tf-btns button { font-family: 'Archivo'; font-size: 10.5px; letter-spacing: 0.07em; text-transform: uppercase; background: transparent; color: var(--ink-dim); border: 1px solid var(--line); padding: 6px 12px; border-radius: 6px; cursor: pointer; }
+.ing-tf-btns button.on { color: var(--field); background: var(--cyan); border-color: var(--cyan); font-weight: 600; }
+.ing-tf-note { font-size: 11.5px; color: var(--ink-dim); line-height: 1.5; margin-bottom: 10px; padding-left: 9px; border-left: 2px solid var(--line); }
+.lg-betlist-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
+.lg-betlist-head h2 { margin-bottom: 0; }
+.lg-filter { display: flex; gap: 5px; }
+.lg-filter button { font-family: 'Archivo'; font-size: 10px; letter-spacing: 0.07em; text-transform: uppercase; background: transparent; color: var(--ink-dim); border: 1px solid var(--line); padding: 6px 11px; border-radius: 6px; cursor: pointer; }
+.lg-filter button.on { color: var(--field); background: var(--phos); border-color: var(--phos); font-weight: 600; }
+.lg-bet.mine { border-left: 2px solid var(--cyan); }
+.lg-mine-tag { display: block; font-family: 'Archivo'; font-size: 8px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--cyan); margin-top: 3px; }
+.lg-mkt { display: inline-block; font-family: 'Archivo'; font-size: 8.5px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; padding: 2px 6px; border-radius: 4px; background: rgba(95,217,232,0.13); color: var(--cyan); margin-right: 7px; vertical-align: middle; }
 .lg-bet-legs { font-size: 11px; color: var(--ink-dim); }
 .lg-bet-notes { font-size: 11px; color: var(--cyan); font-style: italic; }
 .lg-bet-stake { color: var(--ink-dim); text-align: right; }
