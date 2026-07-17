@@ -1087,12 +1087,158 @@ function App() {
 }
 
 // ===========================================================================
+// GAME DETAIL — one game, the whole picture, on one screen.
+// Opens from the board chart. Runs the SAME 20k-sim deep dive the Terminal
+// runs (same builders, same guards — a starter who isn't confirmed still
+// refuses to fake a number), and lays the market, the model, and both rosters'
+// key inputs side by side so a game can be judged without bouncing between
+// Home and the projection screen.
+// ===========================================================================
+function CompareBar({ label, a, h, higherIsBetter, fmt }) {
+  const av = parseFloat(a), hv = parseFloat(h);
+  const both = !isNaN(av) && !isNaN(hv);
+  const max = both ? Math.max(Math.abs(av), Math.abs(hv)) || 1 : 1;
+  const w = (v) => Math.min(100, Math.abs(v) / max * 100);
+  const aBetter = both && (higherIsBetter ? av > hv : av < hv);
+  const hBetter = both && (higherIsBetter ? hv > av : hv < av);
+  const F = fmt || ((x) => x);
+  return (
+    <div className="gd-cmp-row">
+      <span className={"gd-cmp-val" + (aBetter ? " lead" : "")}>{isNaN(av) ? "—" : F(av)}</span>
+      <div className="gd-cmp-mid">
+        <div className="gd-cmp-track left"><div className={"gd-cmp-fill" + (aBetter ? " lead" : "")} style={{ width: (both ? w(av) : 0) + "%" }} /></div>
+        <span className="gd-cmp-label">{label}</span>
+        <div className="gd-cmp-track"><div className={"gd-cmp-fill" + (hBetter ? " lead" : "")} style={{ width: (both ? w(hv) : 0) + "%" }} /></div>
+      </div>
+      <span className={"gd-cmp-val" + (hBetter ? " lead" : "")}>{isNaN(hv) ? "—" : F(hv)}</span>
+    </div>
+  );
+}
+
+function GameDetail({ g, teams, dateKey, isToday, onClose }) {
+  const [r, setR] = useState(null);
+  const [busy, setBusy] = useState(true);
+  const [why, setWhy] = useState("");
+
+  const A = matchTeamDb(g.away, teams), H = matchTeamDb(g.home, teams);
+  const park = H ? parkForTeam(H.name) : "Neutral";
+  const started = g.inPlay || (g.start && new Date(g.start).getTime() <= Date.now());
+
+  const findArm = (t, pName) => {
+    if (!pName || !t?.rotation) return null;
+    const pn = normName(pName);
+    return t.rotation.find((x) => normName(x.name) === pn) || t.rotation.find((x) => pn.includes(normName(x.name).split(" ").pop())) || null;
+  };
+  const aArm = findArm(A, g.awayP), hArm = findArm(H, g.homeP);
+
+  useEffect(() => {
+    let dead = false;
+    (async () => {
+      if (!A || !H) { setWhy(`${!A ? g.away : g.home} isn't in the database — no honest projection possible.`); setBusy(false); return; }
+      if (started) { setWhy("First pitch has passed. This model prices 9 innings — a game in progress is a different question, and the board keeps the last pregame line for the record."); setBusy(false); return; }
+      if (!aArm?.xwoba || !hArm?.xwoba) {
+        setWhy(!g.awayP || !g.homeP
+          ? "A probable starter hasn't been posted yet. The arm is the single biggest input to a total — running the sim on a team-average pitcher would produce a confident number about a game that isn't the one being played."
+          : "A listed starter isn't in the database with stats yet. Import his numbers (Savant CSV) and reopen.");
+        setBusy(false); return;
+      }
+      // let the overlay paint before 20k sims block the thread
+      await new Promise((res) => setTimeout(res, 60));
+      if (dead) return;
+      const num = (v) => (v === "" || v == null ? null : parseFloat(v));
+      const side = (t, arm) => ({
+        off: num(t.off) ?? CFG.LEAGUE_WOBA, xoff: num(t.xoff), pa: num(t.pa) ?? 600,
+        recent: num(t.recent), recentPA: num(t.recentPA), recentBbk: num(t.recentBbk),
+        sp: num(arm.xwoba) ?? 0.32, spBf: num(arm.bf) ?? 200, spIp: num(arm.ip) ?? 5, spEra: num(arm.era),
+        pen: num(t.pen) ?? 0.318, penBf: num(t.penBf) ?? 800, penBarrel: num(t.penBarrel), penHardHit: num(t.penHardHit),
+        oaa: num(t.oaa), framing: num(t.framing),
+      });
+      const a = side(A, aArm), h = side(H, hArm);
+      const proj = projectGame({
+        park, line: num(g.line) ?? 8.5, temp: null, windOut: null,
+        awayOff: a.off, awayXoff: a.xoff, awayPA: a.pa, awayRecent: a.recent, awayRecentPA: a.recentPA, awayRecentBbk: a.recentBbk,
+        awaySP: a.sp, awaySPbf: a.spBf, awaySPip: a.spIp, awaySPera: a.spEra,
+        awayPen: a.pen, awayPenBf: a.penBf, awayPenBarrel: a.penBarrel, awayPenHardHit: a.penHardHit,
+        awayOAA: a.oaa, awayFraming: a.framing,
+        homeOff: h.off, homeXoff: h.xoff, homePA: h.pa, homeRecent: h.recent, homeRecentPA: h.recentPA, homeRecentBbk: h.recentBbk,
+        homeSP: h.sp, homeSPbf: h.spBf, homeSPip: h.spIp, homeSPera: h.spEra,
+        homePen: h.pen, homePenBf: h.penBf, homePenBarrel: h.penBarrel, homePenHardHit: h.penHardHit,
+        homeOAA: h.oaa, homeFraming: h.framing,
+      });
+      if (dead) return;
+      setR({ ...proj, awayName: A.name, homeName: H.name });
+      setBusy(false);
+    })();
+    return () => { dead = true; };
+  }, []);
+
+  const moved = g.openLine !== "" && g.openLine != null && g.line !== "" && parseFloat(g.openLine) !== parseFloat(g.line);
+
+  return (
+    <div className="gd-overlay" role="dialog" aria-label={`${g.away} at ${g.home} full breakdown`}>
+      <div className="gd-sheet">
+        <div className="gd-top">
+          <button className="gd-back" onClick={onClose}>← Board</button>
+          <span className="gd-date">{dateKey}{isToday ? " · today" : " · archived"}</span>
+        </div>
+
+        <h2 className="gd-title">{g.away} <em>@</em> {g.home}</h2>
+        <p className="gd-sub">
+          {g.awayP || "TBD"} vs {g.homeP || "TBD"} · {park}{g.start ? ` · first pitch ${new Date(g.start).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone: "America/New_York" })} ET` : ""}
+          {started ? " · ● in play" : ""}
+        </p>
+
+        <div className="gd-market">
+          <div><em>Line</em><strong>{g.line || "—"}</strong></div>
+          <div><em>Over</em><strong>{g.over || "—"}</strong></div>
+          <div><em>Under</em><strong>{g.under || "—"}</strong></div>
+          <div><em>Opened</em><strong className={moved ? (parseFloat(g.line) > parseFloat(g.openLine) ? "gd-up" : "gd-dn") : ""}>{g.openLine || "—"}{moved ? (parseFloat(g.line) > parseFloat(g.openLine) ? " ▲" : " ▼") : ""}</strong></div>
+        </div>
+        {moved && <p className="gd-move-note">The market has moved {Math.abs(parseFloat(g.line) - parseFloat(g.openLine)).toFixed(1)} runs since this board first saw a number{g.openTs ? ` (${g.openTs})` : ""} — that drift is information about where money went.</p>}
+
+        {g.proj && (
+          <div className="gd-frozen">
+            Scanner's read at {g.proj.ts || "scan time"}: model {g.proj.model} vs line {g.proj.atLine} ({g.proj.edge > 0 ? "+" : ""}{g.proj.edge} pts). Below is the fresh full-depth run.
+          </div>
+        )}
+
+        {busy && <div className="gd-busy">◆ Running the full 20,000-simulation deep dive…</div>}
+        {!busy && why && <div className="gd-why">{why}</div>}
+        {!busy && r && <Readout r={r} />}
+
+        {A && H && (
+          <div className="gd-compare">
+            <div className="gd-cmp-head">
+              <span>{A.name}</span><span className="gd-cmp-mid-head">Inputs, side by side</span><span>{H.name}</span>
+            </div>
+            <CompareBar label="wOBA" a={A.off} h={H.off} higherIsBetter fmt={(x) => x.toFixed(3)} />
+            <CompareBar label="xwOBA" a={A.xoff} h={H.xoff} higherIsBetter fmt={(x) => x.toFixed(3)} />
+            <CompareBar label="14-day wOBA" a={A.recent} h={H.recent} higherIsBetter fmt={(x) => x.toFixed(3)} />
+            <CompareBar label="14d BB%−K%" a={A.recentBbk} h={H.recentBbk} higherIsBetter fmt={(x) => x.toFixed(1)} />
+            <CompareBar label="SP xwOBA" a={aArm?.xwoba} h={hArm?.xwoba} fmt={(x) => x.toFixed(3)} />
+            <CompareBar label="SP ERA" a={aArm?.era} h={hArm?.era} fmt={(x) => x.toFixed(2)} />
+            <CompareBar label="Bullpen xwOBA" a={A.pen} h={H.pen} fmt={(x) => x.toFixed(3)} />
+            <CompareBar label="Pen barrel% alwd" a={A.penBarrel} h={H.penBarrel} fmt={(x) => x.toFixed(1)} />
+            <CompareBar label="Defense OAA" a={A.oaa} h={H.oaa} higherIsBetter fmt={(x) => (x > 0 ? "+" : "") + x.toFixed(0)} />
+            <CompareBar label="Framing runs" a={A.framing} h={H.framing} higherIsBetter fmt={(x) => (x > 0 ? "+" : "") + x.toFixed(0)} />
+            <p className="gd-cmp-note">Pitching rows: lower is better. Blank means that stat hasn't been imported for this team yet — the model falls back to league average there, so a blank is a soft spot in the read, not a zero.</p>
+          </div>
+        )}
+
+        <p className="gd-foot">Same engine, same guards as the Terminal — this is the deep dive, just anchored to the game. Research, not advice; the pass is always available.</p>
+      </div>
+    </div>
+  );
+}
+
+// ===========================================================================
 // CHANGELOG — the visible journal. One entry per build day, written when the
 // code changes, shipped inside the file itself so it can never drift from
 // what's actually deployed. Newest first.
 // ===========================================================================
 const CHANGELOG = [
   { date: "2026-07-16", items: [
+    "Full game breakdown: tap a game on the board chart (or the ⤢ on any slate card) and a dedicated page opens — market panel with opener→current movement, the scanner's earlier read, a fresh full 20k-sim deep dive with the complete Terminal readout, and all ten key inputs side by side for both teams. Same guards as everywhere else: no confirmed starter, no fake number. Works on archived days too.",
     "One-tap game loading in the Terminal: pick any game from Today's Slate and the whole projection fills itself — both teams, probable starters with their stats, the market line, both prices, and the home team's actual park. The auto-apply path now sets the park too (it used to leave whatever was there).",
     "Pulling live odds now auto-attaches probable starters from MLB for every day pulled — one tap does odds AND pitchers. The odds feed itself never carries pitchers (it's totals-market data), so the app chains the MLB schedule call for you; if that's unreachable, the Fetch matchups button and paste box still work.",
     "FIXED (dangerous): the odds feed also serves IN-PLAY games, and the app didn't check. A live total on a game already underway (e.g. 5.5 with four innings left) would overwrite the stored pregame line, and the 9-inning model would then 'find' a huge fake edge against it — and could crown it Bet of the Day. Pulls now request pre-match games only, started games freeze at their last pregame number, and both the scanner and Bet of the Day refuse anything past first pitch.",
@@ -3140,7 +3286,7 @@ function shortTeam(n) {
   return w[w.length - 1] || "?";
 }
 
-function BoardChart({ games, rows, onPick }) {
+function BoardChart({ games, rows, onPick, onOpen }) {
   const [sort, setSort] = useState("gap"); // gap | board
   const [sel, setSel] = useState(null);
 
@@ -3238,9 +3384,12 @@ function BoardChart({ games, rows, onPick }) {
           </span>
           <span className="bc-detail-note">
             {Math.abs(selected.edge ?? 0) >= 4
-              ? "Flagged by the scanner — the Terminal's 20k-sim run is the only thing that can confirm it."
+              ? "Flagged by the scanner — the full 20k-sim deep dive is the only thing that can confirm it."
               : "No meaningful gap. The board and the model agree here."}
           </span>
+          {onOpen && (
+            <button className="bc-open" onClick={() => onOpen(selected.g)}>Open full breakdown →</button>
+          )}
         </div>
       )}
     </div>
@@ -3266,6 +3415,7 @@ function SlateHub() {
   const [rows, setRows] = useState(null);
   const [lean, setLean] = useState(null);
   const [acc, setAcc] = useState(null);
+  const [detailGame, setDetailGame] = useState(null);
   const [gradeMsg, setGradeMsg] = useState("");
   const [grading, setGrading] = useState(false);
 
@@ -3767,7 +3917,11 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
       </div>
 
       {games.length > 0 && (rows || games.some((g) => g.proj)) && (
-        <BoardChart games={games} rows={rows} />
+        <BoardChart games={games} rows={rows} onOpen={(g) => setDetailGame(g)} />
+      )}
+
+      {detailGame && (
+        <GameDetail g={detailGame} teams={teams} dateKey={viewDate} isToday={isToday} onClose={() => setDetailGame(null)} />
       )}
 
       {games.length > 0 && (
@@ -3851,6 +4005,7 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
                       </span>
                     )}
                   </div>
+                  <button className="sg-open" onClick={() => setDetailGame(g)} aria-label="Full breakdown">⤢</button>
                   <button className="sg-remove" onClick={() => removeGame(i)} aria-label="Remove game">✕</button>
                 </div>
                 <div className="sg-market">
@@ -4924,6 +5079,43 @@ const CSS = `
 .slate-research { background: rgba(95,217,232,0.07); border: 1px solid var(--line); border-left: 3px solid var(--cyan); border-radius: 9px; padding: 11px 14px; font-size: 12.5px; color: var(--ink-dim); line-height: 1.55; margin-bottom: 12px; }
 .slate-research strong { color: var(--cyan); }
 .slate-chip.move { background: rgba(245,196,81,0.12); color: var(--amber); }
+.gd-overlay { position: fixed; inset: 0; z-index: 60; background: rgba(5,13,9,0.92); backdrop-filter: blur(6px); overflow-y: auto; -webkit-overflow-scrolling: touch; }
+.gd-sheet { max-width: 720px; margin: 0 auto; padding: 18px 18px 40px; animation: fadein 0.25s ease; }
+.gd-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
+.gd-back { background: transparent; border: 1px solid var(--line); color: var(--ink); font-family: 'Archivo'; font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; padding: 9px 14px; border-radius: 8px; cursor: pointer; }
+.gd-back:hover { border-color: var(--phos); color: var(--phos); }
+.gd-date { font-size: 11px; color: var(--ink-dim); font-family: 'Archivo'; letter-spacing: 0.1em; text-transform: uppercase; }
+.gd-title { font-family: 'Archivo'; font-weight: 700; font-size: 24px; }
+.gd-title em { font-style: normal; color: var(--phos); }
+.gd-sub { font-size: 13px; color: var(--ink-dim); margin: 5px 0 14px; }
+.gd-market { display: grid; grid-template-columns: repeat(4, 1fr); gap: 9px; margin-bottom: 10px; }
+.gd-market div { background: var(--field2); border: 1px solid var(--line); border-radius: 9px; padding: 10px 12px; display: flex; flex-direction: column; gap: 3px; }
+.gd-market em { font-style: normal; font-size: 8.5px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-dim); font-family: 'Archivo'; }
+.gd-market strong { font-family: 'Archivo'; font-weight: 700; font-size: 19px; }
+.gd-market .gd-up { color: var(--amber); }
+.gd-market .gd-dn { color: var(--cyan); }
+.gd-move-note { font-size: 12px; color: var(--ink-dim); margin-bottom: 12px; padding-left: 9px; border-left: 2px solid var(--amber); line-height: 1.5; }
+.gd-frozen { background: rgba(95,217,232,0.07); border: 1px solid var(--line); border-left: 3px solid var(--cyan); border-radius: 9px; padding: 10px 13px; font-size: 12.5px; color: var(--ink-dim); margin-bottom: 12px; }
+.gd-busy { text-align: center; padding: 40px 0; color: var(--phos); font-family: 'Archivo'; font-size: 13px; letter-spacing: 0.1em; animation: pulse 1.4s ease-in-out infinite; }
+.gd-why { background: rgba(232,115,79,0.08); border: 1px solid var(--line); border-left: 3px solid var(--rust); border-radius: 9px; padding: 13px 15px; font-size: 13px; line-height: 1.6; margin-bottom: 14px; }
+.gd-compare { background: var(--field2); border: 1px solid var(--line); border-radius: 12px; padding: 15px; margin-top: 16px; }
+.gd-cmp-head { display: flex; justify-content: space-between; font-family: 'Archivo'; font-size: 11px; font-weight: 600; margin-bottom: 12px; gap: 8px; }
+.gd-cmp-mid-head { font-size: 9px; letter-spacing: 0.11em; text-transform: uppercase; color: var(--ink-dim); font-weight: 400; align-self: center; }
+.gd-cmp-row { display: grid; grid-template-columns: 52px 1fr 52px; gap: 8px; align-items: center; margin-bottom: 8px; }
+.gd-cmp-val { font-family: 'Archivo'; font-size: 12px; color: var(--ink-dim); }
+.gd-cmp-val:last-child { text-align: right; }
+.gd-cmp-val.lead { color: var(--phos); font-weight: 700; }
+.gd-cmp-mid { display: grid; grid-template-columns: 1fr auto 1fr; gap: 7px; align-items: center; }
+.gd-cmp-label { font-size: 9px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-dim); font-family: 'Archivo'; white-space: nowrap; }
+.gd-cmp-track { height: 7px; background: var(--field); border-radius: 4px; overflow: hidden; }
+.gd-cmp-track.left { transform: scaleX(-1); }
+.gd-cmp-fill { height: 100%; background: var(--phos-dim); border-radius: 4px; }
+.gd-cmp-fill.lead { background: var(--phos); }
+.gd-cmp-note { font-size: 11px; color: var(--ink-dim); line-height: 1.5; margin-top: 10px; border-top: 1px solid var(--line); padding-top: 9px; }
+.gd-foot { font-size: 11px; color: var(--ink-dim); text-align: center; margin-top: 18px; }
+.bc-open { margin-top: 9px; font-family: 'Archivo'; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; background: var(--phos); color: var(--field); border: none; padding: 10px 14px; border-radius: 7px; cursor: pointer; font-weight: 600; align-self: flex-start; }
+.sg-open { background: transparent; border: none; color: var(--ink-dim); cursor: pointer; font-size: 14px; padding: 3px 7px; border-radius: 5px; }
+.sg-open:hover { color: var(--phos); background: rgba(52,230,168,0.1); }
 .ing-gamepick { display: flex; flex-direction: column; gap: 5px; margin-bottom: 14px; padding: 12px; background: rgba(52,230,168,0.06); border: 1px solid var(--line); border-left: 3px solid var(--phos); border-radius: 9px; }
 .ing-gamepick label { font-size: 9.5px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--phos); font-family: 'Archivo'; }
 .ing-gamepick select { background: var(--field); border: 1px solid var(--line); color: var(--ink); padding: 10px 12px; border-radius: 7px; font-family: 'Space Grotesk'; font-size: 14px; width: 100%; }
