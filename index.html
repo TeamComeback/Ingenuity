@@ -231,6 +231,60 @@ function daysOld(iso) {
   return d < 0 ? 0 : d;
 }
 
+// Stadium coordinates + roof + approximate home-plate→center-field bearing
+// (degrees true). Bearings are approximations good to ~±20°; with the engine's
+// weather boost capped at ±6%, that error is bounded and acceptable. Roofed
+// parks (fixed or usually-closed retractables) get indoor conditions.
+const PARK_META = {
+  "Coors":           { lat: 39.756, lon: -104.994, roof: false, cf: 5 },
+  "Sutter Health":   { lat: 38.580, lon: -121.513, roof: false, cf: 30 },
+  "Camden":          { lat: 39.284, lon: -76.622,  roof: false, cf: 31 },
+  "Great American":  { lat: 39.097, lon: -84.507,  roof: false, cf: 120 },
+  "Citizens Bank":   { lat: 39.906, lon: -75.166,  roof: false, cf: 10 },
+  "Fenway":          { lat: 42.346, lon: -71.097,  roof: false, cf: 52 },
+  "Wrigley":         { lat: 41.948, lon: -87.655,  roof: false, cf: 45 },
+  "Chase":           { lat: 33.445, lon: -112.067, roof: true,  cf: 0 },
+  "Yankee":          { lat: 40.829, lon: -73.926,  roof: false, cf: 75 },
+  "Rate Field":      { lat: 41.830, lon: -87.634,  roof: false, cf: 125 },
+  "Truist":          { lat: 33.891, lon: -84.468,  roof: false, cf: 145 },
+  "Rogers Centre":   { lat: 43.641, lon: -79.389,  roof: true,  cf: 0 },
+  "American Family": { lat: 43.028, lon: -87.971,  roof: true,  cf: 0 },
+  "Daikin":          { lat: 29.757, lon: -95.355,  roof: true,  cf: 0 },
+  "Nationals Park":  { lat: 38.873, lon: -77.007,  roof: false, cf: 25 },
+  "Globe Life":      { lat: 32.747, lon: -97.084,  roof: true,  cf: 0 },
+  "Target":          { lat: 44.982, lon: -93.278,  roof: false, cf: 90 },
+  "Progressive":     { lat: 41.496, lon: -81.685,  roof: false, cf: 0 },
+  "Angel Stadium":   { lat: 33.800, lon: -117.883, roof: false, cf: 65 },
+  "Dodger":          { lat: 34.074, lon: -118.240, roof: false, cf: 25 },
+  "Citi":            { lat: 40.757, lon: -73.846,  roof: false, cf: 30 },
+  "Comerica":        { lat: 42.339, lon: -83.049,  roof: false, cf: 150 },
+  "Busch":           { lat: 38.623, lon: -90.193,  roof: false, cf: 90 },
+  "loanDepot":       { lat: 25.778, lon: -80.220,  roof: true,  cf: 0 },
+  "Steinbrenner":    { lat: 27.980, lon: -82.507,  roof: false, cf: 45 },
+  "PNC":             { lat: 40.447, lon: -80.006,  roof: false, cf: 115 },
+  "Kauffman":        { lat: 39.051, lon: -94.480,  roof: false, cf: 45 },
+  "Petco":           { lat: 32.707, lon: -117.157, roof: false, cf: 25 },
+  "T-Mobile":        { lat: 47.591, lon: -122.332, roof: true,  cf: 0 },
+  "Oracle":          { lat: 37.778, lon: -122.389, roof: false, cf: 85 },
+};
+
+// Wind blows FROM wind_direction; it travels TOWARD dir+180. The out-to-center
+// component is the projection of that vector onto the park's CF bearing:
+// positive = blowing out (more runs), negative = blowing in.
+function windOutComponent(speedMph, windFromDeg, cfBearing) {
+  if (speedMph == null || windFromDeg == null || cfBearing == null) return 0;
+  const towardDeg = (windFromDeg + 180) % 360;
+  const rad = ((towardDeg - cfBearing) * Math.PI) / 180;
+  return Math.round(speedMph * Math.cos(rad) * 10) / 10;
+}
+
+// 225° -> "SW": the direction the wind is coming FROM, book/broadcast style.
+function degToCompass(deg) {
+  if (deg == null || isNaN(deg)) return "—";
+  const pts = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"];
+  return pts[Math.round(((deg % 360) / 22.5)) % 16];
+}
+
 function parkForTeam(teamName) {
   // Whole-word match: every word of the mapped name must appear in the given
   // name. Keeps "SF Giants" -> Oracle while making "Red Sox"/"White Sox"
@@ -1155,7 +1209,7 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
       });
       const a = side(A, aArm), h = side(H, hArm);
       const proj = projectGame({
-        park, line: num(g.line) ?? 8.5, temp: null, windOut: null,
+        park, line: num(g.line) ?? 8.5, temp: g.wx ? g.wx.temp : null, windOut: g.wx ? g.wx.windOut : null,
         awayOff: a.off, awayXoff: a.xoff, awayPA: a.pa, awayRecent: a.recent, awayRecentPA: a.recentPA, awayRecentBbk: a.recentBbk,
         awaySP: a.sp, awaySPbf: a.spBf, awaySPip: a.spIp, awaySPera: a.spEra,
         awayPen: a.pen, awayPenBf: a.penBf, awayPenBarrel: a.penBarrel, awayPenHardHit: a.penHardHit,
@@ -1186,6 +1240,9 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
         <p className="gd-sub">
           {g.awayP || "TBD"} vs {g.homeP || "TBD"} · {park}{g.start ? ` · first pitch ${new Date(g.start).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone: "America/New_York" })} ET` : ""}
           {started ? " · ● in play" : ""}
+          {g.wx && (g.wx.roof
+            ? " · ⌂ roof — indoor conditions"
+            : ` · ${g.wx.temp}°F, wind ${Math.abs(g.wx.windOut)} mph ${g.wx.windOut > 1 ? "out" : g.wx.windOut < -1 ? "in" : "neutral"}`)}
         </p>
 
         <div className="gd-market">
@@ -1195,6 +1252,27 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
           <div><em>Opened</em><strong className={moved ? (parseFloat(g.line) > parseFloat(g.openLine) ? "gd-up" : "gd-dn") : ""}>{g.openLine || "—"}{moved ? (parseFloat(g.line) > parseFloat(g.openLine) ? " ▲" : " ▼") : ""}</strong></div>
         </div>
         {moved && <p className="gd-move-note">The market has moved {Math.abs(parseFloat(g.line) - parseFloat(g.openLine)).toFixed(1)} runs since this board first saw a number{g.openTs ? ` (${g.openTs})` : ""} — that drift is information about where money went.</p>}
+
+        {g.wx && (
+          <div className="gd-wx">
+            <div className="gd-wx-head">Game conditions · {park}</div>
+            {g.wx.roof ? (
+              <p className="gd-wx-roof">⌂ Roofed park — indoor conditions (72°, still air). Weather is a non-factor here; the park factor ({PARKS[park] ?? 1}) is the whole environment story.</p>
+            ) : (
+              <>
+                <div className="gd-wx-grid">
+                  <div><em>Temp</em><strong>{g.wx.temp}°F</strong><span>{g.wx.temp >= 85 ? "hot — ball carries" : g.wx.temp <= 55 ? "cold — ball dies" : "moderate"}</span></div>
+                  <div><em>Wind</em><strong>{g.wx.spd != null ? `${g.wx.spd} mph` : "—"}</strong><span>{g.wx.dir != null ? `from the ${degToCompass(g.wx.dir)}` : ""}</span></div>
+                  <div><em>To center</em><strong className={g.wx.windOut > 1 ? "gd-up" : g.wx.windOut < -1 ? "gd-dn" : ""}>{g.wx.windOut > 0 ? "+" : ""}{g.wx.windOut} mph</strong><span>{g.wx.windOut > 1 ? "blowing OUT ↗" : g.wx.windOut < -1 ? "blowing IN ↘" : "crosswind / calm"}</span></div>
+                  <div><em>Run env</em><strong>{(((PARKS[park] ?? 1) * weatherFactor(g.wx.temp, g.wx.windOut) - 1) * 100).toFixed(1)}%</strong><span>park × weather vs neutral</span></div>
+                </div>
+                <p className="gd-wx-note">
+                  For prop research: the to-center component is what matters for carry — fly balls, HR/XBH distance, and deep-outfield outs all move with it, while a pure crosswind mostly just bends foul lines. Raw speed and compass direction are shown so you can judge the parts of the park the component math can't see. The engine caps the total weather effect at ±6%, and this forecast was fetched at pull time — re-pull closer to first pitch for a fresher read.
+                </p>
+              </>
+            )}
+          </div>
+        )}
 
         {g.proj && (
           <div className="gd-frozen">
@@ -1238,6 +1316,8 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
 // ===========================================================================
 const CHANGELOG = [
   { date: "2026-07-16", items: [
+    "Weather panel in the game breakdown: temperature with a plain-language read, raw wind speed + compass origin, the signed to-center component (out ↗ / in ↘ / crosswind), and the combined park-times-weather run environment vs neutral. Raw direction is kept now, not just the computed component — for prop research, carry lives in the to-center number while a crosswind mostly bends foul lines.",
+    "Game-time weather, automatic: after every odds pull the app fetches each outdoor park's forecast (free open-meteo, no key) for the actual first-pitch hour — temperature plus the wind's out-to-center component computed from each stadium's orientation. Roofed parks get indoor conditions without a call. The slate scan, Bet of the Day, and the game breakdown all use it now; they previously ran every game at null weather. Shown on every slate card (78° · 9mph out ↗) and in the breakdown header. CF bearings are ±20° approximations and the engine caps weather at ±6%, so errors stay bounded.",
     "Full game breakdown: tap a game on the board chart (or the ⤢ on any slate card) and a dedicated page opens — market panel with opener→current movement, the scanner's earlier read, a fresh full 20k-sim deep dive with the complete Terminal readout, and all ten key inputs side by side for both teams. Same guards as everywhere else: no confirmed starter, no fake number. Works on archived days too.",
     "One-tap game loading in the Terminal: pick any game from Today's Slate and the whole projection fills itself — both teams, probable starters with their stats, the market line, both prices, and the home team's actual park. The auto-apply path now sets the park too (it used to leave whatever was there).",
     "Pulling live odds now auto-attaches probable starters from MLB for every day pulled — one tap does odds AND pitchers. The odds feed itself never carries pitchers (it's totals-market data), so the app chains the MLB schedule call for you; if that's unreachable, the Fetch matchups button and paste box still work.",
@@ -3648,6 +3728,62 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
     return attached;
   };
 
+  // Game-time weather per park, free and keyless (open-meteo). One request
+  // covers every outdoor park on the pulled days; roofed parks get indoor
+  // conditions without a call. Quiet on failure — weather is a refinement,
+  // and the Terminal's manual temp/wind boxes always work.
+  const attachWeather = async (days) => {
+    let attached = 0;
+    const arch = await store.get("ingenuity:slate:archive", {});
+    for (const d of days) {
+      const board = arch[d];
+      if (!board) continue;
+      const need = []; // [{i, meta, hourET}]
+      board.games.forEach((g, i) => {
+        const park = parkForTeam(g.home);
+        const meta = PARK_META[park];
+        if (!meta) return;
+        if (meta.roof) {
+          if (!g.wx) { board.games[i] = { ...g, wx: { temp: 72, windOut: 0, roof: true } }; attached++; }
+          return;
+        }
+        const hourET = g.start
+          ? parseInt(new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "numeric", hour12: false }).format(new Date(g.start)))
+          : 19; // typical first pitch if unknown
+        need.push({ i, meta, hourET });
+      });
+      if (need.length) {
+        try {
+          const lats = need.map((n) => n.meta.lat).join(",");
+          const lons = need.map((n) => n.meta.lon).join(",");
+          const r = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lats}&longitude=${lons}&hourly=temperature_2m,wind_speed_10m,wind_direction_10m&temperature_unit=fahrenheit&wind_speed_unit=mph&timezone=America%2FNew_York&start_date=${d}&end_date=${d}`);
+          if (r.ok) {
+            const j = await r.json();
+            const results = Array.isArray(j) ? j : [j];
+            need.forEach((n, k) => {
+              const h = results[k]?.hourly;
+              if (!h || !h.time) return;
+              const idx = Math.min(Math.max(n.hourET, 0), h.time.length - 1);
+              const temp = h.temperature_2m?.[idx];
+              const spd = h.wind_speed_10m?.[idx];
+              const dir = h.wind_direction_10m?.[idx];
+              if (temp == null) return;
+              const g = board.games[n.i];
+              board.games[n.i] = { ...g, wx: { temp: Math.round(temp), windOut: windOutComponent(spd, dir, n.meta.cf), spd: spd != null ? Math.round(spd) : null, dir: dir != null ? Math.round(dir) : null, roof: false } };
+              attached++;
+            });
+          }
+        } catch { /* offline or blocked — manual weather in the Terminal still works */ }
+      }
+      arch[d] = { ...board, games: [...board.games] };
+    }
+    if (attached) {
+      await store.set("ingenuity:slate:archive", arch);
+      if (arch[viewDate]) setSlate(arch[viewDate]);
+    }
+    return attached;
+  };
+
   const pullLive = async () => {
     const key = apiKey.trim();
     if (!key) { setMsg("Paste your Odds API key first — free at the-odds-api.com."); return; }
@@ -3691,7 +3827,8 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
         const remaining = r.headers.get("x-requests-remaining");
         const spread = days.map((d) => `${byDay[d].length} on ${d}${d === todayKey ? " (today)" : ""}`).join(", ");
         const nArms = await attachPitchers(days);
-        setMsg(`Live market pulled: ${parsed.length} game${parsed.length === 1 ? "" : "s"} across ${days.length} day${days.length === 1 ? "" : "s"} — ${spread}. Each is saved to its own board.${nArms ? ` Probable starters attached automatically (${nArms} arm${nArms === 1 ? "" : "s"}).` : " Pitchers weren't reachable just now — tap Fetch matchups to attach them."}${remaining ? ` ${remaining} API requests left this month.` : ""}`);
+        const nWx = await attachWeather(days);
+        setMsg(`Live market pulled: ${parsed.length} game${parsed.length === 1 ? "" : "s"} across ${days.length} day${days.length === 1 ? "" : "s"} — ${spread}. Each is saved to its own board.${nArms ? ` Probable starters attached automatically (${nArms} arm${nArms === 1 ? "" : "s"}).` : " Pitchers weren't reachable just now — tap Fetch matchups to attach them."}${nWx ? ` Game-time weather set for ${nWx} park${nWx === 1 ? "" : "s"}.` : ""}${remaining ? ` ${remaining} API requests left this month.` : ""}`);
       }
     } catch (e) { setMsg(`Live pull failed: ${e.message}`); }
     setBusy("");
@@ -3740,7 +3877,7 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
       const over = parseFloat(g.over) || -110, under = parseFloat(g.under) || -110;
       const homePark = parkForTeam(H.name);
       const r = projectGame({
-        park: homePark, line, temp: null, windOut: null,
+        park: homePark, line, temp: g.wx ? g.wx.temp : null, windOut: g.wx ? g.wx.windOut : null,
         awayOff: a.off, awayXoff: a.xoff, awayPA: a.pa, awayRecent: a.recent, awayRecentPA: a.recentPA, awayRecentBbk: a.recentBbk, awaySP: a.sp, awaySPbf: a.spBf, awaySPip: a.spIp, awaySPera: a.spEra, awayPen: a.pen, awayPenBf: a.penBf, awayPenBarrel: a.penBarrel, awayPenHardHit: a.penHardHit, awayOAA: a.oaa, awayFraming: a.framing,
         homeOff: h.off, homeXoff: h.xoff, homePA: h.pa, homeRecent: h.recent, homeRecentPA: h.recentPA, homeRecentBbk: h.recentBbk, homeSP: h.sp, homeSPbf: h.spBf, homeSPip: h.spIp, homeSPera: h.spEra, homePen: h.pen, homePenBf: h.penBf, homePenBarrel: h.penBarrel, homePenHardHit: h.penHardHit, homeOAA: h.oaa, homeFraming: h.framing,
       }, 8000);
@@ -3995,6 +4132,9 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
                   <div className="sg-teams">
                     <span className="sg-match">{g.away} @ {g.home}</span>
                     <span className="sg-pitchers">{g.awayP || "TBD"} vs {g.homeP || "TBD"}</span>
+                    {g.wx && (
+                      <span className="sg-wx">{g.wx.roof ? "⌂ roof" : `${g.wx.temp}° · ${Math.abs(g.wx.windOut)}mph ${g.wx.windOut > 1 ? "out ↗" : g.wx.windOut < -1 ? "in ↘" : "calm"}`}</span>
+                    )}
                     {(g.inPlay || (g.start && new Date(g.start).getTime() <= Date.now())) && (
                       <span className="sg-inplay">● in play · line frozen at last pregame number</span>
                     )}
@@ -4108,7 +4248,7 @@ function BetOfTheDay() {
       }
       const line = parseFloat(g.line), over = parseFloat(g.over) || -110, under = parseFloat(g.under) || -110;
       const r = projectGame({
-        park: parkForTeam(H.name), line, temp: null, windOut: null,
+        park: parkForTeam(H.name), line, temp: g.wx ? g.wx.temp : null, windOut: g.wx ? g.wx.windOut : null,
         awayOff: a.off, awayXoff: a.xoff, awayPA: a.pa, awayRecent: a.recent, awayRecentPA: a.recentPA, awayRecentBbk: a.recentBbk, awaySP: a.sp, awaySPbf: a.spBf, awaySPip: a.spIp, awaySPera: a.spEra, awayPen: a.pen, awayPenBf: a.penBf, awayPenBarrel: a.penBarrel, awayPenHardHit: a.penHardHit, awayOAA: a.oaa, awayFraming: a.framing,
         homeOff: h.off, homeXoff: h.xoff, homePA: h.pa, homeRecent: h.recent, homeRecentPA: h.recentPA, homeRecentBbk: h.recentBbk, homeSP: h.sp, homeSPbf: h.spBf, homeSPip: h.spIp, homeSPera: h.spEra, homePen: h.pen, homePenBf: h.penBf, homePenBarrel: h.penBarrel, homePenHardHit: h.penHardHit, homeOAA: h.oaa, homeFraming: h.framing,
       }, 8000);
@@ -5094,6 +5234,18 @@ const CSS = `
 .gd-market strong { font-family: 'Archivo'; font-weight: 700; font-size: 19px; }
 .gd-market .gd-up { color: var(--amber); }
 .gd-market .gd-dn { color: var(--cyan); }
+.gd-wx { background: var(--field2); border: 1px solid var(--line); border-radius: 12px; padding: 14px; margin-bottom: 12px; }
+.gd-wx-head { font-family: 'Archivo'; font-size: 10px; letter-spacing: 0.13em; text-transform: uppercase; color: var(--ink-dim); margin-bottom: 10px; }
+.gd-wx-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 9px; }
+@media (max-width: 560px) { .gd-wx-grid { grid-template-columns: 1fr 1fr; } }
+.gd-wx-grid div { background: var(--field); border: 1px solid var(--line); border-radius: 9px; padding: 10px 11px; display: flex; flex-direction: column; gap: 2px; }
+.gd-wx-grid em { font-style: normal; font-size: 8.5px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-dim); font-family: 'Archivo'; }
+.gd-wx-grid strong { font-family: 'Archivo'; font-weight: 700; font-size: 17px; }
+.gd-wx-grid span { font-size: 10.5px; color: var(--ink-dim); }
+.gd-wx-grid .gd-up { color: var(--amber); }
+.gd-wx-grid .gd-dn { color: var(--cyan); }
+.gd-wx-roof { font-size: 12.5px; color: var(--ink-dim); line-height: 1.55; }
+.gd-wx-note { font-size: 11.5px; color: var(--ink-dim); line-height: 1.55; margin-top: 10px; border-top: 1px solid var(--line); padding-top: 9px; }
 .gd-move-note { font-size: 12px; color: var(--ink-dim); margin-bottom: 12px; padding-left: 9px; border-left: 2px solid var(--amber); line-height: 1.5; }
 .gd-frozen { background: rgba(95,217,232,0.07); border: 1px solid var(--line); border-left: 3px solid var(--cyan); border-radius: 9px; padding: 10px 13px; font-size: 12.5px; color: var(--ink-dim); margin-bottom: 12px; }
 .gd-busy { text-align: center; padding: 40px 0; color: var(--phos); font-family: 'Archivo'; font-size: 13px; letter-spacing: 0.1em; animation: pulse 1.4s ease-in-out infinite; }
@@ -5119,6 +5271,7 @@ const CSS = `
 .ing-gamepick { display: flex; flex-direction: column; gap: 5px; margin-bottom: 14px; padding: 12px; background: rgba(52,230,168,0.06); border: 1px solid var(--line); border-left: 3px solid var(--phos); border-radius: 9px; }
 .ing-gamepick label { font-size: 9.5px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--phos); font-family: 'Archivo'; }
 .ing-gamepick select { background: var(--field); border: 1px solid var(--line); color: var(--ink); padding: 10px 12px; border-radius: 7px; font-family: 'Space Grotesk'; font-size: 14px; width: 100%; }
+.sg-wx { display: block; font-size: 10.5px; color: var(--ink-dim); margin-top: 3px; }
 .sg-inplay { display: block; font-size: 10.5px; color: var(--rust); margin-top: 3px; font-weight: 500; }
 .sg-move { font-size: 11px; margin-top: 3px; }
 .sg-move.up { color: var(--amber); }
