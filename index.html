@@ -1093,6 +1093,8 @@ function App() {
 // ===========================================================================
 const CHANGELOG = [
   { date: "2026-07-16", items: [
+    "One-tap game loading in the Terminal: pick any game from Today's Slate and the whole projection fills itself — both teams, probable starters with their stats, the market line, both prices, and the home team's actual park. The auto-apply path now sets the park too (it used to leave whatever was there).",
+    "Pulling live odds now auto-attaches probable starters from MLB for every day pulled — one tap does odds AND pitchers. The odds feed itself never carries pitchers (it's totals-market data), so the app chains the MLB schedule call for you; if that's unreachable, the Fetch matchups button and paste box still work.",
     "FIXED (dangerous): the odds feed also serves IN-PLAY games, and the app didn't check. A live total on a game already underway (e.g. 5.5 with four innings left) would overwrite the stored pregame line, and the 9-inning model would then 'find' a huge fake edge against it — and could crown it Bet of the Day. Pulls now request pre-match games only, started games freeze at their last pregame number, and both the scanner and Bet of the Day refuse anything past first pitch.",
     "FIXED (serious): the app derived 'today' in UTC, so after 8pm ET it believed it was tomorrow — the slate would vanish during prime time and late west-coast games were filed under the wrong day. Every date now uses Eastern time, the same convention MLB schedules by.",
     "A live pull now files each game under ITS OWN date. The odds feed returns tomorrow's lines too; they used to be dumped onto today's board. One pull can now seed several boards at once — and tomorrow's opener is recorded the moment it appears, which is what makes line movement measurable.",
@@ -1232,6 +1234,7 @@ function Terminal({ onHome }) {
   const [home, setHome] = useState({ ...EMPTY_TEAM });
   const [logMsg, setLogMsg] = useState("");
   const [slateApplied, setSlateApplied] = useState("");
+  const [daySlate, setDaySlate] = useState(null); // today's board, for the one-tap game picker
   const [slateNote, setSlateNote] = useState("");
 
   useEffect(() => {
@@ -1245,6 +1248,9 @@ function Terminal({ onHome }) {
       setTeams(merged);
       if (changed) await store.set("ingenuity:teams", merged);
       if (force) await store.set("ingenuity:seedVersion", CFG.SEED_VERSION);
+      // today's board feeds the one-tap game picker
+      const dayBoard = await store.get("ingenuity:slate:day", null);
+      if (dayBoard && dayBoard.date === etDayKey()) setDaySlate(dayBoard);
       // restore last matchup setup so a session picks up where it left off
       const last = await store.get("ingenuity:lastMatchup", null);
       if (last) {
@@ -1294,7 +1300,9 @@ function Terminal({ onHome }) {
       };
       const aSP = applySP(away, setAway, g.awayP);
       const hSP = applySP(home, setHome, g.homeP);
-      setSlateNote(`Today's Slate applied — line ${g.line || "—"} (${g.over || "-110"}/${g.under || "-110"})${aSP || hSP ? `, starters ${aSP || g.awayP || "?"} vs ${hSP || g.homeP || "?"}` : ""}.`);
+      const pk = parkForTeam(home.name);
+      setPark(pk);
+      setSlateNote(`Today's Slate applied — line ${g.line || "—"} (${g.over || "-110"}/${g.under || "-110"})${aSP || hSP ? `, starters ${aSP || g.awayP || "?"} vs ${hSP || g.homeP || "?"}` : ""}, park ${pk}.`);
     })();
   }, [away.name, home.name]);
 
@@ -1310,6 +1318,34 @@ function Terminal({ onHome }) {
   // "Phillies (Zack Wheeler) @ Tigers (Tarik Skubal) | 7.5 | +102 | -122".
   // Resolves both teams from the DB, sets their probable starters (loading
   // that pitcher's xwOBA/BF/IP/ERA), and fills line + both book prices.
+  // One-tap load from Today's Slate: both teams from the DB, the probable
+  // starters (with their stats), the market line and both prices, and — the
+  // piece the auto-apply used to miss — the home team's actual park.
+  const loadSlateGame = (idx) => {
+    const g = daySlate?.games?.[parseInt(idx)];
+    if (!g) return;
+    const A = matchTeamDb(g.away, teams), H = matchTeamDb(g.home, teams);
+    if (!A || !H) { setSlateNote(`Couldn't match ${!A ? g.away : g.home} to the database — load teams manually for this one.`); return; }
+    const build = (dbTeam, pName) => {
+      const t = { ...EMPTY_TEAM, ...dbTeam };
+      if (pName && dbTeam.rotation) {
+        const pn = normName(pName);
+        const hit = dbTeam.rotation.find((r) => normName(r.name) === pn) || dbTeam.rotation.find((r) => pn.includes(normName(r.name).split(" ").pop()));
+        if (hit) { t.starter = hit.name; t.sp = hit.xwoba || t.sp; t.spBf = hit.bf || t.spBf; t.spIp = hit.ip || t.spIp; t.spEra = hit.era || t.spEra; }
+      }
+      return t;
+    };
+    setSlateApplied(g.away + "|" + g.home); // pre-mark so the auto-apply effect doesn't double-fire
+    setAway(build(A, g.awayP));
+    setHome(build(H, g.homeP));
+    if (g.line !== "" && g.line != null) setLine(String(g.line));
+    if (g.over !== "" && g.over != null) setOverPrice(String(g.over));
+    if (g.under !== "" && g.under != null) setUnderPrice(String(g.under));
+    const pk = parkForTeam(H.name);
+    setPark(pk);
+    setSlateNote(`${g.away} @ ${g.home} loaded — line ${g.line || "—"} (${g.over || "-110"}/${g.under || "-110"}), ${g.awayP || "TBD"} vs ${g.homeP || "TBD"}, park ${pk}.${!g.awayP || !g.homeP ? " A starter is still TBD — the projection will fall back to a team-average arm, so treat it as a sketch until the probable posts." : ""}`);
+  };
+
   const loadGameLine = (g) => {
     const A = matchTeamDb(g.away, teams), H = matchTeamDb(g.home, teams);
     if (!A || !H) return { ok: false, miss: !A ? g.away : g.home };
@@ -1422,6 +1458,19 @@ function Terminal({ onHome }) {
         <main className="ing-main">
           <section className="ing-inputs">
             <SmartImport teams={teams} saveTeams={saveTeams} onGameLine={loadGameLine} />
+            {daySlate && daySlate.games?.length > 0 && (
+              <div className="ing-gamepick">
+                <label>Load from Today's Slate — one tap fills teams, starters, line, prices, and park</label>
+                <select value="" onChange={(e) => e.target.value !== "" && loadSlateGame(e.target.value)}>
+                  <option value="">Pick a game… ({daySlate.games.length} on the board)</option>
+                  {daySlate.games.map((g, i) => (
+                    <option key={i} value={i}>
+                      {g.away} @ {g.home}{g.line ? ` · ${g.line}` : ""}{g.awayP && g.homeP ? ` · ${g.awayP.split(" ").pop()} v ${g.homeP.split(" ").pop()}` : " · TBD arms"}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
             <div className="ing-env">
               <div className="ing-field">
                 <label>Park</label>
@@ -3330,7 +3379,7 @@ function SlateHub() {
         // Probe forward — All-Star break or an off-day. Tell the user when play resumes.
         let nextDate = null, nextCount = 0;
         for (let k = 1; k <= 10 && !nextDate; k++) {
-          const d = new Date(Date.now() + k * 86400000).toISOString().slice(0, 10);
+          const d = etDayKey(new Date(Date.now() + k * 86400000));
           try {
             const rr = await fetch(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${d}`);
             const jj = await rr.json();
@@ -3412,6 +3461,43 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
     logInterp("slate-paste", true, `${games.length} games (${mode})`);
   };
 
+  // After odds land, fetch MLB's probable starters for each pulled day and
+  // merge them in — the odds feed is totals-market data and never carries
+  // pitchers, but MLB's schedule API does. Chaining the two makes one tap do
+  // the whole job. Quiet on failure: the paste path and the fetch button remain.
+  const attachPitchers = async (days) => {
+    let attached = 0;
+    const arch = await store.get("ingenuity:slate:archive", {});
+    for (const d of days) {
+      if (!arch[d]) continue;
+      try {
+        const r = await fetch(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${d}&hydrate=probablePitcher`);
+        if (!r.ok) continue;
+        const j = await r.json();
+        const api = (j.dates?.[0]?.games || []);
+        if (!api.length) continue;
+        arch[d] = { ...arch[d], games: arch[d].games.map((g) => {
+          const hit = api.find((x) => {
+            const a = normName(x.teams.away.team.name), h = normName(x.teams.home.team.name);
+            const ga = normName(g.away), gh = normName(g.home);
+            return (a.includes(ga) || ga.includes(a)) && (h.includes(gh) || gh.includes(h));
+          });
+          if (!hit) return g;
+          const ap = hit.teams.away.probablePitcher?.fullName || g.awayP;
+          const hp = hit.teams.home.probablePitcher?.fullName || g.homeP;
+          if ((ap && ap !== g.awayP) || (hp && hp !== g.homeP)) attached++;
+          return { ...g, awayP: ap || g.awayP, homeP: hp || g.homeP };
+        }) };
+      } catch { /* blocked or offline — buttons and paste still work */ }
+    }
+    if (attached) {
+      await store.set("ingenuity:slate:archive", arch);
+      const fresh = arch[viewDate];
+      if (fresh) setSlate(fresh);
+    }
+    return attached;
+  };
+
   const pullLive = async () => {
     const key = apiKey.trim();
     if (!key) { setMsg("Paste your Odds API key first — free at the-odds-api.com."); return; }
@@ -3454,7 +3540,8 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
         if (fresh[viewDate]) setSlate(fresh[viewDate]);
         const remaining = r.headers.get("x-requests-remaining");
         const spread = days.map((d) => `${byDay[d].length} on ${d}${d === todayKey ? " (today)" : ""}`).join(", ");
-        setMsg(`Live market pulled: ${parsed.length} game${parsed.length === 1 ? "" : "s"} across ${days.length} day${days.length === 1 ? "" : "s"} — ${spread}. Each is saved to its own board.${remaining ? ` ${remaining} API requests left this month.` : ""} Fetch matchups (step 1) to attach probable pitchers.`);
+        const nArms = await attachPitchers(days);
+        setMsg(`Live market pulled: ${parsed.length} game${parsed.length === 1 ? "" : "s"} across ${days.length} day${days.length === 1 ? "" : "s"} — ${spread}. Each is saved to its own board.${nArms ? ` Probable starters attached automatically (${nArms} arm${nArms === 1 ? "" : "s"}).` : " Pitchers weren't reachable just now — tap Fetch matchups to attach them."}${remaining ? ` ${remaining} API requests left this month.` : ""}`);
       }
     } catch (e) { setMsg(`Live pull failed: ${e.message}`); }
     setBusy("");
@@ -4837,6 +4924,9 @@ const CSS = `
 .slate-research { background: rgba(95,217,232,0.07); border: 1px solid var(--line); border-left: 3px solid var(--cyan); border-radius: 9px; padding: 11px 14px; font-size: 12.5px; color: var(--ink-dim); line-height: 1.55; margin-bottom: 12px; }
 .slate-research strong { color: var(--cyan); }
 .slate-chip.move { background: rgba(245,196,81,0.12); color: var(--amber); }
+.ing-gamepick { display: flex; flex-direction: column; gap: 5px; margin-bottom: 14px; padding: 12px; background: rgba(52,230,168,0.06); border: 1px solid var(--line); border-left: 3px solid var(--phos); border-radius: 9px; }
+.ing-gamepick label { font-size: 9.5px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--phos); font-family: 'Archivo'; }
+.ing-gamepick select { background: var(--field); border: 1px solid var(--line); color: var(--ink); padding: 10px 12px; border-radius: 7px; font-family: 'Space Grotesk'; font-size: 14px; width: 100%; }
 .sg-inplay { display: block; font-size: 10.5px; color: var(--rust); margin-top: 3px; font-weight: 500; }
 .sg-move { font-size: 11px; margin-top: 3px; }
 .sg-move.up { color: var(--amber); }
