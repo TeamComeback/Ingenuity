@@ -1316,6 +1316,7 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
 // ===========================================================================
 const CHANGELOG = [
   { date: "2026-07-16", items: [
+    "Weather failures are no longer silent. If the forecast fetch fails, the pull message now says so ('Weather didn\'t load — …') instead of just omitting it, and a new 'Refresh weather' button re-tries without spending an odds-API credit. Note: weather (open-meteo) only reaches the internet from the HOSTED app; inside the Claude artifact preview the sandbox blocks it — the button now says that plainly.",
     "FIXED: Bet of the Day (and slate cards) could show YESTERDAY'S starting pitcher during a series. A three-game set is the same two teams three nights running; when today's odds were merged, the name-match found yesterday's game and — because the odds feed carries no pitchers — kept the old probable. Odds now merge per-date: a new day's board never inherits the prior day's arm or opener, while a same-day refresh still keeps pitchers already attached. All paste/import paths are date-tagged too.",
     "Weather panel in the game breakdown: temperature with a plain-language read, raw wind speed + compass origin, the signed to-center component (out ↗ / in ↘ / crosswind), and the combined park-times-weather run environment vs neutral. Raw direction is kept now, not just the computed component — for prop research, carry lives in the to-center number while a crosswind mostly bends foul lines.",
     "Game-time weather, automatic: after every odds pull the app fetches each outdoor park's forecast (free open-meteo, no key) for the actual first-pitch hour — temperature plus the wind's out-to-center component computed from each stadium's orientation. Roofed parks get indoor conditions without a call. The slate scan, Bet of the Day, and the game breakdown all use it now; they previously ran every game at null weather. Shown on every slate card (78° · 9mph out ↗) and in the breakdown header. CF bearings are ±20° approximations and the engine caps weather at ±6%, so errors stay bounded.",
@@ -3740,7 +3741,7 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
   // conditions without a call. Quiet on failure — weather is a refinement,
   // and the Terminal's manual temp/wind boxes always work.
   const attachWeather = async (days) => {
-    let attached = 0;
+    let attached = 0, reachErr = null, tried = 0;
     const arch = await store.get("ingenuity:slate:archive", {});
     for (const d of days) {
       const board = arch[d];
@@ -3760,10 +3761,12 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
         need.push({ i, meta, hourET });
       });
       if (need.length) {
+        tried += need.length;
         try {
           const lats = need.map((n) => n.meta.lat).join(",");
           const lons = need.map((n) => n.meta.lon).join(",");
           const r = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lats}&longitude=${lons}&hourly=temperature_2m,wind_speed_10m,wind_direction_10m&temperature_unit=fahrenheit&wind_speed_unit=mph&timezone=America%2FNew_York&start_date=${d}&end_date=${d}`);
+          if (!r.ok) { reachErr = `weather service returned ${r.status}`; }
           if (r.ok) {
             const j = await r.json();
             const results = Array.isArray(j) ? j : [j];
@@ -3780,7 +3783,7 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
               attached++;
             });
           }
-        } catch { /* offline or blocked — manual weather in the Terminal still works */ }
+        } catch (e) { reachErr = "couldn't reach the weather service (open-meteo) from here"; }
       }
       arch[d] = { ...board, games: [...board.games] };
     }
@@ -3788,7 +3791,20 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
       await store.set("ingenuity:slate:archive", arch);
       if (arch[viewDate]) setSlate(arch[viewDate]);
     }
-    return attached;
+    return { attached, tried, reachErr };
+  };
+
+  const refreshWeather = async () => {
+    if (!isToday) { setMsg("Weather refresh applies to today's board."); return; }
+    if (!slate?.games?.length) { setMsg("Build the slate first, then weather can attach."); return; }
+    setBusy("wx"); setMsg("");
+    const wx = await attachWeather([todayKey]);
+    setBusy("");
+    setMsg(wx.attached
+      ? `Game-time weather updated for ${wx.attached} park${wx.attached === 1 ? "" : "s"}${wx.tried > wx.attached ? ` (${wx.tried - wx.attached} still pending)` : ""}.`
+      : wx.reachErr
+        ? `Weather didn't load — ${wx.reachErr}. On the hosted app this works; inside the Claude artifact the sandbox blocks outside weather calls. You can enter temp/wind by hand in the Terminal.`
+        : "No outdoor parks on the board need weather (roofed games use indoor conditions).");
   };
 
   const pullLive = async () => {
@@ -3834,8 +3850,8 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
         const remaining = r.headers.get("x-requests-remaining");
         const spread = days.map((d) => `${byDay[d].length} on ${d}${d === todayKey ? " (today)" : ""}`).join(", ");
         const nArms = await attachPitchers(days);
-        const nWx = await attachWeather(days);
-        setMsg(`Live market pulled: ${parsed.length} game${parsed.length === 1 ? "" : "s"} across ${days.length} day${days.length === 1 ? "" : "s"} — ${spread}. Each is saved to its own board.${nArms ? ` Probable starters attached automatically (${nArms} arm${nArms === 1 ? "" : "s"}).` : " Pitchers weren't reachable just now — tap Fetch matchups to attach them."}${nWx ? ` Game-time weather set for ${nWx} park${nWx === 1 ? "" : "s"}.` : ""}${remaining ? ` ${remaining} API requests left this month.` : ""}`);
+        const wx = await attachWeather(days);
+        setMsg(`Live market pulled: ${parsed.length} game${parsed.length === 1 ? "" : "s"} across ${days.length} day${days.length === 1 ? "" : "s"} — ${spread}. Each is saved to its own board.${nArms ? ` Probable starters attached automatically (${nArms} arm${nArms === 1 ? "" : "s"}).` : " Pitchers weren't reachable just now — tap Fetch matchups to attach them."}${wx.attached ? ` Game-time weather set for ${wx.attached} park${wx.attached === 1 ? "" : "s"}.` : wx.reachErr ? ` Weather didn't load (${wx.reachErr}) — enter temp/wind manually in the Terminal if you need it.` : ""}${remaining ? ` ${remaining} API requests left this month.` : ""}`);
       }
     } catch (e) { setMsg(`Live pull failed: ${e.message}`); }
     setBusy("");
@@ -4080,6 +4096,9 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
 
       <div className="slate-controls">
         <button className="ing-run small" onClick={fetchMatchups} disabled={!!busy || !isToday} title={isToday ? "" : "Live fetch only applies to today's board"}>{busy === "fetch" ? "Fetching…" : games.length ? "Refresh matchups + pitchers" : "1 · Fetch matchups + pitchers"}</button>
+        {games.length > 0 && isToday && (
+          <button className="ing-run small ghosty" onClick={refreshWeather} disabled={!!busy} title="Re-fetch game-time weather without spending an odds credit">{busy === "wx" ? "Checking sky…" : "Refresh weather"}</button>
+        )}
         <label className="slate-filebtn">
           {busy === "vision" ? "Reading…" : "2 · Import odds (screenshot / file)"}
           <input key={inputKey} type="file" accept=".csv,.txt,image/*" onChange={(e) => stageFile(e.target.files[0])} disabled={!!busy} hidden />
@@ -5498,6 +5517,8 @@ const CSS = `
 .slate { max-width: 1080px; width: 100%; margin-top: 22px; background: var(--field2); border: 1px solid var(--line); border-radius: 14px; padding: 20px 22px; text-align: left; }
 .slate-head { display: flex; flex-direction: column; gap: 3px; margin-bottom: 12px; }
 .slate-head h2 { font-family: 'Archivo'; font-size: 13px; letter-spacing: 0.11em; text-transform: uppercase; color: var(--cyan); }
+.ing-run.ghosty { background: transparent; border: 1px solid var(--line); color: var(--cyan); box-shadow: none; }
+.ing-run.ghosty:hover:not(:disabled) { border-color: var(--cyan); box-shadow: 0 0 14px rgba(95,217,232,0.25); }
 .slate-controls { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
 .slate-input { width: 100%; background: var(--field); border: 1px solid var(--line); color: var(--ink); padding: 11px 13px; border-radius: 8px; font-family: 'Space Grotesk'; font-size: 13px; resize: vertical; margin-bottom: 8px; }
 .slate-input:focus { outline: none; border-color: var(--cyan); box-shadow: 0 0 0 3px rgba(95,217,232,0.12); }
