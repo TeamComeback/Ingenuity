@@ -1316,6 +1316,7 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
 // ===========================================================================
 const CHANGELOG = [
   { date: "2026-07-16", items: [
+    "FIXED: Bet of the Day (and slate cards) could show YESTERDAY'S starting pitcher during a series. A three-game set is the same two teams three nights running; when today's odds were merged, the name-match found yesterday's game and — because the odds feed carries no pitchers — kept the old probable. Odds now merge per-date: a new day's board never inherits the prior day's arm or opener, while a same-day refresh still keeps pitchers already attached. All paste/import paths are date-tagged too.",
     "Weather panel in the game breakdown: temperature with a plain-language read, raw wind speed + compass origin, the signed to-center component (out ↗ / in ↘ / crosswind), and the combined park-times-weather run environment vs neutral. Raw direction is kept now, not just the computed component — for prop research, carry lives in the to-center number while a crosswind mostly bends foul lines.",
     "Game-time weather, automatic: after every odds pull the app fetches each outdoor park's forecast (free open-meteo, no key) for the actual first-pitch hour — temperature plus the wind's out-to-center component computed from each stadium's orientation. Roofed parks get indoor conditions without a call. The slate scan, Bet of the Day, and the game breakdown all use it now; they previously ran every game at null weather. Shown on every slate card (78° · 9mph out ↗) and in the breakdown header. CF bearings are ±20° approximations and the engine caps weather at ±6%, so errors stay bounded.",
     "Full game breakdown: tap a game on the board chart (or the ⤢ on any slate card) and a dedicated page opens — market panel with opener→current movement, the scanner's earlier read, a fresh full 20k-sim deep dive with the complete Terminal readout, and all ten key inputs side by side for both teams. Same guards as everywhere else: no confirmed starter, no fake number. Works on archived days too.",
@@ -3532,7 +3533,7 @@ function SlateHub() {
       // merge any odds forwarded from a Terminal screenshot import
       const stash = await store.get("ingenuity:slate:odds", "");
       if (stash) {
-        cur = mergeOdds(cur, parseOddsLines(stash));
+        cur = mergeOdds(cur, parseOddsLines(stash), todayKey);
         await store.set("ingenuity:slate:odds", "");
         await saveSlate(cur);
         setMsg("Odds from your screenshot import were merged into today's slate.");
@@ -3548,7 +3549,13 @@ function SlateHub() {
   // touched again; `line` tracks the current market. The gap between them is
   // where the money went — the raw material for actually measuring CLV.
   function mergeOdds(cur, parsed, dateKey) {
-    const games = cur ? [...cur.games] : [];
+    // If the board we're merging into is for a DIFFERENT day than these odds,
+    // start clean. A three-game series is the same two teams on three nights;
+    // matching by name across days would carry yesterday's probable starter
+    // (and its opener) onto today's game. Pitchers belong to a date, not a
+    // matchup. When dateKey differs from the board's date, don't reuse it.
+    const sameDay = !cur || !dateKey || cur.date === dateKey;
+    const games = sameDay && cur ? [...cur.games] : [];
     const stamp = new Date().toISOString().slice(11, 16);
     const has = (v) => v !== "" && v != null && !isNaN(parseFloat(v));
     // First pitch passed = anything the market says now is a LIVE number.
@@ -3672,7 +3679,7 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
       }
       const ok = parsed.filter((x) => !x.err);
       if (!ok.length) { setMsg("No games with totals found in that file."); logInterp("slate-import", false, "no games recognized"); }
-      else { await saveSlate(mergeOdds(slate, parsed)); setMsg(`${ok.length} games merged into today's slate.`); logInterp("slate-import", true, ok.length + " games"); }
+      else { await saveSlate(mergeOdds(slate, parsed, slate?.date || todayKey)); setMsg(`${ok.length} games merged into the ${slate?.date === todayKey || !slate ? "today's" : slate.date} board.`); logInterp("slate-import", true, ok.length + " games"); }
       removeStaged();
     } catch (e) { setMsg(`Import failed: ${e.message}.`); logInterp("slate-import", false, e.message); }
     setBusy("");
@@ -3684,7 +3691,7 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
     const withTotals = games.filter((g) => g.line !== "" && g.line != null);
     const noTotal = games.length - withTotals.length;
     if (!games.length) { setMsg("Couldn't find any games in that paste. It needs at least the two team names per game; totals and prices are picked up when present. Team names, city names, or codes (PHI, NYY) all work."); logInterp("slate-paste", false, "no games found"); return; }
-    await saveSlate(mergeOdds(slate, games));
+    await saveSlate(mergeOdds(slate, games, slate?.date || todayKey));
     setPasteText(""); setPasteOpen(false);
     const pitchers = games.filter((g) => g.awayP || g.homeP).length;
     setMsg(`${games.length} game${games.length === 1 ? "" : "s"} read (${mode === "lines" ? "clean format" : mode === "shorthand" ? "pitcher shorthand" : "smart scan of pasted board"})${withTotals.length ? `, ${withTotals.length} with totals` : ""}${pitchers ? `, ${pitchers} with pitchers` : ""}.${noTotal ? ` ${noTotal} still need a total typed in — edit them below.` : ""}`);
