@@ -1316,6 +1316,8 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
 // ===========================================================================
 const CHANGELOG = [
   { date: "2026-07-16", items: [
+    "FIXED: loading a game into the Terminal from Today's Slate now carries its weather into the Temp/Wind boxes too (it was filling teams, line, prices, and park but leaving weather blank). Roofed parks load 72°/0; a game with no weather yet clears the fields and the note tells you to pull or Refresh weather.",
+    "New 'Refresh slate' button beside Refresh weather: clears today's board and pulls everything fresh — odds, pitchers, weather — so stale games, old lines, or removed matchups don't pile up. Other days' archived boards are untouched.",
     "Weather failures are no longer silent. If the forecast fetch fails, the pull message now says so ('Weather didn\'t load — …') instead of just omitting it, and a new 'Refresh weather' button re-tries without spending an odds-API credit. Note: weather (open-meteo) only reaches the internet from the HOSTED app; inside the Claude artifact preview the sandbox blocks it — the button now says that plainly.",
     "FIXED: Bet of the Day (and slate cards) could show YESTERDAY'S starting pitcher during a series. A three-game set is the same two teams three nights running; when today's odds were merged, the name-match found yesterday's game and — because the odds feed carries no pitchers — kept the old probable. Odds now merge per-date: a new day's board never inherits the prior day's arm or opener, while a same-day refresh still keeps pitchers already attached. All paste/import paths are date-tagged too.",
     "Weather panel in the game breakdown: temperature with a plain-language read, raw wind speed + compass origin, the signed to-center component (out ↗ / in ↘ / crosswind), and the combined park-times-weather run environment vs neutral. Raw direction is kept now, not just the computed component — for prop research, carry lives in the to-center number while a crosswind mostly bends foul lines.",
@@ -1530,7 +1532,12 @@ function Terminal({ onHome }) {
       const hSP = applySP(home, setHome, g.homeP);
       const pk = parkForTeam(home.name);
       setPark(pk);
-      setSlateNote(`Today's Slate applied — line ${g.line || "—"} (${g.over || "-110"}/${g.under || "-110"})${aSP || hSP ? `, starters ${aSP || g.awayP || "?"} vs ${hSP || g.homeP || "?"}` : ""}, park ${pk}.`);
+      let wxN = "";
+      if (g.wx) {
+        if (g.wx.roof) { setTemp("72"); setWindOut("0"); wxN = ", roof"; }
+        else { if (g.wx.temp != null) setTemp(String(g.wx.temp)); if (g.wx.windOut != null) setWindOut(String(g.wx.windOut)); wxN = g.wx.temp != null ? `, ${g.wx.temp}°` : ""; }
+      }
+      setSlateNote(`Today's Slate applied — line ${g.line || "—"} (${g.over || "-110"}/${g.under || "-110"})${aSP || hSP ? `, starters ${aSP || g.awayP || "?"} vs ${hSP || g.homeP || "?"}` : ""}, park ${pk}${wxN}.`);
     })();
   }, [away.name, home.name]);
 
@@ -1571,7 +1578,16 @@ function Terminal({ onHome }) {
     if (g.under !== "" && g.under != null) setUnderPrice(String(g.under));
     const pk = parkForTeam(H.name);
     setPark(pk);
-    setSlateNote(`${g.away} @ ${g.home} loaded — line ${g.line || "—"} (${g.over || "-110"}/${g.under || "-110"}), ${g.awayP || "TBD"} vs ${g.homeP || "TBD"}, park ${pk}.${!g.awayP || !g.homeP ? " A starter is still TBD — the projection will fall back to a team-average arm, so treat it as a sketch until the probable posts." : ""}`);
+    // carry game-time weather across too, if the slate has it attached
+    let wxNote = "";
+    if (g.wx) {
+      if (g.wx.roof) { setTemp("72"); setWindOut("0"); wxNote = ", roof (indoor)"; }
+      else { setTemp(g.wx.temp != null ? String(g.wx.temp) : ""); setWindOut(g.wx.windOut != null ? String(g.wx.windOut) : ""); wxNote = g.wx.temp != null ? `, ${g.wx.temp}°/${g.wx.windOut > 0 ? "+" : ""}${g.wx.windOut} mph out` : ""; }
+    } else {
+      setTemp(""); setWindOut(""); // clear stale weather from a previous game
+      wxNote = " — no weather on this game yet; pull or Refresh weather in Today's Slate to auto-fill it";
+    }
+    setSlateNote(`${g.away} @ ${g.home} loaded — line ${g.line || "—"} (${g.over || "-110"}/${g.under || "-110"}), ${g.awayP || "TBD"} vs ${g.homeP || "TBD"}, park ${pk}${wxNote}.${!g.awayP || !g.homeP ? " A starter is still TBD — the projection will fall back to a team-average arm, so treat it as a sketch until the probable posts." : ""}`);
   };
 
   const loadGameLine = (g) => {
@@ -3794,6 +3810,21 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
     return { attached, tried, reachErr };
   };
 
+  // Clear today's board and pull it fresh — removes any games that rolled off,
+  // stale pitchers, or old lines, and rebuilds cleanly. Uses one odds credit.
+  const refreshSlate = async () => {
+    if (!isToday) { setMsg("Refresh applies to today's board. Use the day picker to return to today first."); return; }
+    if (busy) return;
+    setBusy("refresh"); setMsg("");
+    const arch = await store.get("ingenuity:slate:archive", {});
+    delete arch[todayKey];
+    await store.set("ingenuity:slate:archive", arch);
+    await store.set("ingenuity:slate:day", null);
+    setSlate(null); setRows(null); setLean(null); setDetailGame(null);
+    setBusy("");
+    await pullLive(); // rebuild from scratch: odds → pitchers → weather
+  };
+
   const refreshWeather = async () => {
     if (!isToday) { setMsg("Weather refresh applies to today's board."); return; }
     if (!slate?.games?.length) { setMsg("Build the slate first, then weather can attach."); return; }
@@ -4098,6 +4129,9 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
         <button className="ing-run small" onClick={fetchMatchups} disabled={!!busy || !isToday} title={isToday ? "" : "Live fetch only applies to today's board"}>{busy === "fetch" ? "Fetching…" : games.length ? "Refresh matchups + pitchers" : "1 · Fetch matchups + pitchers"}</button>
         {games.length > 0 && isToday && (
           <button className="ing-run small ghosty" onClick={refreshWeather} disabled={!!busy} title="Re-fetch game-time weather without spending an odds credit">{busy === "wx" ? "Checking sky…" : "Refresh weather"}</button>
+        )}
+        {games.length > 0 && isToday && (
+          <button className="ing-run small ghosty warn" onClick={refreshSlate} disabled={!!busy} title="Clear today's board and pull everything fresh (uses one odds credit)">{busy === "refresh" ? "Rebuilding…" : "↻ Refresh slate"}</button>
         )}
         <label className="slate-filebtn">
           {busy === "vision" ? "Reading…" : "2 · Import odds (screenshot / file)"}
@@ -5517,6 +5551,8 @@ const CSS = `
 .slate { max-width: 1080px; width: 100%; margin-top: 22px; background: var(--field2); border: 1px solid var(--line); border-radius: 14px; padding: 20px 22px; text-align: left; }
 .slate-head { display: flex; flex-direction: column; gap: 3px; margin-bottom: 12px; }
 .slate-head h2 { font-family: 'Archivo'; font-size: 13px; letter-spacing: 0.11em; text-transform: uppercase; color: var(--cyan); }
+.ing-run.ghosty.warn { color: var(--amber); }
+.ing-run.ghosty.warn:hover:not(:disabled) { border-color: var(--amber); box-shadow: 0 0 14px rgba(245,196,81,0.25); }
 .ing-run.ghosty { background: transparent; border: 1px solid var(--line); color: var(--cyan); box-shadow: none; }
 .ing-run.ghosty:hover:not(:disabled) { border-color: var(--cyan); box-shadow: 0 0 14px rgba(95,217,232,0.25); }
 .slate-controls { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
