@@ -49,7 +49,7 @@ const DEFAULT_CFG = {
   REG_OFFENSE_PA: 200,
   REG_STARTER_BF: 250,
   REG_BULLPEN_BF: 200,
-  RECENT_FORM_WEIGHT: 0.4,
+  RECENT_FORM_WEIGHT: 0.25, // legacy raw-wOBA path only (v1.5: was 0.4 — 14-day raw wOBA is mostly noise; the BB%-K% process path is where recent trust belongs)
   STARTER_IP_SD: 1.1,
   // v1.2: overdispersion split into a SHARED game factor (weather/ump/ball —
   // hits both offenses together) and per-side factors. The shared factor
@@ -91,6 +91,14 @@ const DEFAULT_CFG = {
   PEN_CONTACT_WEIGHT: 0.4,    // bullpen: barrel/hard-hit-derived quality vs raw xwOBA
   DEFENSE_OAA_SCALE: 0.0025,  // fractional runs shift per team OAA
   FRAMING_FACTOR_SCALE: 0.0015, // fractional runs shift per catcher framing run
+
+  // v1.5 — times-through-the-order. A starter isn't one pitcher: he's ~0.010
+  // wOBA better than his line the 1st time through and worse the 3rd. Flat
+  // pricing systematically undervalues innings 5–6 (where overs live) and
+  // misprices long outings. Centered on the 2nd pass so a typical 5.5-IP start
+  // stays calibration-neutral; the 3rd-pass step runs slightly steeper (1.2x),
+  // matching the research consensus that the 3rd-time penalty is the biggest.
+  TTO_STEP: 0.010,
 };
 
 // Live config = defaults + brain overrides (persisted, human-approved).
@@ -108,6 +116,7 @@ const BRAIN_TUNABLES = {
   OFFENSE_XWOBA_WEIGHT: { min: 0.2,  max: 1.0,  desc: "xwOBA vs actual wOBA in offense true-talent" },
   PEN_CONTACT_WEIGHT:   { min: 0,    max: 0.8,  desc: "Barrel/hard-hit vs xwOBA in bullpen rating" },
   DEFENSE_OAA_SCALE:    { min: 0,    max: 0.006, desc: "Runs impact per team OAA" },
+  TTO_STEP:             { min: 0,    max: 0.02,  desc: "wOBA penalty per time through the order" },
 };
 
 function applyBrainParams(overrides) {
@@ -355,6 +364,16 @@ function randPoisson(lambda) {
   return Math.max(0, Math.round(lambda + Math.sqrt(lambda) * randn()));
 }
 
+// Split a start into 1st/2nd/3rd-time-through segments. One pass through the
+// order is 9 batters ≈ 9/PA_PER_INNING innings. Exported for testability.
+function ttoSegments(sip) {
+  const passIp = 9 / CFG.PA_PER_INNING;
+  const ip1 = Math.min(sip, passIp);
+  const ip2 = Math.min(Math.max(sip - passIp, 0), passIp);
+  const ip3 = Math.max(sip - 2 * passIp, 0);
+  return [ip1, ip2, ip3];
+}
+
 function simulateSide(offW, oppSP, oppSPip, oppPen, park, fld, n, gameFactor, sideScale) {
   const runs = new Float64Array(n);
   for (let i = 0; i < n; i++) {
@@ -366,7 +385,9 @@ function simulateSide(offW, oppSP, oppSPip, oppPen, park, fld, n, gameFactor, si
       const pa = ip * CFG.PA_PER_INNING;
       return ((m - CFG.LEAGUE_WOBA) / CFG.WOBA_SCALE + CFG.LEAGUE_RUNS_PER_PA) * pa;
     };
-    let lam = (mrun(oppSP, sip) + mrun(oppPen, penIp)) * park * fld * sideScale + CFG.CALIBRATION_OFFSET / 2;
+    const [ip1, ip2, ip3] = ttoSegments(sip);
+    const spRuns = mrun(oppSP - CFG.TTO_STEP, ip1) + mrun(oppSP, ip2) + mrun(oppSP + 1.2 * CFG.TTO_STEP, ip3);
+    let lam = (spRuns + mrun(oppPen, penIp)) * park * fld * sideScale + CFG.CALIBRATION_OFFSET / 2;
     lam *= gameFactor[i]; // shared run-environment draw — correlates the two sides
     lam *= randGamma(CFG.OVERDISP_SHAPE_SIDE) / CFG.OVERDISP_SHAPE_SIDE;
     runs[i] = randPoisson(Math.max(0, lam)); // integer runs, negative-binomial dispersion
@@ -1316,6 +1337,8 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
 // ===========================================================================
 const CHANGELOG = [
   { date: "2026-07-16", items: [
+    "Engine v1.5 — times-through-the-order: a starter is now priced ~0.010 wOBA better his 1st pass through the lineup and worse his 3rd (1.2x steeper, per the research consensus), instead of one flat number all night. Centered on the 2nd pass so typical 5.5-IP starts stay calibration-neutral; deep outings and the innings-5-6 window reprice. Brain-tunable (TTO_STEP).",
+    "Recent-form honesty: the legacy raw-wOBA 14-day weight drops 0.4 → 0.25. Raw wOBA at 14 days is mostly noise; the BB%-K% process path (stabilizes ~60 PA) is where recent trust belongs. Projections using 14-day raw wOBA only will lean slightly more on season talent now — that's the correction working, not a bug.",
     "FIXED: loading a game into the Terminal from Today's Slate now carries its weather into the Temp/Wind boxes too (it was filling teams, line, prices, and park but leaving weather blank). Roofed parks load 72°/0; a game with no weather yet clears the fields and the note tells you to pull or Refresh weather.",
     "New 'Refresh slate' button beside Refresh weather: clears today's board and pulls everything fresh — odds, pitchers, weather — so stale games, old lines, or removed matchups don't pile up. Other days' archived boards are untouched.",
     "Weather failures are no longer silent. If the forecast fetch fails, the pull message now says so ('Weather didn\'t load — …') instead of just omitting it, and a new 'Refresh weather' button re-tries without spending an odds-API credit. Note: weather (open-meteo) only reaches the internet from the HOSTED app; inside the Claude artifact preview the sandbox blocks it — the button now says that plainly.",
