@@ -1366,6 +1366,8 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
 // ===========================================================================
 const CHANGELOG = [
   { date: "2026-07-16", items: [
+    "Database tab's Smart Import is now stats-first: it opens ready for CSVs/pastes (not game lines), since that's what you're doing there.",
+    "Import receipt: after any stats import you get a per-team, per-player summary — exactly who was updated and to what wOBA/xwOBA, which players were auto-rostered as new, and a reminder that any name NOT shown didn't match. No more guessing whether the paste took. Tapping a team in the list below still shows its full stored roster anytime.",
     "FIXED (the '300 players, 0 matched' bug): two problems. First, Savant's 'last_name, first_name' header has a comma in the column LABEL, so the parser split it into two columns while each data row kept the name as one quoted field — shifting every column after it by one, so 'team' was silently reading the PA number. Now detected and realigned. Second, the importer required pre-loaded rosters to match against; it now auto-builds rosters from the CSV's team column, so a stats file works from a completely empty database. If a file has no team column, the message now says exactly that and how to fix the export.",
     "Permanent results log: every graded game now distills to a compact row (date, teams, line, model, final, O/U) in a store that NEVER expires — separate from the 90-day full-board archive. This is the R&D record; it protects training data the old 90-day wipe was silently deleting. Included in backups.",
     "Over/under streaks in the game breakdown: each team's recent O/U run from your own graded results (e.g. 'Braves — 3 straight UNDER'), newest-first. Explicitly a research signal, NOT a model input — the 'hot unders continue' and 'series due to flip' reads are opposite stories about the same streak, so the app shows the fact and lets you decide. Grows only as your graded results accumulate.",
@@ -1828,7 +1830,7 @@ function Terminal({ onHome }) {
       {tab === "database" && (
         <>
           <div className="ing-db-import">
-            <SmartImport teams={teams} saveTeams={saveTeams} onGameLine={loadGameLine} />
+            <SmartImport teams={teams} saveTeams={saveTeams} onGameLine={loadGameLine} statsFocus />
           </div>
           <Database teams={teams} saveTeams={saveTeams} loaded={loaded} />
         </>
@@ -3190,10 +3192,15 @@ function applyStatRows(rows, teams, mode = "season") {
   const teamsTouched = [];
   next.forEach((t, i2) => {
     if (t === teams[i2]) return;
-    let cnt = 0;
-    (t.players || []).forEach((pl, j) => { if (pl !== (teams[i2].players || [])[j]) cnt++; });
-    (t.rotation || []).forEach((pt, j) => { if (pt !== (teams[i2].rotation || [])[j]) cnt++; });
-    teamsTouched.push({ name: t.name, n: cnt });
+    const changed = []; // {name, kind, woba|xwoba, isNew}
+    const oldP = teams[i2].players || [], oldR = teams[i2].rotation || [];
+    (t.players || []).forEach((pl, j) => {
+      if (pl !== oldP[j]) changed.push({ name: pl.name, kind: "hitter", val: pl.woba || "", isNew: !oldP[j] });
+    });
+    (t.rotation || []).forEach((pt, j) => {
+      if (pt !== oldR[j]) changed.push({ name: pt.name, kind: "pitcher", val: pt.xwoba || "", era: pt.era || "", isNew: !oldR[j] });
+    });
+    teamsTouched.push({ name: t.name, n: changed.length, changed });
   });
   teamsTouched.sort((a, b) => b.n - a.n);
   return { next, hitters, pitchers, teamsTouched, seeded, unroutable };
@@ -3243,9 +3250,10 @@ function savantCsvToRows(csv) {
   return { rows: out.length ? out : null, headers: rows[0] };
 }
 
-function SmartImport({ teams, saveTeams, onGameLine }) {
-  const [open, setOpen] = useState(false);
+function SmartImport({ teams, saveTeams, onGameLine, statsFocus }) {
+  const [open, setOpen] = useState(!!statsFocus); // in the Database tab, open by default — this is a stats tool
   const [timeframe, setTimeframe] = useState("season"); // season | recent
+  const [lastImport, setLastImport] = useState(null); // { teams:[{name, added, updated, players:[...]}] } — what the last import changed
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
@@ -3256,6 +3264,7 @@ function SmartImport({ teams, saveTeams, onGameLine }) {
     const hadTeamCol = rows.some((r) => r.team);
     const { next, hitters, pitchers, teamsTouched, seeded, unroutable } = applyStatRows(rows, teams, timeframe);
     await saveTeams(next);
+    setLastImport({ ts: new Date().toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" }), mode: timeframe, teams: teamsTouched || [], seeded: seeded || 0 });
     const touched = teamsTouched || [];
     const teamList = touched.slice(0, 6).map((t) => t.n ? `${t.name} (${t.n})` : t.name).join(", ")
       + (touched.length > 6 ? ` +${touched.length - 6} more` : "");
@@ -3419,6 +3428,33 @@ If none of these: {"kind":"unknown"}` },
             <button className="ing-run small" onClick={handleText} disabled={busy || !text.trim()}>{busy ? "Working…" : "Load / apply paste"}</button>
             {msg && <span className="ing-importmsg">{msg}</span>}
           </div>
+
+          {lastImport && lastImport.teams.length > 0 && (
+            <div className="ing-receipt">
+              <div className="ing-receipt-head">
+                <span>Imported {lastImport.ts} · {lastImport.mode === "recent" ? "14-day form" : "season stats"}</span>
+                <button onClick={() => setLastImport(null)} aria-label="Dismiss">✕</button>
+              </div>
+              {lastImport.seeded > 0 && <p className="ing-receipt-seed">Auto-rostered {lastImport.seeded} new player{lastImport.seeded === 1 ? "" : "s"} from the file's team column.</p>}
+              {lastImport.teams.map((tm, i) => (
+                <details key={i} className="ing-receipt-team" open={lastImport.teams.length <= 2}>
+                  <summary>{tm.name} <em>{tm.n} update{tm.n === 1 ? "" : "s"}</em></summary>
+                  {tm.changed && tm.changed.length > 0 && (
+                    <div className="ing-receipt-players">
+                      {tm.changed.map((p, j) => (
+                        <span key={j} className={p.kind === "pitcher" ? "pit" : ""}>
+                          {p.kind === "pitcher" ? "⚾ " : ""}{p.name}
+                          <em>{p.val || "—"}</em>
+                          {p.isNew ? <i className="new">new</i> : null}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </details>
+              ))}
+              <p className="ing-receipt-note">Tap a team in the list below to see its full stored roster anytime. If a name you pasted isn't here, its spelling didn't match — fix it and re-paste.</p>
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -5353,6 +5389,19 @@ const CSS = `
 .ing-lineup-player .nm { font-weight: 500; }
 .ing-lineup-player .st { color: var(--ink-dim); font-size: 11px; }
 .ing-lineup-player .wb { color: var(--cyan); font-family: 'Archivo'; font-weight: 600; }
+.ing-receipt { margin-top: 14px; background: rgba(52,230,168,0.05); border: 1px solid var(--line); border-left: 3px solid var(--phos); border-radius: 10px; padding: 13px; }
+.ing-receipt-head { display: flex; justify-content: space-between; align-items: center; font-family: 'Archivo'; font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--phos); margin-bottom: 9px; }
+.ing-receipt-head button { background: transparent; border: none; color: var(--ink-dim); cursor: pointer; font-size: 13px; }
+.ing-receipt-seed { font-size: 12px; color: var(--cyan); margin-bottom: 9px; }
+.ing-receipt-team { margin-bottom: 6px; }
+.ing-receipt-team summary { cursor: pointer; font-size: 13px; font-weight: 500; padding: 5px 0; }
+.ing-receipt-team summary em { font-style: normal; color: var(--ink-dim); font-size: 11px; margin-left: 6px; }
+.ing-receipt-players { display: flex; flex-wrap: wrap; gap: 6px; padding: 6px 0 8px 14px; }
+.ing-receipt-players span { font-size: 11.5px; background: var(--field); border: 1px solid var(--line); border-radius: 6px; padding: 3px 8px; color: var(--ink); }
+.ing-receipt-players span.pit { color: var(--cyan); }
+.ing-receipt-players em { font-style: normal; color: var(--phos); margin-left: 5px; font-family: 'Archivo'; }
+.ing-receipt-players i.new { font-style: normal; color: var(--amber); font-size: 8.5px; text-transform: uppercase; letter-spacing: 0.08em; margin-left: 5px; }
+.ing-receipt-note { font-size: 11px; color: var(--ink-dim); line-height: 1.5; margin-top: 8px; border-top: 1px solid var(--line); padding-top: 8px; }
 .ing-importmsg { color: var(--phos); font-size: 12.5px; margin: 10px 0; }
 .ing-pasteblock { margin-top: 26px; display: flex; flex-direction: column; gap: 10px; align-items: flex-start; }
 .ing-pasteblock textarea { font-family: 'Space Grotesk'; font-size: 12.5px; resize: vertical; }
