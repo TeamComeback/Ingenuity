@@ -294,6 +294,33 @@ function degToCompass(deg) {
   return pts[Math.round(((deg % 360) / 22.5)) % 16];
 }
 
+// MLB's own player list — free, keyless, one call, ~750-900 active players with
+// their current team. This is the fix for CSVs with no team column at all
+// (which is the NORMAL case for Baseball Savant — its leaderboards have a
+// TEAM FILTER, not a team COLUMN you can add to the export; there is no
+// button on Savant that puts "Team" into the CSV). Cached for a week; the
+// season rarely needs it fresher than that outside trade-deadline week.
+const ROSTER_MAP_MAX_AGE_DAYS = 7;
+async function refreshMlbRosterMap() {
+  try {
+    const yr = new Date().getFullYear();
+    const r = await fetch(`https://statsapi.mlb.com/api/v1/sports/1/players?season=${yr}`);
+    if (!r.ok) return { ok: false, n: 0 };
+    const j = await r.json();
+    const people = j.people || [];
+    const map = {};
+    for (const p of people) {
+      const team = p.currentTeam?.name;
+      if (!p.fullName || !team) continue;
+      const resolved = resolveTeamName(team) || team;
+      map[normName(p.fullName)] = resolved;
+    }
+    const n = Object.keys(map).length;
+    if (n) await store.set("ingenuity:mlb:rosterMap", { asOf: etDayKey(), map });
+    return { ok: n > 0, n };
+  } catch { return { ok: false, n: 0 }; } // offline or blocked — team-column CSVs and manual entry still work
+}
+
 function parkForTeam(teamName) {
   // Whole-word match: every word of the mapped name must appear in the given
   // name. Keeps "SF Giants" -> Oracle while making "Red Sox"/"White Sox"
@@ -1366,6 +1393,9 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
 // ===========================================================================
 const CHANGELOG = [
   { date: "2026-07-16", items: [
+    "CORRECTION + real fix: there is no \"add Team\" option anywhere on Baseball Savant — its Team control filters the leaderboard to one team, it never adds a team column to the CSV. Earlier guidance pointing to that button was wrong. The app now resolves each player's team from MLB's own free roster list instead, so a plain Savant export with no team column still auto-routes every player correctly. A 'Sync MLB rosters' control (auto-runs on first use, refreshes weekly) keeps that list current; a team column in the file, if present, still takes priority.",
+    "Database tab import is now STATS-ONLY, end to end. Pasting a game line here (the 'Twins @ Guardians' mistake) is refused with a pointer to the Project tab instead of silently loading a matchup. The header, description, and paste-box example no longer mention game lines, and an odds screenshot dropped here is rejected too.",
+    "The two stat modes are relabeled for what they actually do: 'Full roster (season)' = the season baseline for every player (load once from a full-league Savant export, refresh weekly), and 'Recent form / lineup' = last-14-day form or announced lineups, layered on top without touching the season baseline.",
     "Database tab's Smart Import is now stats-first: it opens ready for CSVs/pastes (not game lines), since that's what you're doing there.",
     "Import receipt: after any stats import you get a per-team, per-player summary — exactly who was updated and to what wOBA/xwOBA, which players were auto-rostered as new, and a reminder that any name NOT shown didn't match. No more guessing whether the paste took. Tapping a team in the list below still shows its full stored roster anytime.",
     "FIXED (the '300 players, 0 matched' bug): two problems. First, Savant's 'last_name, first_name' header has a comma in the column LABEL, so the parser split it into two columns while each data row kept the name as one quoted field — shifting every column after it by one, so 'team' was silently reading the PA number. Now detected and realigned. Second, the importer required pre-loaded rosters to match against; it now auto-builds rosters from the CSV's team column, so a stats file works from a completely empty database. If a file has no team column, the message now says exactly that and how to fix the export.",
@@ -3061,19 +3091,23 @@ function parseCsvText(text) {
 //   recentPA, recentBbk) and never touches season numbers. Recent windows are
 //   small samples; overwriting season talent with 14 days of noise is exactly
 //   the mistake the stabilization logic exists to prevent.
-function applyStatRows(rows, teams, mode = "season") {
-  // Auto-roster: if a stat row names a team (Savant CSVs include a team column),
-  // make sure that player exists on that team before matching. This is what lets
-  // an import work when your rosters are empty or thin — the exact "300 players,
-  // 0 matched" case. A pitcher row (has ERA/xERA or barrel-allowed but no wOBA)
-  // seeds the rotation; a hitter row seeds the lineup.
+function applyStatRows(rows, teams, mode = "season", rosterMap = null) {
+  // Auto-roster: figure out each player's team, then make sure he exists on
+  // that team's roster before matching. This lets an import work even when
+  // rosters are empty or thin. Two sources, in order: (1) the CSV's own team
+  // column when the file happens to have one, (2) MLB's own roster list
+  // (rosterMap) for files that don't — which is the NORMAL Baseball Savant
+  // case, since Savant has no way to add a team column to its exports at all.
+  // A pitcher row (has ERA/xERA or barrel-allowed but no wOBA) seeds the
+  // rotation; a hitter row seeds the lineup.
   let seeded = 0, unroutable = 0;
-  if (rows.some((r) => r.team)) {
+  if (rows.some((r) => r.team) || (rosterMap && Object.keys(rosterMap).length)) {
     const idx = new Map(); // resolved team name -> team object
     teams.forEach((t) => idx.set(normName(t.name), t));
     for (const r of rows) {
-      if (!r.team) { continue; }
-      const resolved = resolveTeamName(r.team) || r.team;
+      const fromMap = !r.team && rosterMap ? rosterMap[normName(r.name)] : null;
+      if (!r.team && !fromMap) { continue; } // no team label anywhere for this player — leave to the season/recent name-match below
+      const resolved = r.team ? (resolveTeamName(r.team) || r.team) : fromMap;
       let t = idx.get(normName(resolved));
       if (!t) { unroutable++; continue; } // team not in the 30-team DB (shouldn't happen, but safe)
       const isPitcher = (r.era != null || r.xera != null || (r.barrel != null && r.woba == null && r.xwoba == null));
@@ -3254,6 +3288,35 @@ function SmartImport({ teams, saveTeams, onGameLine, statsFocus }) {
   const [open, setOpen] = useState(!!statsFocus); // in the Database tab, open by default — this is a stats tool
   const [timeframe, setTimeframe] = useState("season"); // season | recent
   const [lastImport, setLastImport] = useState(null); // { teams:[{name, added, updated, players:[...]}] } — what the last import changed
+  const [rosterMap, setRosterMap] = useState(null); // MLB name -> team, for CSVs with no team column
+  const [rosterSync, setRosterSync] = useState(""); // status line for the sync control
+
+  useEffect(() => {
+    if (!statsFocus) return;
+    (async () => {
+      const cached = await store.get("ingenuity:mlb:rosterMap", null);
+      if (cached) {
+        setRosterMap(cached.map);
+        const age = Math.floor((Date.now() - new Date(cached.asOf + "T12:00:00Z").getTime()) / 86400000);
+        if (age > ROSTER_MAP_MAX_AGE_DAYS) syncRosters(true); // stale — refresh quietly
+        else setRosterSync(`MLB rosters synced ${age === 0 ? "today" : age + "d ago"} — ${Object.keys(cached.map).length} players.`);
+      } else {
+        syncRosters(true); // never synced — do it now, quietly
+      }
+    })();
+  }, [statsFocus]);
+
+  const syncRosters = async (quiet) => {
+    if (!quiet) setRosterSync("Syncing MLB rosters…");
+    const res = await refreshMlbRosterMap();
+    if (res.ok) {
+      const cached = await store.get("ingenuity:mlb:rosterMap", null);
+      setRosterMap(cached?.map || null);
+      setRosterSync(`MLB rosters synced just now — ${res.n} players. This lets stats CSVs with no team column still route correctly.`);
+    } else {
+      setRosterSync(quiet ? "" : "Couldn't reach MLB's roster list from here — team-column CSVs still work; sync again later.");
+    }
+  };
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
@@ -3262,17 +3325,19 @@ function SmartImport({ teams, saveTeams, onGameLine, statsFocus }) {
 
   const applyRows = async (rows, label) => {
     const hadTeamCol = rows.some((r) => r.team);
-    const { next, hitters, pitchers, teamsTouched, seeded, unroutable } = applyStatRows(rows, teams, timeframe);
+    const { next, hitters, pitchers, teamsTouched, seeded, unroutable } = applyStatRows(rows, teams, timeframe, rosterMap);
     await saveTeams(next);
     setLastImport({ ts: new Date().toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" }), mode: timeframe, teams: teamsTouched || [], seeded: seeded || 0 });
     const touched = teamsTouched || [];
     const teamList = touched.slice(0, 6).map((t) => t.n ? `${t.name} (${t.n})` : t.name).join(", ")
       + (touched.length > 6 ? ` +${touched.length - 6} more` : "");
-    const seededNote = seeded ? ` Auto-rostered ${seeded} new player${seeded === 1 ? "" : "s"} from the file's team column.` : "";
+    const seededNote = seeded ? ` Auto-rostered ${seeded} new player${seeded === 1 ? "" : "s"} (${hadTeamCol ? "from the file's team column" : "matched against MLB's current rosters"}).` : "";
 
     // If nothing landed, say WHY — the three real causes are distinguishable.
     const diagnose = () => {
-      if (!hadTeamCol) return `${label}: parsed ${rows.length} players, but this file has no team column, and your rosters are empty — so there's nothing to attach the stats to. Re-export from Baseball Savant with "Team" added to the columns (Custom Leaderboard → add Team), and it'll auto-build the rosters. Or load a lineup first.`;
+      if (!hadTeamCol) return rosterMap && Object.keys(rosterMap).length
+        ? `${label}: parsed ${rows.length} players, but none matched MLB's current rosters by name — check for nicknames, suffixes, or typos, or tap "Sync MLB rosters" if it's been a while.`
+        : `${label}: parsed ${rows.length} players. Baseball Savant's exports don't include a team column (there's no button for that — the "Team" control on Savant is a filter, not an export column), so the app resolves each player's team from MLB's own roster list instead. That list hasn't synced yet — tap "Sync MLB rosters" above and re-run this import.`;
       if (unroutable) return `${label}: parsed ${rows.length} players, but their team labels didn't match any of the 30 MLB clubs (${unroutable} unresolved). If the file uses an unusual team code, tell me the format and I'll map it.`;
       return `${label}: parsed ${rows.length} players but none matched — check name spellings against the Database tab.`;
     };
@@ -3331,9 +3396,12 @@ If none of these: {"kind":"unknown"}` },
             logInterp("image-lineup", true, parsed.team);
           }
         } else if (parsed.kind === "odds" && parsed.lines?.length) {
-          await store.set("ingenuity:slate:odds", parsed.lines.join("\n"));
-          setMsg(`Read ${parsed.lines.length} games with odds — sent to Today's Slate on the Home screen. It will merge automatically.`);
-          logInterp("image-odds", true, parsed.lines.length + " games");
+          if (statsFocus) { setMsg("That's an odds/slate screenshot, not roster stats. Odds go to Today's Slate from the Home screen. This box only loads player stats."); logInterp("image-odds", false, "odds in stats box"); }
+          else {
+            await store.set("ingenuity:slate:odds", parsed.lines.join("\n"));
+            setMsg(`Read ${parsed.lines.length} games with odds — sent to Today's Slate on the Home screen. It will merge automatically.`);
+            logInterp("image-odds", true, parsed.lines.length + " games");
+          }
         } else { setMsg("Couldn't classify that screenshot as stats, a lineup, or odds. A tighter crop usually fixes it."); logInterp("image", false, "unclassifiable screenshot"); }
       } else {
         const content = await file.text();
@@ -3358,6 +3426,18 @@ If none of these: {"kind":"unknown"}` },
   const handleText = async () => {
     setBusy(true); setMsg("");
     try {
+      // In the Database tab this panel is STATS ONLY. A game line pasted here is a
+      // mistake (it belongs in the Terminal's projection), so we never route text
+      // to the game-line parser — we treat everything as stats and, if it isn't,
+      // say so plainly instead of silently loading a matchup.
+      if (statsFocus) {
+        const { rows, headers } = savantCsvToRows(text);
+        if (rows) { await applyRows(rows, `Stats parsed (${rows.length} players)`); setText(""); logInterp("csv-paste", true, rows.length + " rows"); }
+        else if (/\b(@|at|vs)\b/i.test(text) && /\d/.test(text)) { setMsg("That looks like a game line, not player stats. Game lines go in the Project tab (they build a projection). This box is only for roster stats — paste a Savant CSV or a stats table with a header row."); logInterp("csv-paste", false, "game line in stats box"); }
+        else { setMsg(`No stat columns found. Paste a Savant export (or table) that includes a header row with wOBA / est_woba, ERA / xERA, BB%, K%, and ideally a Team column. Headers seen: ${headers.slice(0, 6).join(", ") || "none"}.`); logInterp("csv-paste", false, "stat header, no columns"); }
+        setBusy(false);
+        return;
+      }
       // Player stats first — a stats paste must never be read as odds.
       if (looksLikeStats(text)) {
         const { rows, headers } = savantCsvToRows(text);
@@ -3395,25 +3475,37 @@ If none of these: {"kind":"unknown"}` },
   return (
     <div className="ing-import">
       <button className="ing-import-toggle" onClick={() => setOpen(!open)}>
-        {open ? "\u25be" : "\u25b8"} Smart import — game lines, CSVs, screenshots
+        {open ? "\u25be" : "\u25b8"} {statsFocus ? "Import roster stats — CSVs & screenshots" : "Smart import — game lines, CSVs, screenshots"}
       </button>
       {open && (
         <div className="ing-import-body">
-          <p className="ing-hint">Paste a <strong>game line</strong> to auto-fill this projection — teams, both starters with their stats, line, and prices, all at once. Or drop a Savant CSV to refresh the database, a lineup screenshot to load tonight's order, or an odds-board screenshot to feed Today's Slate. Files stage first — nothing imports until you confirm.</p>
+          <p className="ing-hint">{statsFocus
+            ? <>This loads <strong>player stats into the team database</strong>. Drop a Baseball Savant CSV (ideally with a <strong>Team</strong> column so it sorts every player to the right club) or paste a stats table with a header row. Pick the timeframe first. Files stage — nothing imports until you confirm. Game lines belong in the Project tab, not here.</>
+            : <>Paste a <strong>game line</strong> to auto-fill this projection — teams, both starters with their stats, line, and prices, all at once. Or drop a Savant CSV to refresh the database, a lineup screenshot to load tonight's order, or an odds-board screenshot to feed Today's Slate. Files stage first — nothing imports until you confirm.</>}</p>
 
           <div className="ing-tf">
-            <span className="ing-tf-label">Stats timeframe</span>
+            <span className="ing-tf-label">{statsFocus ? "What are you loading?" : "Stats timeframe"}</span>
             <div className="ing-tf-btns">
-              <button className={timeframe === "season" ? "on" : ""} onClick={() => setTimeframe("season")}>Season</button>
-              <button className={timeframe === "recent" ? "on" : ""} onClick={() => setTimeframe("recent")}>Last 14 days</button>
+              <button className={timeframe === "season" ? "on" : ""} onClick={() => setTimeframe("season")}>{statsFocus ? "Full roster (season)" : "Season"}</button>
+              <button className={timeframe === "recent" ? "on" : ""} onClick={() => setTimeframe("recent")}>{statsFocus ? "Recent form / lineup" : "Last 14 days"}</button>
             </div>
           </div>
           <p className="ing-tf-note">
             {timeframe === "season"
-              ? "Season mode: sets each player's true-talent line — team wOBA/xwOBA, rotation, bullpen. This is the baseline the model regresses toward."
-              : "14-day mode: fills recent form only (recent wOBA + BB%−K%) and leaves season numbers alone. The engine weights BB%−K% heavier here — it stabilizes at ~60 PA, while raw wOBA over 14 days is still mostly noise."}
+              ? (statsFocus
+                ? "Full-roster mode: the season baseline for every player — team wOBA/xwOBA, whole rotation, whole bullpen. This is the foundation the model regresses toward, and what you'd load from a full-league Savant export. Do this once, refresh weekly."
+                : "Season mode: sets each player's true-talent line — team wOBA/xwOBA, rotation, bullpen. This is the baseline the model regresses toward.")
+              : (statsFocus
+                ? "Recent / lineup mode: last-14-day form (recent wOBA + BB%−K%), layered on top without touching the season baseline. This is what you load when today's lineups are announced or you want hot/cold form. BB%−K% is weighted heavier here — it stabilizes near 60 PA, while raw 14-day wOBA is mostly noise."
+                : "14-day mode: fills recent form only (recent wOBA + BB%−K%) and leaves season numbers alone. The engine weights BB%−K% heavier here — it stabilizes at ~60 PA, while raw wOBA over 14 days is still mostly noise.")}
           </p>
 
+          {statsFocus && (
+            <div className="ing-rostersync">
+              <button className="ing-ghost small" onClick={() => syncRosters(false)} disabled={busy}>⟳ Sync MLB rosters</button>
+              <span>{rosterSync || "Resolves player → team automatically, even when a CSV has no team column."}</span>
+            </div>
+          )}
           <input key={inputKey} type="file" accept=".csv,.txt,.tsv,image/*" onChange={(e) => stageFile(e.target.files[0])} disabled={busy} />
           {staged && (
             <div className="ing-staged">
@@ -3423,7 +3515,9 @@ If none of these: {"kind":"unknown"}` },
               <button className="ing-ghost" onClick={removeStaged} disabled={busy}>✕ Remove</button>
             </div>
           )}
-          <textarea rows={4} value={text} onChange={(e) => setText(e.target.value)} placeholder={"Shorthand works: skenes wheeler 8.5 -104 -122\n(away SP, home SP, total, over, under — teams auto-detected)\n\nOr a full line: Phillies (Zack Wheeler) @ Tigers (Tarik Skubal) | 7.5 | +102 | -122\nOr a stats CSV with header row"} />
+          <textarea rows={4} value={text} onChange={(e) => setText(e.target.value)} placeholder={statsFocus
+            ? "Paste a stats table or CSV with a header row, e.g.:\nlast_name, first_name,team,pa,woba,est_woba,bb_percent,k_percent\n\"Harper, Bryce\",PHI,300,.390,.380,14,20\n\nA Team column lets one file fill every club at once."
+            : "Shorthand works: skenes wheeler 8.5 -104 -122\n(away SP, home SP, total, over, under — teams auto-detected)\n\nOr a full line: Phillies (Zack Wheeler) @ Tigers (Tarik Skubal) | 7.5 | +102 | -122\nOr a stats CSV with header row"} />
           <div className="ing-db-actions">
             <button className="ing-run small" onClick={handleText} disabled={busy || !text.trim()}>{busy ? "Working…" : "Load / apply paste"}</button>
             {msg && <span className="ing-importmsg">{msg}</span>}
@@ -5389,6 +5483,9 @@ const CSS = `
 .ing-lineup-player .nm { font-weight: 500; }
 .ing-lineup-player .st { color: var(--ink-dim); font-size: 11px; }
 .ing-lineup-player .wb { color: var(--cyan); font-family: 'Archivo'; font-weight: 600; }
+.ing-rostersync { display: flex; align-items: center; gap: 10px; margin-bottom: 11px; font-size: 11.5px; color: var(--ink-dim); flex-wrap: wrap; }
+.ing-rostersync button { font-family: 'Archivo'; font-size: 10.5px; letter-spacing: 0.06em; background: transparent; border: 1px solid var(--line); color: var(--cyan); padding: 6px 11px; border-radius: 7px; cursor: pointer; white-space: nowrap; }
+.ing-rostersync button:hover:not(:disabled) { border-color: var(--cyan); }
 .ing-receipt { margin-top: 14px; background: rgba(52,230,168,0.05); border: 1px solid var(--line); border-left: 3px solid var(--phos); border-radius: 10px; padding: 13px; }
 .ing-receipt-head { display: flex; justify-content: space-between; align-items: center; font-family: 'Archivo'; font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--phos); margin-bottom: 9px; }
 .ing-receipt-head button { background: transparent; border: none; color: var(--ink-dim); cursor: pointer; font-size: 13px; }
