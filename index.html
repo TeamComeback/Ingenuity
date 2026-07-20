@@ -1194,6 +1194,12 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
   const [r, setR] = useState(null);
   const [busy, setBusy] = useState(true);
   const [why, setWhy] = useState("");
+  const [streaks, setStreaks] = useState(null);
+
+  useEffect(() => { (async () => {
+    const log = await store.get("ingenuity:results:log", {});
+    if (Object.keys(log).length) setStreaks({ away: teamOUStreak(log, g.away), home: teamOUStreak(log, g.home) });
+  })(); }, []);
 
   const A = matchTeamDb(g.away, teams), H = matchTeamDb(g.home, teams);
   const park = H ? parkForTeam(H.name) : "Neutral";
@@ -1295,6 +1301,29 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
           </div>
         )}
 
+        {streaks && (streaks.away.n > 0 || streaks.home.n > 0) && (
+          <div className="gd-streak">
+            <div className="gd-streak-head">Recent over/under form · from your graded results</div>
+            {[{ t: g.away, s: streaks.away }, { t: g.home, s: streaks.home }].map(({ t, s }, i) => (
+              <div className="gd-streak-row" key={i}>
+                <span className="gd-streak-team">{t}</span>
+                {s.n > 0 ? (
+                  <>
+                    <span className={"gd-streak-tag " + (s.side === "O" ? "ov" : s.side === "U" ? "un" : "")}>
+                      {s.streak >= 2 ? `${s.streak} straight ${s.side === "O" ? "OVER" : s.side === "U" ? "UNDER" : "PUSH"}` : `last: ${s.side === "O" ? "over" : s.side === "U" ? "under" : "push"}`}
+                    </span>
+                    <span className="gd-streak-seq">{s.last.map((x) => x.ou).join(" ")}</span>
+                  </>
+                ) : <span className="gd-streak-tag">no graded games yet</span>}
+              </div>
+            ))}
+            <p className="gd-streak-note">
+              A streak is a fact, not a lean. "Hot unders keep going under" and "a series is due to flip" are opposite reads of the same run — both are stories.
+              This is shown for research, is NOT in the projection, and grows only as your own graded results accumulate.
+            </p>
+          </div>
+        )}
+
         {g.proj && (
           <div className="gd-frozen">
             Scanner's read at {g.proj.ts || "scan time"}: model {g.proj.model} vs line {g.proj.atLine} ({g.proj.edge > 0 ? "+" : ""}{g.proj.edge} pts). Below is the fresh full-depth run.
@@ -1337,6 +1366,8 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
 // ===========================================================================
 const CHANGELOG = [
   { date: "2026-07-16", items: [
+    "Permanent results log: every graded game now distills to a compact row (date, teams, line, model, final, O/U) in a store that NEVER expires — separate from the 90-day full-board archive. This is the R&D record; it protects training data the old 90-day wipe was silently deleting. Included in backups.",
+    "Over/under streaks in the game breakdown: each team's recent O/U run from your own graded results (e.g. 'Braves — 3 straight UNDER'), newest-first. Explicitly a research signal, NOT a model input — the 'hot unders continue' and 'series due to flip' reads are opposite stories about the same streak, so the app shows the fact and lets you decide. Grows only as your graded results accumulate.",
     "Engine v1.5 — times-through-the-order: a starter is now priced ~0.010 wOBA better his 1st pass through the lineup and worse his 3rd (1.2x steeper, per the research consensus), instead of one flat number all night. Centered on the 2nd pass so typical 5.5-IP starts stay calibration-neutral; deep outings and the innings-5-6 window reprice. Brain-tunable (TTO_STEP).",
     "Recent-form honesty: the legacy raw-wOBA 14-day weight drops 0.4 → 0.25. Raw wOBA at 14 days is mostly noise; the BB%-K% process path (stabilizes ~60 PA) is where recent trust belongs. Projections using 14-day raw wOBA only will lean slightly more on season talent now — that's the correction working, not a bug.",
     "FIXED: loading a game into the Terminal from Today's Slate now carries its weather into the Temp/Wind boxes too (it was filling teams, line, prices, and park but leaving weather blank). Roofed parks load 72°/0; a game with no weather yet clears the fields and the note tells you to pull or Refresh weather.",
@@ -1406,7 +1437,7 @@ const BACKUP_KEYS = [
   "ingenuity:teams", "ingenuity:ledger:games", "ingenuity:ledger:bets",
   "ingenuity:slate:day", "ingenuity:slate:archive", "ingenuity:history:bets",
   "ingenuity:brain:params", "ingenuity:brain:log", "ingenuity:brain:interpLog",
-  "ingenuity:brain:slateScan", "ingenuity:brain:slateAccuracy", "ingenuity:botd",
+  "ingenuity:brain:slateScan", "ingenuity:brain:slateAccuracy", "ingenuity:botd", "ingenuity:results:log",
   "ingenuity:history:version", "ingenuity:seedVersion",
 ];
 
@@ -3517,7 +3548,50 @@ function BoardChart({ games, rows, onPick, onOpen }) {
   );
 }
 
-const SLATE_ARCHIVE_DAYS = 90; // keep a season's worth of boards; a day is ~3KB
+const SLATE_ARCHIVE_DAYS = 90; // keep a season's worth of full boards; a day is ~3KB
+
+// Full boards (odds + weather + pitchers) roll off at 90 days, but a graded
+// game is training data — it must never expire. Each finished game distills to
+// one compact permanent row (~120 bytes): date, teams, park, line, model,
+// final, and O/U result. Keyed by date+matchup so re-grading can't duplicate.
+// This is the store R&D reads from, and what powers over/under streaks.
+async function recordFinals(arch) {
+  const rec = await store.get("ingenuity:results:log", {});
+  let added = 0;
+  for (const d of Object.keys(arch)) {
+    for (const g of (arch[d].games || [])) {
+      if (g.final == null) continue;
+      const key = d + "|" + normName(g.away) + "@" + normName(g.home);
+      if (rec[key]) continue;
+      const line = g.proj ? g.proj.atLine : (g.line !== "" && g.line != null ? parseFloat(g.line) : null);
+      const ou = line == null ? null : g.final > line ? "O" : g.final < line ? "U" : "P";
+      rec[key] = { date: d, away: g.away, home: g.home, line, final: g.final, model: g.proj ? g.proj.model : null, ou };
+      added++;
+    }
+  }
+  if (added) await store.set("ingenuity:results:log", rec);
+  return added;
+}
+
+// Per-team over/under streak from the permanent log. Returns the most recent
+// run of the SAME result and the last few games, newest first. This is a
+// research signal to SURFACE — not a model input. The "hot unders will keep
+// going under" read and the contrarian "series due to flip" read are opposite
+// interpretations of the same streak; the app shows the fact and lets the user
+// decide, rather than baking a bias into the projection.
+function teamOUStreak(log, teamName) {
+  const n = normName(teamName);
+  const games = Object.values(log)
+    .filter((r) => r.ou && (normName(r.away).includes(n) || normName(r.home).includes(n) || n.includes(normName(r.away)) || n.includes(normName(r.home))))
+    .sort((a, b) => (a.date < b.date ? 1 : -1)); // newest first
+  if (!games.length) return { n: 0 };
+  let streak = 1;
+  const top = games[0].ou;
+  for (let i = 1; i < games.length; i++) { if (games[i].ou === top) streak++; else break; }
+  const last = games.slice(0, 6).map((g) => ({ date: g.date, ou: g.ou, final: g.final, line: g.line, vs: normName(g.away).includes(n) ? g.home : g.away }));
+  return { n: games.length, streak, side: top, last };
+}
+
 
 function SlateHub() {
   const todayKey = etDayKey();
@@ -3580,7 +3654,7 @@ function SlateHub() {
       } else if (cur) setSlate(cur);
       const scan = await store.get("ingenuity:brain:slateScan", null);
       if (scan && scan.date === todayKey && scan.lean) setLean({ call: null, saved: scan });
-      setAcc(computeAccuracy(arch));
+      setAcc(computeAccuracy(arch, await store.get("ingenuity:results:log", {})));
       gradeArchive(true); // settle up quietly on open — the closest thing to "always working"
     })();
   }, []);
@@ -3992,11 +4066,24 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
   // How wrong was the model, measured against games that had already been
   // projected before they were played? Only counts boards carrying a frozen
   // proj — a number written down after the fact proves nothing.
-  const computeAccuracy = (arch) => {
+  const computeAccuracy = (arch, permLog) => {
     const rows2 = [];
+    const seen = new Set();
+    // permanent log first — it outlives the 90-day boards
+    for (const r of Object.values(permLog || {})) {
+      if (r.model == null || r.final == null) continue;
+      const k = r.date + "|" + normName(r.away) + "@" + normName(r.home);
+      seen.add(k);
+      rows2.push({ date: r.date, away: r.away, home: r.home, model: r.model, line: r.line, final: r.final, err: r.final - r.model });
+    }
+    // then any still-in-window boards not yet distilled
     for (const d of Object.keys(arch)) {
       for (const g of (arch[d].games || [])) {
-        if (g.proj && g.final != null) rows2.push({ date: d, away: g.away, home: g.home, model: g.proj.model, line: g.proj.atLine, final: g.final, err: g.final - g.proj.model });
+        if (g.proj && g.final != null) {
+          const k = d + "|" + normName(g.away) + "@" + normName(g.home);
+          if (seen.has(k)) continue;
+          rows2.push({ date: d, away: g.away, home: g.home, model: g.proj.model, line: g.proj.atLine, final: g.final, err: g.final - g.proj.model });
+        }
       }
     }
     const n = rows2.length;
@@ -4041,7 +4128,8 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
       } catch (e) { /* sandbox blocks statsapi; stay quiet and let the panel say so */ }
     }
     if (got) await store.set("ingenuity:slate:archive", arch);
-    const a = computeAccuracy(arch);
+    await recordFinals(arch); // distill graded games into the permanent, never-expiring log
+    const a = computeAccuracy(arch, await store.get("ingenuity:results:log", {}));
     setAcc(a);
     if (a.n) await store.set("ingenuity:brain:slateAccuracy", { n: a.n, bias: +a.bias.toFixed(3), mae: +a.mae.toFixed(3), big: a.big, ts: new Date().toISOString().slice(0, 16).replace("T", " ") });
     // refresh the viewed board so any new finals show immediately
@@ -5330,6 +5418,15 @@ const CSS = `
 .gd-wx-roof { font-size: 12.5px; color: var(--ink-dim); line-height: 1.55; }
 .gd-wx-note { font-size: 11.5px; color: var(--ink-dim); line-height: 1.55; margin-top: 10px; border-top: 1px solid var(--line); padding-top: 9px; }
 .gd-move-note { font-size: 12px; color: var(--ink-dim); margin-bottom: 12px; padding-left: 9px; border-left: 2px solid var(--amber); line-height: 1.5; }
+.gd-streak { background: var(--field2); border: 1px solid var(--line); border-radius: 12px; padding: 14px; margin-bottom: 12px; }
+.gd-streak-head { font-family: 'Archivo'; font-size: 10px; letter-spacing: 0.13em; text-transform: uppercase; color: var(--ink-dim); margin-bottom: 10px; }
+.gd-streak-row { display: flex; align-items: center; gap: 9px; margin-bottom: 7px; flex-wrap: wrap; }
+.gd-streak-team { font-family: 'Space Grotesk'; font-size: 13px; min-width: 130px; }
+.gd-streak-tag { font-family: 'Archivo'; font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; padding: 3px 8px; border-radius: 5px; background: var(--field); color: var(--ink-dim); border: 1px solid var(--line); }
+.gd-streak-tag.ov { color: var(--amber); border-color: rgba(245,196,81,0.4); }
+.gd-streak-tag.un { color: var(--cyan); border-color: rgba(95,217,232,0.4); }
+.gd-streak-seq { font-family: 'Archivo'; font-size: 11px; letter-spacing: 0.14em; color: var(--ink-dim); }
+.gd-streak-note { font-size: 11px; color: var(--ink-dim); line-height: 1.55; margin-top: 9px; border-top: 1px solid var(--line); padding-top: 9px; }
 .gd-frozen { background: rgba(95,217,232,0.07); border: 1px solid var(--line); border-left: 3px solid var(--cyan); border-radius: 9px; padding: 10px 13px; font-size: 12.5px; color: var(--ink-dim); margin-bottom: 12px; }
 .gd-busy { text-align: center; padding: 40px 0; color: var(--phos); font-family: 'Archivo'; font-size: 13px; letter-spacing: 0.1em; animation: pulse 1.4s ease-in-out infinite; }
 .gd-why { background: rgba(232,115,79,0.08); border: 1px solid var(--line); border-left: 3px solid var(--rust); border-radius: 9px; padding: 13px 15px; font-size: 13px; line-height: 1.6; margin-bottom: 14px; }
