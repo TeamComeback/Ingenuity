@@ -1366,6 +1366,7 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
 // ===========================================================================
 const CHANGELOG = [
   { date: "2026-07-16", items: [
+    "FIXED (the '300 players, 0 matched' bug): two problems. First, Savant's 'last_name, first_name' header has a comma in the column LABEL, so the parser split it into two columns while each data row kept the name as one quoted field — shifting every column after it by one, so 'team' was silently reading the PA number. Now detected and realigned. Second, the importer required pre-loaded rosters to match against; it now auto-builds rosters from the CSV's team column, so a stats file works from a completely empty database. If a file has no team column, the message now says exactly that and how to fix the export.",
     "Permanent results log: every graded game now distills to a compact row (date, teams, line, model, final, O/U) in a store that NEVER expires — separate from the 90-day full-board archive. This is the R&D record; it protects training data the old 90-day wipe was silently deleting. Included in backups.",
     "Over/under streaks in the game breakdown: each team's recent O/U run from your own graded results (e.g. 'Braves — 3 straight UNDER'), newest-first. Explicitly a research signal, NOT a model input — the 'hot unders continue' and 'series due to flip' reads are opposite stories about the same streak, so the app shows the fact and lets you decide. Grows only as your graded results accumulate.",
     "Engine v1.5 — times-through-the-order: a starter is now priced ~0.010 wOBA better his 1st pass through the lineup and worse his 3rd (1.2x steeper, per the research consensus), instead of one flat number all night. Centered on the 2nd pass so typical 5.5-IP starts stay calibration-neutral; deep outings and the innings-5-6 window reprice. Brain-tunable (TTO_STEP).",
@@ -3059,6 +3060,32 @@ function parseCsvText(text) {
 //   small samples; overwriting season talent with 14 days of noise is exactly
 //   the mistake the stabilization logic exists to prevent.
 function applyStatRows(rows, teams, mode = "season") {
+  // Auto-roster: if a stat row names a team (Savant CSVs include a team column),
+  // make sure that player exists on that team before matching. This is what lets
+  // an import work when your rosters are empty or thin — the exact "300 players,
+  // 0 matched" case. A pitcher row (has ERA/xERA or barrel-allowed but no wOBA)
+  // seeds the rotation; a hitter row seeds the lineup.
+  let seeded = 0, unroutable = 0;
+  if (rows.some((r) => r.team)) {
+    const idx = new Map(); // resolved team name -> team object
+    teams.forEach((t) => idx.set(normName(t.name), t));
+    for (const r of rows) {
+      if (!r.team) { continue; }
+      const resolved = resolveTeamName(r.team) || r.team;
+      let t = idx.get(normName(resolved));
+      if (!t) { unroutable++; continue; } // team not in the 30-team DB (shouldn't happen, but safe)
+      const isPitcher = (r.era != null || r.xera != null || (r.barrel != null && r.woba == null && r.xwoba == null));
+      const bucket = isPitcher ? "rotation" : "players";
+      t[bucket] = t[bucket] || [];
+      const exists = t[bucket].some((p) => normName(p.name) === normName(r.name));
+      if (!exists) {
+        if (isPitcher) t.rotation.push({ name: r.name, xwoba: "", bf: "", ip: "", era: "" });
+        else t.players.push({ name: r.name, woba: "", pa: "" });
+        seeded++;
+      }
+    }
+  }
+
   const byName = new Map();
   for (const r of rows) { const k = normName(r.name); if (k) byName.set(k, r); }
   const lastIdx = new Map();
@@ -3096,7 +3123,7 @@ function applyStatRows(rows, teams, mode = "season") {
       };
     });
     const teamsTouched = nextR.filter((t, i2) => t !== teams[i2]).map((t) => ({ name: t.name, n: 0 })).sort();
-    return { next: nextR, hitters: matched, pitchers: 0, mode: "recent", teamsTouched };
+    return { next: nextR, hitters: matched, pitchers: 0, mode: "recent", teamsTouched, seeded, unroutable };
   }
 
   let hitters = 0, pitchers = 0;
@@ -3169,13 +3196,26 @@ function applyStatRows(rows, teams, mode = "season") {
     teamsTouched.push({ name: t.name, n: cnt });
   });
   teamsTouched.sort((a, b) => b.n - a.n);
-  return { next, hitters, pitchers, teamsTouched };
+  return { next, hitters, pitchers, teamsTouched, seeded, unroutable };
 }
 
 function savantCsvToRows(csv) {
   const rows = parseCsvText(csv);
   if (rows.length < 2) return { rows: null, headers: rows[0] || [] };
-  const head = rows[0].map((h) => String(h).trim().toLowerCase());
+  let head = rows[0].map((h) => String(h).trim().toLowerCase());
+  // Savant's default name header is "last_name, first_name" — a single logical
+  // column whose LABEL contains a comma. A naive CSV split turns the header into
+  // two cells ("last_name" + "first_name") while each data row keeps the name as
+  // one quoted "Last, First" field. That misaligns every column after the name
+  // by one (team ends up reading PA, etc.). Detect and repair by collapsing the
+  // two header cells back into one so header and data column counts agree.
+  if (head[0] === "last_name" && (head[1] === "first_name" || head[1] === "")) {
+    const dataCols = rows[1] ? rows[1].length : head.length;
+    if (head.length === dataCols + 1) {
+      head = ["last_name, first_name", ...head.slice(2)];
+      rows[0] = rows[0].slice(); // header now aligns 1:1 with data rows
+    }
+  }
   const find = (cands) => { for (const c of cands) { const i = head.indexOf(c); if (i !== -1) return i; } return -1; };
   const iName = (() => { const i = find(["last_name, first_name", "last_name,first_name", "player_name", "player", "name", "\u540d"]); return i !== -1 ? i : 0; })();
   const iPa = find(["pa", "pa_count", "plate_appearances"]);
@@ -3187,6 +3227,7 @@ function savantCsvToRows(csv) {
   const iK = find(["k_percent", "k%", "strikeout_percent", "k_pct"]);
   const iBarrel = find(["barrel_batted_rate", "brl_percent", "barrel%", "barrel_pct"]);
   const iHardHit = find(["hard_hit_percent", "hardhit_percent", "hard_hit%", "hard_hit_pct"]);
+  const iTeam = find(["team", "team_name", "player_team", "team_abbrev", "parent_org", "team_id"]);
   if (iX === -1 && iW === -1 && iE === -1 && iBB === -1 && iK === -1 && iBarrel === -1 && iHardHit === -1) return { rows: null, headers: rows[0] };
   const out = rows.slice(1).filter((r) => r[iName] && String(r[iName]).trim()).map((r) => {
     const cell = String(r[iName]).trim();
@@ -3194,6 +3235,7 @@ function savantCsvToRows(csv) {
     const num = (i) => (i !== -1 && r[i] !== "" && r[i] != null ? parseFloat(r[i]) : null);
     return {
       name: parts && parts.length === 2 ? `${parts[1]} ${parts[0]}` : cell,
+      team: iTeam !== -1 && r[iTeam] != null ? String(r[iTeam]).trim() : null,
       pa: num(iPa), woba: num(iW), xwoba: num(iX), era: num(iE), xera: num(iXE),
       bb: num(iBB), k: num(iK), barrel: num(iBarrel), hardHit: num(iHardHit),
     };
@@ -3211,18 +3253,29 @@ function SmartImport({ teams, saveTeams, onGameLine }) {
   const [inputKey, setInputKey] = useState(0); // remount the file input to truly clear it
 
   const applyRows = async (rows, label) => {
-    const { next, hitters, pitchers, teamsTouched } = applyStatRows(rows, teams, timeframe);
+    const hadTeamCol = rows.some((r) => r.team);
+    const { next, hitters, pitchers, teamsTouched, seeded, unroutable } = applyStatRows(rows, teams, timeframe);
     await saveTeams(next);
-    const teamList = (teamsTouched || []).slice(0, 6).map((t) => t.n ? `${t.name} (${t.n})` : t.name).join(", ")
-      + ((teamsTouched || []).length > 6 ? ` +${teamsTouched.length - 6} more` : "");
+    const touched = teamsTouched || [];
+    const teamList = touched.slice(0, 6).map((t) => t.n ? `${t.name} (${t.n})` : t.name).join(", ")
+      + (touched.length > 6 ? ` +${touched.length - 6} more` : "");
+    const seededNote = seeded ? ` Auto-rostered ${seeded} new player${seeded === 1 ? "" : "s"} from the file's team column.` : "";
+
+    // If nothing landed, say WHY — the three real causes are distinguishable.
+    const diagnose = () => {
+      if (!hadTeamCol) return `${label}: parsed ${rows.length} players, but this file has no team column, and your rosters are empty — so there's nothing to attach the stats to. Re-export from Baseball Savant with "Team" added to the columns (Custom Leaderboard → add Team), and it'll auto-build the rosters. Or load a lineup first.`;
+      if (unroutable) return `${label}: parsed ${rows.length} players, but their team labels didn't match any of the 30 MLB clubs (${unroutable} unresolved). If the file uses an unusual team code, tell me the format and I'll map it.`;
+      return `${label}: parsed ${rows.length} players but none matched — check name spellings against the Database tab.`;
+    };
+
     if (timeframe === "recent") {
-      setMsg(hitters || (teamsTouched || []).length
-        ? `${label}: read as LAST-14-DAY form — ${hitters} hitters recognized, applied to ${teamsTouched.length} team${teamsTouched.length === 1 ? "" : "s"}: ${teamList}. Season numbers untouched.`
-        : `${label}: no players matched your rosters, so no recent form was set. Load lineups first, or switch to Season.`);
+      setMsg(hitters || touched.length
+        ? `${label}: read as LAST-14-DAY form — ${hitters} hitters recognized across ${touched.length} team${touched.length === 1 ? "" : "s"}${touched.length ? `: ${teamList}` : ""}.${seededNote} Season numbers untouched.`
+        : diagnose());
     } else {
-      setMsg((teamsTouched || []).length
-        ? `${label}: ${hitters} hitters and ${pitchers} pitchers recognized and applied to ${teamsTouched.length} team${teamsTouched.length === 1 ? "" : "s"}: ${teamList}. Team wOBA, bullpens, and freshness stamps updated.`
-        : `${label}: parsed, but no players matched your rosters — check name spellings against the Database tab.`);
+      setMsg(touched.length || seeded
+        ? `${label}: ${hitters} hitters and ${pitchers} pitchers recognized across ${touched.length} team${touched.length === 1 ? "" : "s"}${touched.length ? `: ${teamList}` : ""}.${seededNote} Team wOBA, bullpens, and freshness stamps updated.`
+        : diagnose());
     }
   };
 
