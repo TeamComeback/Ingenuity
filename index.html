@@ -4531,11 +4531,14 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
                     const base = d === (slate?.date) ? slate : (arch[d] || null);
                     await saveSlate(mergeOdds(base, byDay[d], d));
                 }
-                // leave the user looking at the day they were already on
-                const back = arch[viewDate] || (viewDate === todayKey ? null : null);
+                // A pull can seed several days (today + tomorrow's early lines). saveSlate
+                // updates the on-screen board each loop, so after the loop we'd be looking
+                // at whichever day sorted last — i.e. tomorrow. Always snap back to TODAY
+                // so the board you see matches today's real lines, not tomorrow's openers.
+                setViewDate(todayKey);
                 const fresh = await store.get("ingenuity:slate:archive", {});
-                if (fresh[viewDate])
-                    setSlate(fresh[viewDate]);
+                setSlate(fresh[todayKey] || null);
+                setArchDates(Object.keys(fresh).sort().reverse());
                 const remaining = r.headers.get("x-requests-remaining");
                 const spread = days.map((d) => `${byDay[d].length} on ${d}${d === todayKey ? " (today)" : ""}`).join(", ");
                 const nArms = await attachPitchers(days);
@@ -4752,16 +4755,32 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
         }
     };
     const isToday = viewDate === todayKey;
+    const isFuture = viewDate > todayKey;
+    const dayLabel = isToday ? "Today's Slate — the 6th agent" : isFuture ? `Upcoming board — ${viewDate}` : `Slate archive — ${viewDate}`;
     const games = slate?.games || [];
     const withOdds = games.filter((g) => g.line !== "" && g.line != null).length;
     const withP = games.filter((g) => g.awayP && g.homeP).length;
     const moved = games.filter((g) => g.openLine !== "" && g.openLine != null && g.line !== "" && parseFloat(g.openLine) !== parseFloat(g.line)).length;
     return (React.createElement("section", { className: "slate" },
         React.createElement("div", { className: "slate-head" },
-            React.createElement("h2", null, isToday ? "Today's Slate — the 6th agent" : `Slate archive — ${viewDate}`),
+            React.createElement("h2", null, dayLabel),
             React.createElement("span", { className: "botd-sub" },
                 viewDate,
                 " \u00B7 the wide net: stores every game's odds + pitchers for the day, sweeps the board at 8k sims to flag candidates (4+ pt gaps). Confirm any lean in the Terminal, which runs 20k sims and only calls an edge at 7+ pts.")),
+        !isToday && (React.createElement("div", { className: "slate-daybanner " + (isFuture ? "future" : "past") },
+            isFuture
+                ? React.createElement(React.Fragment, null,
+                    "\u23ED You're viewing ",
+                    React.createElement("strong", null, viewDate),
+                    " \u2014 tomorrow's early lines, not today. These are openers books have posted ahead; today's real board is under \"back to today\".")
+                : React.createElement(React.Fragment, null,
+                    "\uD83D\uDDD3 You're viewing ",
+                    React.createElement("strong", null, viewDate),
+                    " \u2014 a past board, frozen as it was. Not today's slate."),
+            React.createElement("button", { className: "ing-ghost", onClick: () => pickDay(todayKey) },
+                "\u21A9 back to today (",
+                todayKey,
+                ")"))),
         archDates.length > 1 && (React.createElement("div", { className: "slate-days" },
             React.createElement("span", { className: "slate-days-label" }, "Board"),
             React.createElement("select", { value: viewDate, onChange: (e) => pickDay(e.target.value) },
@@ -4770,7 +4789,7 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
                     " \u00B7 today"),
                 archDates.map((d) => React.createElement("option", { key: d, value: d },
                     d,
-                    d === todayKey ? " · today" : ""))),
+                    d === todayKey ? " · today" : d > todayKey ? " · upcoming" : ""))),
             !isToday && React.createElement("button", { className: "ing-ghost", onClick: () => pickDay(todayKey) }, "\u21A9 back to today"))),
         !isToday && (React.createElement("div", { className: "slate-research" },
             React.createElement("strong", null,
@@ -6127,6 +6146,11 @@ const CSS = `
 .slate-days-label { font-family: 'Archivo'; font-size: 9.5px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-dim); }
 .slate-days select { background: var(--field); border: 1px solid var(--line); color: var(--ink); padding: 7px 10px; border-radius: 7px; font-family: 'Space Grotesk'; font-size: 13px; }
 .slate-research { background: rgba(95,217,232,0.07); border: 1px solid var(--line); border-left: 3px solid var(--cyan); border-radius: 9px; padding: 11px 14px; font-size: 12.5px; color: var(--ink-dim); line-height: 1.55; margin-bottom: 12px; }
+.slate-daybanner { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; border-radius: 10px; padding: 12px 15px; margin-bottom: 14px; font-size: 13px; line-height: 1.5; }
+.slate-daybanner strong { font-weight: 700; }
+.slate-daybanner.future { background: rgba(245,196,81,0.10); border: 1px solid rgba(245,196,81,0.35); border-left: 3px solid var(--amber); color: #f3d68a; }
+.slate-daybanner.past { background: rgba(95,217,232,0.08); border: 1px solid var(--line); border-left: 3px solid var(--cyan); color: var(--ink); }
+.slate-daybanner .ing-ghost { margin-left: auto; }
 .slate-research strong { color: var(--cyan); }
 .slate-chip.move { background: rgba(245,196,81,0.12); color: var(--amber); }
 /* Full breakdown is a solid, opaque PAGE — the board never shows through. */
@@ -6524,8 +6548,6 @@ const CSS = `
   .ing-bar { transition: none; }
 }
 `;
-// ---- mount ----
-ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
 // ---- mount ----
 ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
 
