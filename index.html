@@ -1223,6 +1223,24 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
   const [why, setWhy] = useState("");
   const [streaks, setStreaks] = useState(null);
 
+  // A full breakdown is a PAGE, not a floating card: lock the body scroll behind
+  // it (so the board underneath can't move), scroll this page to the top on
+  // open, and restore everything on close. Escape also closes it.
+  useEffect(() => {
+    const y = window.scrollY;
+    const prevOverflow = document.body.style.overflow;
+    const prevPos = document.body.style.position;
+    document.body.style.overflow = "hidden";
+    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => {
+      document.body.style.overflow = prevOverflow;
+      document.body.style.position = prevPos;
+      window.scrollTo(0, y);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, []);
+
   useEffect(() => { (async () => {
     const log = await store.get("ingenuity:results:log", {});
     if (Object.keys(log).length) setStreaks({ away: teamOUStreak(log, g.away), home: teamOUStreak(log, g.home) });
@@ -1283,12 +1301,13 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
   const moved = g.openLine !== "" && g.openLine != null && g.line !== "" && parseFloat(g.openLine) !== parseFloat(g.line);
 
   return (
-    <div className="gd-overlay" role="dialog" aria-label={`${g.away} at ${g.home} full breakdown`}>
+    <div className="gd-page" role="dialog" aria-modal="true" aria-label={`${g.away} at ${g.home} full breakdown`}>
+      <div className="gd-bar">
+        <button className="gd-back" onClick={onClose} aria-label="Back to the board">← Back</button>
+        <span className="gd-bar-title">{g.away} @ {g.home}</span>
+        <span className="gd-date">{dateKey}{isToday ? " · today" : " · archived"}</span>
+      </div>
       <div className="gd-sheet">
-        <div className="gd-top">
-          <button className="gd-back" onClick={onClose}>← Board</button>
-          <span className="gd-date">{dateKey}{isToday ? " · today" : " · archived"}</span>
-        </div>
 
         <h2 className="gd-title">{g.away} <em>@</em> {g.home}</h2>
         <p className="gd-sub">
@@ -1393,6 +1412,7 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
 // ===========================================================================
 const CHANGELOG = [
   { date: "2026-07-16", items: [
+    "Full breakdown is now a real, solid PAGE — not a translucent overlay with the board bleeding through. Opaque background, its own sticky top bar with a prominent ← Back button that never scrolls away, the matchup pinned in the bar, a smooth slide-in (respecting reduced-motion), body-scroll locked behind it, your board scroll position restored exactly on return, and Escape closes it too.",
     "CORRECTION + real fix: there is no \"add Team\" option anywhere on Baseball Savant — its Team control filters the leaderboard to one team, it never adds a team column to the CSV. Earlier guidance pointing to that button was wrong. The app now resolves each player's team from MLB's own free roster list instead, so a plain Savant export with no team column still auto-routes every player correctly. A 'Sync MLB rosters' control (auto-runs on first use, refreshes weekly) keeps that list current; a team column in the file, if present, still takes priority.",
     "Database tab import is now STATS-ONLY, end to end. Pasting a game line here (the 'Twins @ Guardians' mistake) is refused with a pointer to the Project tab instead of silently loading a matchup. The header, description, and paste-box example no longer mention game lines, and an odds screenshot dropped here is rejected too.",
     "The two stat modes are relabeled for what they actually do: 'Full roster (season)' = the season baseline for every player (load once from a full-league Savant export, refresh weekly), and 'Recent form / lineup' = last-14-day form or announced lineups, layered on top without touching the season baseline.",
@@ -5589,12 +5609,35 @@ const CSS = `
 .slate-research { background: rgba(95,217,232,0.07); border: 1px solid var(--line); border-left: 3px solid var(--cyan); border-radius: 9px; padding: 11px 14px; font-size: 12.5px; color: var(--ink-dim); line-height: 1.55; margin-bottom: 12px; }
 .slate-research strong { color: var(--cyan); }
 .slate-chip.move { background: rgba(245,196,81,0.12); color: var(--amber); }
-.gd-overlay { position: fixed; inset: 0; z-index: 60; background: rgba(5,13,9,0.92); backdrop-filter: blur(6px); overflow-y: auto; -webkit-overflow-scrolling: touch; }
-.gd-sheet { max-width: 720px; margin: 0 auto; padding: 18px 18px 40px; animation: fadein 0.25s ease; }
-.gd-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
-.gd-back { background: transparent; border: 1px solid var(--line); color: var(--ink); font-family: 'Archivo'; font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; padding: 9px 14px; border-radius: 8px; cursor: pointer; }
-.gd-back:hover { border-color: var(--phos); color: var(--phos); }
-.gd-date { font-size: 11px; color: var(--ink-dim); font-family: 'Archivo'; letter-spacing: 0.1em; text-transform: uppercase; }
+/* Full breakdown is a solid, opaque PAGE — the board never shows through. */
+.gd-page {
+  position: fixed; inset: 0; z-index: 100;
+  background: radial-gradient(ellipse at 50% -10%, #103026 0%, #08160f 55%, #050d09 100%), #08160f;
+  display: flex; flex-direction: column;
+  overflow: hidden;
+  animation: gd-slide 0.28s cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+@keyframes gd-slide { from { transform: translateX(3%); opacity: 0; } to { transform: none; opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .gd-page { animation: gd-fade 0.15s ease; } @keyframes gd-fade { from { opacity: 0; } to { opacity: 1; } } }
+/* Sticky bar with the back button — always reachable, never scrolls away. */
+.gd-bar {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 12px;
+  padding: 14px 18px; border-bottom: 1px solid var(--line);
+  background: rgba(7,20,14,0.92); backdrop-filter: blur(12px);
+  position: sticky; top: 0; z-index: 2;
+}
+.gd-bar-title { font-family: 'Archivo'; font-weight: 600; font-size: 13px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gd-back {
+  background: var(--phos); border: none; color: var(--field);
+  font-family: 'Archivo'; font-weight: 600; font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase;
+  padding: 9px 16px; border-radius: 8px; cursor: pointer; white-space: nowrap;
+  box-shadow: 0 0 16px rgba(52,230,168,0.25); transition: box-shadow 0.16s, transform 0.1s;
+}
+.gd-back:hover { box-shadow: 0 0 24px rgba(52,230,168,0.45); }
+.gd-back:active { transform: translateY(1px); }
+/* The scrolling content area — this scrolls, the bar stays put. */
+.gd-sheet { flex: 1 1 auto; overflow-y: auto; -webkit-overflow-scrolling: touch; max-width: 720px; width: 100%; margin: 0 auto; padding: 18px 18px 48px; }
+.gd-date { font-size: 11px; color: var(--ink-dim); font-family: 'Archivo'; letter-spacing: 0.1em; text-transform: uppercase; white-space: nowrap; }
 .gd-title { font-family: 'Archivo'; font-weight: 700; font-size: 24px; }
 .gd-title em { font-style: normal; color: var(--phos); }
 .gd-sub { font-size: 13px; color: var(--ink-dim); margin: 5px 0 14px; }
