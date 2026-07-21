@@ -913,7 +913,7 @@ const TEAM_LOOKUP = (() => {
   add("Rays", ["tampa bay", "tb", "tbr", "rays"]);
   add("Rangers", ["texas", "tex", "rangers"]);
   add("Blue Jays", ["toronto", "tor", "blue jays", "bluejays", "jays"]);
-  add("Nationals", ["washington", "wsh", "was", "nationals", "nats"]);
+  add("Nationals", ["washington", "wsh", "was", "wsn", "nationals", "nats"]);
   return map;
 })();
 
@@ -1412,6 +1412,7 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
 // ===========================================================================
 const CHANGELOG = [
   { date: "2026-07-16", items: [
+    "FanGraphs leaderboards now import. Your uploaded file was FanGraphs, not Savant, and it had two things the parser choked on: a transposed header (each column name stacked on its own line, so only '#, Name, Team, G' was ever read) and a real Team column FanGraphs always includes. The app now detects the vertical/stacked header, rebuilds it, reads all the stats, and routes every player via the Team column — no MLB-roster sync even needed. Tested against the actual 379-player file: all parsed, all teams resolved (added the FanGraphs WSN code for Washington).",
     "Full breakdown is now a real, solid PAGE — not a translucent overlay with the board bleeding through. Opaque background, its own sticky top bar with a prominent ← Back button that never scrolls away, the matchup pinned in the bar, a smooth slide-in (respecting reduced-motion), body-scroll locked behind it, your board scroll position restored exactly on return, and Escape closes it too.",
     "CORRECTION + real fix: there is no \"add Team\" option anywhere on Baseball Savant — its Team control filters the leaderboard to one team, it never adds a team column to the CSV. Earlier guidance pointing to that button was wrong. The app now resolves each player's team from MLB's own free roster list instead, so a plain Savant export with no team column still auto-routes every player correctly. A 'Sync MLB rosters' control (auto-runs on first use, refreshes weekly) keeps that list current; a team column in the file, if present, still takes priority.",
     "Database tab import is now STATS-ONLY, end to end. Pasting a game line here (the 'Twins @ Guardians' mistake) is refused with a pointer to the Project tab instead of silently loading a matchup. The header, description, and paste-box example no longer mention game lines, and an odds screenshot dropped here is rejected too.",
@@ -3261,6 +3262,37 @@ function applyStatRows(rows, teams, mode = "season", rosterMap = null) {
 }
 
 function savantCsvToRows(csv) {
+  // FanGraphs paste shape: the header is transposed — each column label sits on
+  // its OWN line (#, Name, Team, G, PA, ... wOBA, xwOBA, ... WAR), and the data
+  // rows begin only after the last label. A normal parse sees just the first
+  // physical line ("# Name Team G") as the header and misses wOBA entirely.
+  // Detect and un-stack it into a proper single header row.
+  {
+    const raw = String(csv).replace(/\r/g, "").split("\n");
+    // A stacked-label line is a single short token (a stat name), no tabs.
+    const looksLabel = (s) => s && !s.includes("\t") && s.trim().length > 0 && s.trim().length <= 5 || /^(name|team|player)$/i.test((s||"").trim());
+    // Find the first wide (tab-rich) data line — that's row 1 of real data.
+    let firstData = -1;
+    for (let i = 0; i < raw.length; i++) {
+      if ((raw[i].match(/\t/g) || []).length >= 6 && /[A-Za-z]/.test(raw[i]) && /\d/.test(raw[i])) { firstData = i; break; }
+    }
+    // Count the stacked single-token header lines that precede it (allowing the
+    // very first line to itself contain a few tab-joined labels like "# Name Team G").
+    if (firstData > 3) {
+      const labelLines = raw.slice(0, firstData).flatMap((l) => l.split("\t")).map((s) => s.trim()).filter(Boolean);
+      const dataCols = raw[firstData].split("\t").length;
+      // Only treat as FanGraphs if the stacked labels line up with the data width
+      // and include the fields we actually use.
+      const lower = labelLines.map((s) => s.toLowerCase());
+      const hasKey = lower.includes("woba") || lower.includes("xwoba") || (lower.includes("bb%") && lower.includes("k%"));
+      if (labelLines.length >= dataCols - 1 && labelLines.length <= dataCols + 1 && hasKey) {
+        const body = raw.slice(firstData).filter((l) => l.trim());
+        const rebuilt = [labelLines.slice(0, dataCols).join("\t"), ...body].join("\n");
+        return savantCsvToRows(rebuilt); // re-parse with a proper single header row
+      }
+    }
+  }
+
   const rows = parseCsvText(csv);
   if (rows.length < 2) return { rows: null, headers: rows[0] || [] };
   let head = rows[0].map((h) => String(h).trim().toLowerCase());
@@ -3288,7 +3320,7 @@ function savantCsvToRows(csv) {
   const iK = find(["k_percent", "k%", "strikeout_percent", "k_pct"]);
   const iBarrel = find(["barrel_batted_rate", "brl_percent", "barrel%", "barrel_pct"]);
   const iHardHit = find(["hard_hit_percent", "hardhit_percent", "hard_hit%", "hard_hit_pct"]);
-  const iTeam = find(["team", "team_name", "player_team", "team_abbrev", "parent_org", "team_id"]);
+  const iTeam = find(["team", "team_name", "player_team", "team_abbrev", "parent_org", "team_id", "tm"]);
   if (iX === -1 && iW === -1 && iE === -1 && iBB === -1 && iK === -1 && iBarrel === -1 && iHardHit === -1) return { rows: null, headers: rows[0] };
   const out = rows.slice(1).filter((r) => r[iName] && String(r[iName]).trim()).map((r) => {
     const cell = String(r[iName]).trim();
@@ -3500,7 +3532,7 @@ If none of these: {"kind":"unknown"}` },
       {open && (
         <div className="ing-import-body">
           <p className="ing-hint">{statsFocus
-            ? <>This loads <strong>player stats into the team database</strong>. Drop a Baseball Savant CSV (ideally with a <strong>Team</strong> column so it sorts every player to the right club) or paste a stats table with a header row. Pick the timeframe first. Files stage — nothing imports until you confirm. Game lines belong in the Project tab, not here.</>
+            ? <>This loads <strong>player stats into the team database</strong>. Works with <strong>Baseball Savant</strong> CSVs and <strong>FanGraphs</strong> leaderboards (including the copy-paste format where the column names stack vertically). FanGraphs includes a Team column, so it sorts every player automatically. Pick the timeframe first. Files stage — nothing imports until you confirm. Game lines belong in the Project tab, not here.</>
             : <>Paste a <strong>game line</strong> to auto-fill this projection — teams, both starters with their stats, line, and prices, all at once. Or drop a Savant CSV to refresh the database, a lineup screenshot to load tonight's order, or an odds-board screenshot to feed Today's Slate. Files stage first — nothing imports until you confirm.</>}</p>
 
           <div className="ing-tf">
