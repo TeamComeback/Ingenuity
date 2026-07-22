@@ -4148,6 +4148,7 @@ function SlateHub() {
         const sameDay = !cur || !dateKey || cur.date === dateKey;
         const games = sameDay && cur ? [...cur.games] : [];
         const stamp = new Date().toISOString().slice(11, 16);
+        const nowDay = etDayKey(); // ET day this merge is happening on
         const has = (v) => v !== "" && v != null && !isNaN(parseFloat(v));
         // First pitch passed = anything the market says now is a LIVE number.
         // Belt and braces alongside commenceTimeFrom: freeze started games at their
@@ -4170,14 +4171,21 @@ function SlateHub() {
                 const line = has(o.line) ? o.line : g0.line;
                 const over = has(o.over) ? o.over : g0.over;
                 const under = has(o.under) ? o.under : g0.under;
-                const openingNow = !has(g0.openLine) && has(line); // first time this game got a number
+                // A line carried from a PRIOR day's early pull (openTs stamped before
+                // today) is a stale opener, not today's market. If today's fresh pull
+                // brought a real line, it is authoritative — replace, and reset the
+                // opener to today so line-movement is measured from today's first look,
+                // not yesterday's placeholder. This is what stops a tomorrow-preview
+                // number (e.g. 11.5) from sitting on today's board when the real one is 13.
+                const staleCarry = g0.lastDay && g0.lastDay !== nowDay;
+                const openingNow = (!has(g0.openLine) || staleCarry) && has(line);
                 games[gi] = { ...g0, line, over, under,
                     awayP: o.awayP || g0.awayP, homeP: o.homeP || g0.homeP,
                     openLine: openingNow ? line : g0.openLine,
                     openOver: openingNow ? over : g0.openOver,
                     openUnder: openingNow ? under : g0.openUnder,
                     openTs: openingNow ? stamp : g0.openTs,
-                    lastTs: stamp };
+                    lastTs: stamp, lastDay: nowDay };
             }
             else {
                 // A game we've never seen that has ALREADY started can only give us a
@@ -4189,7 +4197,7 @@ function SlateHub() {
                 games.push({ away: o.away, home: o.home, awayP: o.awayP || "", homeP: o.homeP || "",
                     line: o.line, over: o.over, under: o.under, start: o.start || null,
                     openLine: fresh ? o.line : "", openOver: fresh ? o.over : "", openUnder: fresh ? o.under : "",
-                    openTs: fresh ? stamp : "", lastTs: stamp });
+                    openTs: fresh ? stamp : "", lastTs: stamp, lastDay: nowDay });
             }
         }
         return { date: dateKey || (cur && cur.date) || todayKey, games };
@@ -4923,6 +4931,10 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
                             g.homeP || "TBD"),
                         g.wx && (React.createElement("span", { className: "sg-wx" }, g.wx.roof ? "⌂ roof" : `${g.wx.temp}° · ${Math.abs(g.wx.windOut)}mph ${g.wx.windOut > 1 ? "out ↗" : g.wx.windOut < -1 ? "in ↘" : "calm"}`)),
                         (g.inPlay || (g.start && new Date(g.start).getTime() <= Date.now())) && (React.createElement("span", { className: "sg-inplay" }, "\u25CF in play \u00B7 line frozen at last pregame number")),
+                        isToday && g.lastDay && g.lastDay !== todayKey && !(g.inPlay || (g.start && new Date(g.start).getTime() <= Date.now())) && (React.createElement("span", { className: "sg-stale" },
+                            "\u26A0 line last set ",
+                            g.lastDay,
+                            " (a prior day) \u2014 tap Refresh matchups or Refresh slate to pull today's number")),
                         g.openLine !== "" && g.openLine != null && g.line !== "" && parseFloat(g.openLine) !== parseFloat(g.line) && (React.createElement("span", { className: "sg-move " + (parseFloat(g.line) > parseFloat(g.openLine) ? "up" : "down") },
                             "opened ",
                             g.openLine,
@@ -6258,6 +6270,7 @@ const CSS = `
 .ing-gamepick select { background: var(--field); border: 1px solid var(--line); color: var(--ink); padding: 10px 12px; border-radius: 7px; font-family: 'Space Grotesk'; font-size: 14px; width: 100%; }
 .sg-wx { display: block; font-size: 10.5px; color: var(--ink-dim); margin-top: 3px; }
 .sg-inplay { display: block; font-size: 10.5px; color: var(--rust); margin-top: 3px; font-weight: 500; }
+.sg-stale { display: block; font-size: 10.5px; color: var(--amber); margin-top: 3px; font-weight: 500; }
 .sg-move { font-size: 11px; margin-top: 3px; }
 .sg-move.up { color: var(--amber); }
 .sg-move.down { color: var(--cyan); }
