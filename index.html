@@ -88,6 +88,16 @@ const DEFAULT_CFG = {
     PEN_CONTACT_WEIGHT: 0.4, // bullpen: barrel/hard-hit-derived quality vs raw xwOBA
     DEFENSE_OAA_SCALE: 0.0025, // fractional runs shift per team OAA
     FRAMING_FACTOR_SCALE: 0.0015, // fractional runs shift per catcher framing run
+    // v1.6 — platoon splits. A lineup's run output depends heavily on the
+    // handedness matchup vs the opposing starter. Team wOBA vs LHP / vs RHP is
+    // the matchup-specific signal books price in. Splits are SMALL samples (a
+    // team sees far fewer LHP than RHP over a season), so the chosen split is
+    // regressed toward the team's OVERALL wOBA with a large phantom count — a
+    // 40-PA split barely moves the overall; a full-season split gets real weight.
+    // The net shift is also hard-capped so a noisy split can't swing a total.
+    SPLIT_REG_PA: 300, // phantom PA regressing a platoon split toward the team's overall wOBA
+    SPLIT_MAX_SHIFT: 0.030, // hard cap (wOBA pts) on how far the split can move the offense from its overall
+    LEAGUE_PLATOON_GAP: 0.020, // typical lineup wOBA edge vs opposite-hand pitching (reference/context only)
     // v1.5 — times-through-the-order. A starter isn't one pitcher: he's ~0.010
     // wOBA better than his line the 1st time through and worse the 3rd. Flat
     // pricing systematically undervalues innings 5–6 (where overs live) and
@@ -153,6 +163,29 @@ function effectiveOffenseWoba(off, xoff) {
     if (isNaN(o))
         return x;
     return CFG.OFFENSE_XWOBA_WEIGHT * x + (1 - CFG.OFFENSE_XWOBA_WEIGHT) * o;
+}
+// v1.6 — apply the platoon matchup. Given the team's baseline effective wOBA
+// (already xwOBA-blended) and its wOBA vs the opposing starter's hand, nudge
+// the baseline toward the split. The split is regressed toward the baseline by
+// phantom PA (small split samples barely move it) and the net shift is capped,
+// so this adds a real matchup signal without letting a noisy 40-PA split swing
+// a total. oppHand is "L" or "R" (the starter's throwing hand); splitVsL/R are
+// the team's wOBA against LHP/RHP with their PA counts.
+function applyPlatoon(baseWoba, oppHand, splitVsL, splitPaL, splitVsR, splitPaR) {
+    if (oppHand !== "L" && oppHand !== "R")
+        return baseWoba; // unknown hand → no adjustment
+    const split = oppHand === "L" ? parseFloat(splitVsL) : parseFloat(splitVsR);
+    const spa = oppHand === "L" ? parseFloat(splitPaL) : parseFloat(splitPaR);
+    if (isNaN(split))
+        return baseWoba; // no split on file → no adjustment
+    const pa = isNaN(spa) ? 0 : Math.max(0, spa);
+    // regress the split toward the baseline: weight = pa / (pa + phantom)
+    const w = pa / (pa + CFG.SPLIT_REG_PA);
+    const regressed = split * w + baseWoba * (1 - w);
+    // cap the net shift off the baseline
+    let shift = regressed - baseWoba;
+    shift = Math.max(-CFG.SPLIT_MAX_SHIFT, Math.min(CFG.SPLIT_MAX_SHIFT, shift));
+    return baseWoba + shift;
 }
 // BB%−K% (plate discipline) → wOBA-equivalent. Stabilizes far faster (~60 PA)
 // than wOBA itself (~200+ PA), so it's the trustworthy part of a 14-day window.
@@ -443,8 +476,13 @@ function simulateSide(offW, oppSP, oppSPip, oppPen, park, fld, n, gameFactor, si
 }
 function projectGame(g, nOverride) {
     const park = (PARKS[g.park] ?? 1.0) * weatherFactor(g.temp, g.windOut);
-    const awayOff = regress(blendRecent(effectiveOffenseWoba(g.awayOff, g.awayXoff), g.awayPA, g.awayRecent, g.awayRecentPA, g.awayRecentBbk), g.awayPA, CFG.REG_OFFENSE_PA);
-    const homeOff = regress(blendRecent(effectiveOffenseWoba(g.homeOff, g.homeXoff), g.homePA, g.homeRecent, g.homeRecentPA, g.homeRecentBbk), g.homePA, CFG.REG_OFFENSE_PA);
+    // Offense: xwOBA-blended baseline → platoon nudge vs the OPPOSING starter's
+    // hand → recent-form blend → regression. Away bats face the home starter, so
+    // away offense uses homeSPHand; home offense uses awaySPHand.
+    const awayBase = applyPlatoon(effectiveOffenseWoba(g.awayOff, g.awayXoff), g.homeSPHand, g.awayOffVsL, g.awayPaVsL, g.awayOffVsR, g.awayPaVsR);
+    const homeBase = applyPlatoon(effectiveOffenseWoba(g.homeOff, g.homeXoff), g.awaySPHand, g.homeOffVsL, g.homePaVsL, g.homeOffVsR, g.homePaVsR);
+    const awayOff = regress(blendRecent(awayBase, g.awayPA, g.awayRecent, g.awayRecentPA, g.awayRecentBbk), g.awayPA, CFG.REG_OFFENSE_PA);
+    const homeOff = regress(blendRecent(homeBase, g.homePA, g.homeRecent, g.homeRecentPA, g.homeRecentBbk), g.homePA, CFG.REG_OFFENSE_PA);
     const awaySP = regress(effectivePitcherWoba(g.awaySP, g.awaySPera), g.awaySPbf, CFG.REG_STARTER_BF);
     const homeSP = regress(effectivePitcherWoba(g.homeSP, g.homeSPera), g.homeSPbf, CFG.REG_STARTER_BF);
     const awayPen = regress(effectivePenWoba(g.awayPen, g.awayPenBarrel, g.awayPenHardHit), g.awayPenBf, CFG.REG_BULLPEN_BF);
@@ -638,6 +676,8 @@ const HISTORY_VERSION = 4;
 // ---------------------------------------------------------------------------
 const EMPTY_TEAM = {
     name: "", off: "", xoff: "", pa: "", recent: "", recentPA: "", recentBbk: "",
+    // platoon splits: team wOBA vs LHP / vs RHP with their PA counts (v1.6)
+    offVsL: "", paVsL: "", offVsR: "", paVsR: "",
     sp: "", spBf: "", spIp: "5.0", spEra: "", pen: "", penBf: "800", penBarrel: "", penHardHit: "",
     oaa: "", framing: "",
     players: [], rotation: [],
@@ -830,7 +870,7 @@ function mergeSeedRosters(stored, force = false) {
     const merged = [...stored];
     let changed = false;
     const mkH = (h) => ({ name: h[0], woba: h[1] || "", pa: h[2] || "" });
-    const mkP = (p) => ({ name: p[0], xwoba: p[1] || "", bf: p[2] || "", ip: "", era: p[3] || "" });
+    const mkP = (p) => ({ name: p[0], xwoba: p[1] || "", bf: p[2] || "", ip: "", era: p[3] || "", hand: p[4] || "" });
     const blank = (v) => v === "" || v == null;
     for (const [name, r] of Object.entries(SEED_ROSTERS)) {
         const i = merged.findIndex((t) => (t.name || "").toLowerCase() === name.toLowerCase());
@@ -1245,7 +1285,7 @@ function App() {
             React.createElement("div", { className: "home-brand" },
                 React.createElement("span", { className: "ing-logo big" }, "\u25C6"),
                 React.createElement("h1", null, "INGENUITY"),
-                React.createElement("p", null, "MLB totals research suite \u00B7 projection engine v1.3 \u00B7 honest bookkeeping")),
+                React.createElement("p", null, "MLB totals research suite \u00B7 projection engine v1.6 \u00B7 honest bookkeeping")),
             React.createElement("div", { className: "home-cards" },
                 React.createElement("button", { className: "home-card", onClick: () => setView("terminal") },
                     React.createElement("span", { className: "home-card-glyph" }, "\u03A3"),
@@ -1389,7 +1429,7 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
             const side = (t, arm) => ({
                 off: num(t.off) ?? CFG.LEAGUE_WOBA, xoff: num(t.xoff), pa: num(t.pa) ?? 600,
                 recent: num(t.recent), recentPA: num(t.recentPA), recentBbk: num(t.recentBbk),
-                sp: num(arm.xwoba) ?? 0.32, spBf: num(arm.bf) ?? 200, spIp: num(arm.ip) ?? 5, spEra: num(arm.era),
+                sp: num(arm.xwoba) ?? 0.32, spBf: num(arm.bf) ?? 200, spIp: num(arm.ip) ?? 5, spEra: num(arm.era), spHand: (arm.hand === "L" || arm.hand === "R") ? arm.hand : null,
                 pen: num(t.pen) ?? 0.318, penBf: num(t.penBf) ?? 800, penBarrel: num(t.penBarrel), penHardHit: num(t.penHardHit),
                 oaa: num(t.oaa), framing: num(t.framing),
             });
@@ -1397,11 +1437,13 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
             const proj = projectGame({
                 park, line: num(g.line) ?? 8.5, temp: g.wx ? g.wx.temp : null, windOut: g.wx ? g.wx.windOut : null,
                 awayOff: a.off, awayXoff: a.xoff, awayPA: a.pa, awayRecent: a.recent, awayRecentPA: a.recentPA, awayRecentBbk: a.recentBbk,
-                awaySP: a.sp, awaySPbf: a.spBf, awaySPip: a.spIp, awaySPera: a.spEra,
+                awayOffVsL: num(A.offVsL), awayPaVsL: num(A.paVsL), awayOffVsR: num(A.offVsR), awayPaVsR: num(A.paVsR),
+                awaySP: a.sp, awaySPbf: a.spBf, awaySPip: a.spIp, awaySPera: a.spEra, awaySPHand: a.spHand,
                 awayPen: a.pen, awayPenBf: a.penBf, awayPenBarrel: a.penBarrel, awayPenHardHit: a.penHardHit,
                 awayOAA: a.oaa, awayFraming: a.framing,
                 homeOff: h.off, homeXoff: h.xoff, homePA: h.pa, homeRecent: h.recent, homeRecentPA: h.recentPA, homeRecentBbk: h.recentBbk,
-                homeSP: h.sp, homeSPbf: h.spBf, homeSPip: h.spIp, homeSPera: h.spEra,
+                homeOffVsL: num(H.offVsL), homePaVsL: num(H.paVsL), homeOffVsR: num(H.offVsR), homePaVsR: num(H.paVsR),
+                homeSP: h.sp, homeSPbf: h.spBf, homeSPip: h.spIp, homeSPera: h.spEra, homeSPHand: h.spHand,
                 homePen: h.pen, homePenBf: h.penBf, homePenBarrel: h.penBarrel, homePenHardHit: h.penHardHit,
                 homeOAA: h.oaa, homeFraming: h.framing,
             });
@@ -1549,7 +1591,18 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
                 React.createElement(CompareBar, { label: "Pen barrel% alwd", a: A.penBarrel, h: H.penBarrel, fmt: (x) => x.toFixed(1) }),
                 React.createElement(CompareBar, { label: "Defense OAA", a: A.oaa, h: H.oaa, higherIsBetter: true, fmt: (x) => (x > 0 ? "+" : "") + x.toFixed(0) }),
                 React.createElement(CompareBar, { label: "Framing runs", a: A.framing, h: H.framing, higherIsBetter: true, fmt: (x) => (x > 0 ? "+" : "") + x.toFixed(0) }),
-                React.createElement("p", { className: "gd-cmp-note" }, "Pitching rows: lower is better. Blank means that stat hasn't been imported for this team yet \u2014 the model falls back to league average there, so a blank is a soft spot in the read, not a zero."))),
+                (() => {
+                    const hHand = (hArm?.hand === "L" || hArm?.hand === "R") ? hArm.hand : null;
+                    const aHand = (aArm?.hand === "L" || aArm?.hand === "R") ? aArm.hand : null;
+                    const aSplit = hHand === "L" ? A.offVsL : hHand === "R" ? A.offVsR : null;
+                    const hSplit = aHand === "L" ? H.offVsL : aHand === "R" ? H.offVsR : null;
+                    if (aSplit == null && hSplit == null)
+                        return null;
+                    return (React.createElement(React.Fragment, null,
+                        React.createElement(CompareBar, { label: `wOBA vs ${hHand || "?"}HP (away)`, a: aSplit, h: null, higherIsBetter: true, fmt: (x) => x.toFixed(3) }),
+                        React.createElement(CompareBar, { label: `wOBA vs ${aHand || "?"}HP (home)`, a: null, h: hSplit, higherIsBetter: true, fmt: (x) => x.toFixed(3) })));
+                })(),
+                React.createElement("p", { className: "gd-cmp-note" }, "Pitching rows: lower is better. Platoon rows show each lineup's wOBA against the opposing starter's hand (the matchup the model nudges toward). Blank means that stat hasn't been imported for this team yet \u2014 the model falls back to league average there, so a blank is a soft spot in the read, not a zero."))),
             React.createElement("p", { className: "gd-foot" }, "Same engine, same guards as the Terminal \u2014 this is the deep dive, just anchored to the game. Research, not advice; the pass is always available."))));
 }
 // ===========================================================================
@@ -1558,6 +1611,10 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
 // what's actually deployed. Newest first.
 // ===========================================================================
 const CHANGELOG = [
+    { date: "2026-07-22", items: [
+            "Engine v1.6 — platoon splits. Run scoring swings hard on the handedness matchup, so the model now nudges each lineup toward its wOBA vs the opposing starter's hand (LHP/RHP). The split is regressed toward the team's overall wOBA by sample size (a 40-PA split barely moves it; a full-season split gets real weight) and the net shift is hard-capped at ±0.030 wOBA, so a noisy split can't swing a total. Only fires when the starter's throwing hand is known.",
+            "New import spot for it (Database tab → 'Platoon splits'): paste team wOBA vs LHP / vs RHP one row per team (Team | wOBA vs L | PA vs L | wOBA vs R | PA vs R — tab, comma, pipe, or space separated), plus a pitcher-hand box (Name | L). FanGraphs Splits Leaderboards export these; a manual paste works too. A coverage line shows how many teams have splits and how many rostered arms are handed. The breakdown's side-by-side now shows each lineup's wOBA vs the opposing hand.",
+        ] },
     { date: "2026-07-16", items: [
             "FanGraphs leaderboards now import. Your uploaded file was FanGraphs, not Savant, and it had two things the parser choked on: a transposed header (each column name stacked on its own line, so only '#, Name, Team, G' was ever read) and a real Team column FanGraphs always includes. The app now detects the vertical/stacked header, rebuilds it, reads all the stats, and routes every player via the Team column — no MLB-roster sync even needed. Tested against the actual 379-player file: all parsed, all teams resolved (added the FanGraphs WSN code for Washington).",
             "Full breakdown is now a real, solid PAGE — not a translucent overlay with the board bleeding through. Opaque background, its own sticky top bar with a prominent ← Back button that never scrolls away, the matchup pinned in the bar, a smooth slide-in (respecting reduced-motion), body-scroll locked behind it, your board scroll position restored exactly on return, and Escape closes it too.",
@@ -1983,7 +2040,7 @@ function Terminal({ onHome }) {
                 React.createElement("button", { className: "ing-home-btn", onClick: onHome, "aria-label": "Back to home" }, "\u2190 Home"),
                 React.createElement("div", null,
                     React.createElement("h1", null, "TERMINAL"),
-                    React.createElement("p", null, "Run projection \u00B7 v1.3 \u00B7 research"))),
+                    React.createElement("p", null, "Run projection \u00B7 v1.6 \u00B7 research"))),
             React.createElement("nav", { className: "ing-nav" },
                 React.createElement("button", { className: tab === "project" ? "on" : "", onClick: () => setTab("project") }, "Project"),
                 React.createElement("button", { className: tab === "database" ? "on" : "", onClick: () => setTab("database") }, "Database"),
@@ -2038,6 +2095,8 @@ function Terminal({ onHome }) {
         tab === "database" && (React.createElement(React.Fragment, null,
             React.createElement("div", { className: "ing-db-import" },
                 React.createElement(SmartImport, { teams: teams, saveTeams: saveTeams, onGameLine: loadGameLine, statsFocus: true })),
+            React.createElement("div", { className: "ing-db-import" },
+                React.createElement(PlatoonImport, { teams: teams, saveTeams: saveTeams })),
             React.createElement(Database, { teams: teams, saveTeams: saveTeams, loaded: loaded }))),
         tab === "lineups" && React.createElement(LineupFetcher, { teams: teams, saveTeams: saveTeams }),
         React.createElement("footer", { className: "ing-foot" }, "Research instrument. Projections are estimates from the inputs you provide \u2014 only as good as the data entered. Not betting advice.")));
@@ -3254,6 +3313,131 @@ function parseCsvText(text) {
 //   recentPA, recentBbk) and never touches season numbers. Recent windows are
 //   small samples; overwriting season talent with 14 days of noise is exactly
 //   the mistake the stabilization logic exists to prevent.
+// v1.6 — parse pasted team-level platoon splits. Accepts flexible rows:
+//   Team | wOBA vs L | PA vs L | wOBA vs R | PA vs R
+// separated by tab, comma, or pipe. Header row optional (auto-detected/skipped).
+// Team can be a nickname, city, or abbreviation — resolveTeamName handles it.
+// PA columns are optional; if omitted the split still applies but with lighter
+// weight (it regresses harder toward the overall wOBA).
+function parseTeamSplits(text) {
+    const lines = String(text || "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    const out = [];
+    for (const line of lines) {
+        let cells = line.split(/\t|\s*\|\s*|\s*,\s*/).map((c) => c.trim()).filter((c) => c !== "");
+        // Fallback for pure space-delimited rows (no tab/pipe/comma): split on
+        // whitespace, but keep a leading multi-word team name intact by regrouping
+        // all leading non-numeric tokens back together below.
+        if (cells.length < 3)
+            cells = line.split(/\s+/).map((c) => c.trim()).filter(Boolean);
+        if (cells.length < 3)
+            continue;
+        // skip an obvious header
+        if (/^(team|club|tm)$/i.test(cells[0]) && cells.slice(1).some((c) => /vs|lhp|rhp|woba|pa/i.test(c)))
+            continue;
+        // find the team cell = first non-numeric token
+        const num = (v) => { const n = parseFloat(String(v).replace(/[^0-9.\-]/g, "")); return isNaN(n) ? null : n; };
+        // team is the leading run of non-numeric tokens
+        let ti = 0;
+        const nameParts = [];
+        while (ti < cells.length && num(cells[ti]) == null) {
+            nameParts.push(cells[ti]);
+            ti++;
+        }
+        const teamRaw = nameParts.join(" ");
+        const nums = cells.slice(ti).map(num).filter((n) => n != null);
+        if (!teamRaw || nums.length < 2)
+            continue;
+        const resolved = resolveTeamName(teamRaw) || teamRaw;
+        // interpret numbers: [wOBAvsL, PAvsL, wOBAvsR, PAvsR] — wOBA values are <1, PA are >=1
+        // be forgiving: pair each wOBA (a value below 1) with the PA that follows it if present
+        let offVsL = null, paVsL = null, offVsR = null, paVsR = null;
+        const wobas = [];
+        const pas = [];
+        for (const n of nums) {
+            if (n > 0 && n < 1)
+                wobas.push(n);
+            else
+                pas.push(n);
+        }
+        if (wobas.length >= 1)
+            offVsL = wobas[0];
+        if (wobas.length >= 2)
+            offVsR = wobas[1];
+        if (pas.length >= 1)
+            paVsL = pas[0];
+        if (pas.length >= 2)
+            paVsR = pas[1];
+        out.push({ team: resolved, offVsL, paVsL, offVsR, paVsR });
+    }
+    return out;
+}
+// Apply parsed team splits onto the team database. Returns { next, applied, unmatched }.
+function applyTeamSplits(splits, teams) {
+    const idx = new Map();
+    teams.forEach((t) => idx.set(normName(t.name), t));
+    let applied = 0;
+    const unmatched = [];
+    const next = teams.map((t) => ({ ...t }));
+    const nidx = new Map();
+    next.forEach((t) => nidx.set(normName(t.name), t));
+    for (const s of splits) {
+        const t = nidx.get(normName(s.team));
+        if (!t) {
+            unmatched.push(s.team);
+            continue;
+        }
+        if (s.offVsL != null)
+            t.offVsL = s.offVsL.toFixed(3);
+        if (s.paVsL != null)
+            t.paVsL = String(Math.round(s.paVsL));
+        if (s.offVsR != null)
+            t.offVsR = s.offVsR.toFixed(3);
+        if (s.paVsR != null)
+            t.paVsR = String(Math.round(s.paVsR));
+        t.splitsAsOf = etDayKey();
+        applied++;
+    }
+    return { next, applied, unmatched };
+}
+// Parse pitcher throwing hands: "Name | L" or "Name, R" rows, or "Name (L)".
+function parsePitcherHands(text) {
+    const lines = String(text || "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    const out = [];
+    for (const line of lines) {
+        // hand = a lone L/R/S token, or (L)/(R) after the name
+        let m = line.match(/^(.*?)[\s,|(]+([LRS])\)?\s*$/i);
+        if (!m)
+            continue;
+        const name = m[1].trim().replace(/[,|]$/, "").trim();
+        let hand = m[2].toUpperCase();
+        if (hand === "S")
+            hand = "R"; // switch-pitcher (rare) → default R; overrideable by hand
+        if (name)
+            out.push({ name, hand });
+    }
+    return out;
+}
+// Apply pitcher hands onto rotation entries across all teams. Matches by name.
+function applyPitcherHands(hands, teams) {
+    let applied = 0;
+    const unmatched = [];
+    const next = teams.map((t) => ({ ...t, rotation: (t.rotation || []).map((p) => ({ ...p })) }));
+    for (const h of hands) {
+        let hit = false;
+        for (const t of next) {
+            for (const p of (t.rotation || [])) {
+                if (normName(p.name) === normName(h.name) || normName(p.name).split(" ").pop() === normName(h.name).split(" ").pop()) {
+                    p.hand = h.hand;
+                    applied++;
+                    hit = true;
+                }
+            }
+        }
+        if (!hit)
+            unmatched.push(h.name);
+    }
+    return { next, applied, unmatched };
+}
 function applyStatRows(rows, teams, mode = "season", rosterMap = null) {
     // Auto-roster: figure out each player's team, then make sure he exists on
     // that team's roster before matching. This lets an import work even when
@@ -3848,6 +4032,74 @@ If none of these: {"kind":"unknown"}` },
                         React.createElement("em", null, p.val || "—"),
                         p.isNew ? React.createElement("i", { className: "new" }, "new") : null)))))))),
                 React.createElement("p", { className: "ing-receipt-note" }, "Tap a team in the list below to see its full stored roster anytime. If a name you pasted isn't here, its spelling didn't match \u2014 fix it and re-paste.")))))));
+}
+function PlatoonImport({ teams, saveTeams }) {
+    const [open, setOpen] = useState(false);
+    const [splitText, setSplitText] = useState("");
+    const [handText, setHandText] = useState("");
+    const [msg, setMsg] = useState("");
+    const importSplits = async () => {
+        const parsed = parseTeamSplits(splitText);
+        if (!parsed.length) {
+            setMsg("No team-split rows recognized. Use one row per team: Team | wOBA vs L | PA vs L | wOBA vs R | PA vs R");
+            return;
+        }
+        const { next, applied, unmatched } = applyTeamSplits(parsed, teams);
+        await saveTeams(next);
+        setMsg(`Platoon splits saved for ${applied} team${applied === 1 ? "" : "s"}.${unmatched.length ? ` Unmatched: ${unmatched.slice(0, 6).join(", ")}${unmatched.length > 6 ? "…" : ""} — check team names against the Database.` : ""} These now nudge each lineup's projection by the opposing starter's hand.`);
+    };
+    const importHands = async () => {
+        const parsed = parsePitcherHands(handText);
+        if (!parsed.length) {
+            setMsg("No pitcher hands recognized. Use one row per pitcher: Name | L  (or R). Example: Blake Snell L");
+            return;
+        }
+        const { next, applied, unmatched } = applyPitcherHands(parsed, teams);
+        await saveTeams(next);
+        setMsg(`Throwing hand set for ${applied} pitcher${applied === 1 ? "" : "s"}.${unmatched.length ? ` Unmatched: ${unmatched.slice(0, 6).join(", ")}${unmatched.length > 6 ? "…" : ""} — import the pitcher's stats first so he's on a rotation.` : ""} The platoon nudge only fires when the starter's hand is known.`);
+    };
+    // coverage summary — how many teams have splits, how many rostered pitchers have a hand
+    const teamsWithSplits = teams.filter((t) => t.offVsL !== "" || t.offVsR !== "").length;
+    let arms = 0, armsWithHand = 0;
+    for (const t of teams)
+        for (const p of (t.rotation || [])) {
+            arms++;
+            if (p.hand === "L" || p.hand === "R")
+                armsWithHand++;
+        }
+    return (React.createElement("div", { className: "ing-platoon" },
+        React.createElement("button", { className: "ing-platoon-head", onClick: () => setOpen(!open) },
+            React.createElement("span", null,
+                "Platoon splits \u2014 wOBA vs LHP / RHP ",
+                React.createElement("em", null, "v1.6")),
+            React.createElement("span", { className: "ing-platoon-cov" },
+                teamsWithSplits,
+                "/",
+                teams.length,
+                " teams \u00B7 ",
+                armsWithHand,
+                "/",
+                arms,
+                " arms handed ",
+                open ? "▲" : "▼")),
+        open && (React.createElement("div", { className: "ing-platoon-body" },
+            React.createElement("p", { className: "ing-hint" }, "Run scoring swings hard on the handedness matchup. Paste team wOBA vs LHP / vs RHP and the model will nudge each lineup toward the split that matches the opposing starter \u2014 regressed for sample size and capped, so a small split won't swing a total. FanGraphs \u2192 Splits Leaderboards exports these; a manual paste works too."),
+            React.createElement("label", { className: "ing-f wide" },
+                React.createElement("span", null,
+                    "Team splits \u2014 one row per team: ",
+                    React.createElement("code", null, "Team | wOBA vs L | PA vs L | wOBA vs R | PA vs R")),
+                React.createElement("textarea", { rows: 5, value: splitText, onChange: (e) => setSplitText(e.target.value), placeholder: "Dodgers | 0.345 | 420 | 0.330 | 1100\nYankees | 0.360 | 380 | 0.322 | 1050\nRed Sox, 0.310, 400, 0.340, 1000" })),
+            React.createElement("button", { className: "ing-run small", onClick: importSplits }, "Import team splits"),
+            React.createElement("div", { className: "ing-platoon-div" }),
+            React.createElement("label", { className: "ing-f wide" },
+                React.createElement("span", null,
+                    "Pitcher throwing hand \u2014 one row per pitcher: ",
+                    React.createElement("code", null, "Name | L"),
+                    " or ",
+                    React.createElement("code", null, "Name R")),
+                React.createElement("textarea", { rows: 4, value: handText, onChange: (e) => setHandText(e.target.value), placeholder: "Blake Snell L\nGerrit Cole R\nChris Sale (L)\nTarik Skubal | L" })),
+            React.createElement("button", { className: "ing-run small", onClick: importHands }, "Set pitcher hands"),
+            msg && React.createElement("p", { className: "ing-platoon-msg" }, msg)))));
 }
 // ===========================================================================
 // TODAY'S SLATE — the 6th agent's home. One persistent slate per day:
@@ -6118,6 +6370,19 @@ const CSS = `
 .bk-note { font-size: 12px; color: var(--ink-dim); line-height: 1.55; margin-bottom: 10px; }
 .bk-restore { display: flex; flex-direction: column; gap: 6px; font-family: 'Archivo'; font-size: 9.5px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-dim); }
 .ing-db-import { padding: 0 28px; margin-top: 18px; }
+.ing-platoon { background: var(--field2); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+.ing-platoon-head { width: 100%; display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 14px 16px; background: transparent; border: none; color: var(--ink); cursor: pointer; font-family: 'Space Grotesk', sans-serif; font-size: 14px; font-weight: 600; text-align: left; }
+.ing-platoon-head em { font-style: normal; font-size: 10px; color: var(--phos); font-family: 'Archivo'; letter-spacing: 0.06em; margin-left: 6px; }
+.ing-platoon-cov { font-size: 11px; color: var(--ink-dim); font-family: 'Archivo'; letter-spacing: 0.04em; white-space: nowrap; }
+.ing-platoon-body { padding: 4px 16px 18px; border-top: 1px solid var(--line); }
+.ing-platoon-body .ing-hint { margin-top: 12px; }
+.ing-platoon-body .ing-f { margin-top: 12px; }
+.ing-platoon-body code { font-family: 'Space Grotesk', monospace; font-size: 11px; color: var(--cyan); background: rgba(95,217,232,0.08); padding: 1px 5px; border-radius: 4px; }
+.ing-platoon-body textarea { background: var(--field); border: 1px solid var(--line); color: var(--ink); padding: 10px 12px; border-radius: 8px; font-family: 'Space Grotesk', sans-serif; font-size: 13px; width: 100%; resize: vertical; }
+.ing-platoon-body textarea:focus { outline: none; border-color: var(--phos); box-shadow: 0 0 0 3px rgba(52,230,168,0.12); }
+.ing-platoon-body .ing-run.small { margin-top: 10px; }
+.ing-platoon-div { height: 1px; background: var(--line); margin: 18px 0 4px; }
+.ing-platoon-msg { margin-top: 12px; font-size: 12.5px; color: var(--phos); line-height: 1.5; background: rgba(52,230,168,0.06); border-left: 2px solid var(--phos); padding: 9px 12px; border-radius: 6px; }
 .grade { background: var(--field2); border: 1px solid var(--line); border-radius: 12px; padding: 14px; margin-bottom: 14px; }
 .grade-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
 .grade-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 9px; margin-bottom: 9px; }
