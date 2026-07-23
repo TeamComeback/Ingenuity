@@ -229,6 +229,7 @@ function penFatigueScore(usage) {
     const weighted = d1 * 1.0 + d2 * 0.65 + d3 * 0.35; // yesterday matters most
     let s = (weighted - CFG.PEN_FATIGUE_BASE) / (CFG.PEN_FATIGUE_BASE * 0.8);
     s += (parseFloat(usage.backToBack) || 0) * CFG.PEN_B2B_WEIGHT;
+    // note: usage.arms may be a list (per-arm detail) or a count — neither feeds the score
     return Math.max(-1, Math.min(1, s));
 }
 // Apply that score to the bullpen's effective wOBA allowed. Tired pen = worse
@@ -428,13 +429,22 @@ async function fetchBullpenFatigue() {
                         // index 0 is the starter — skip him, this is a BULLPEN measure
                         for (let k = 1; k < ids.length; k++) {
                             const pl = sd.players?.["ID" + ids[k]];
-                            const pitches = parseFloat(pl?.stats?.pitching?.pitchesThrown ?? pl?.stats?.pitching?.numberOfPitches);
+                            const pi = pl?.stats?.pitching || {};
+                            const pitches = parseFloat(pi.pitchesThrown ?? pi.numberOfPitches);
                             if (!isNaN(pitches))
                                 rec["d" + (di + 1)] += pitches;
                             const nm = pl?.person?.fullName;
-                            if (nm) {
-                                (rec.armDays[nm] = rec.armDays[nm] || new Set()).add(di);
-                            }
+                            if (!nm)
+                                continue;
+                            const arm = (rec.armDays[nm] = rec.armDays[nm] || { days: new Set(), pitches: {}, outs: 0, er: 0, k: 0, bb: 0, h: 0 });
+                            arm.days.add(di);
+                            arm.pitches[di] = (arm.pitches[di] || 0) + (isNaN(pitches) ? 0 : pitches);
+                            // recent line for context — what he actually did in these outings
+                            arm.outs += parseFloat(pi.outs) || 0;
+                            arm.er += parseFloat(pi.earnedRuns) || 0;
+                            arm.k += parseFloat(pi.strikeOuts) || 0;
+                            arm.bb += parseFloat(pi.baseOnBalls) || 0;
+                            arm.h += parseFloat(pi.hits) || 0;
                         }
                     }
                 }
@@ -450,15 +460,29 @@ async function fetchBullpenFatigue() {
     const out = {};
     for (const [team, rec] of Object.entries(perTeam)) {
         let b2b = 0;
-        for (const set of Object.values(rec.armDays)) {
-            const d = [...set].sort();
+        const arms = [];
+        for (const [name, a] of Object.entries(rec.armDays)) {
+            const d = [...a.days].sort((x, y) => x - y);
+            let isB2B = false;
             for (let i = 1; i < d.length; i++)
                 if (d[i] - d[i - 1] === 1) {
-                    b2b++;
+                    isB2B = true;
                     break;
                 }
+            if (isB2B)
+                b2b++;
+            const p1 = a.pitches[0] || 0, p2 = a.pitches[1] || 0, p3 = a.pitches[2] || 0;
+            arms.push({
+                name, p1, p2, p3, b2b: isB2B,
+                appearances: d.length,
+                ip: (a.outs / 3),
+                er: a.er, k: a.k, bb: a.bb, h: a.h,
+                // heaviest-recent-day drives the availability read; yesterday matters most
+                load: p1 * 1.0 + p2 * 0.65 + p3 * 0.35,
+            });
         }
-        out[team] = { d1: rec.d1, d2: rec.d2, d3: rec.d3, backToBack: b2b, arms: Object.keys(rec.armDays).length };
+        arms.sort((x, y) => y.load - x.load);
+        out[team] = { d1: rec.d1, d2: rec.d2, d3: rec.d3, backToBack: b2b, arms };
     }
     await store.set("ingenuity:mlb:penFatigue", { asOf: etDayKey(), teams: out });
     return { ok: true, teams: Object.keys(out).length, games, boxes };
@@ -486,6 +510,7 @@ function applyPenFatigueToTeams(fatigue, teams) {
         t.penFatigue = score.toFixed(3);
         t.penFatigueAsOf = today;
         t.penFatigueDetail = `${Math.round(rec.d1)}/${Math.round(rec.d2)}/${Math.round(rec.d3)} pitches (last 3d), ${rec.backToBack} arm${rec.backToBack === 1 ? "" : "s"} back-to-back`;
+        t.penArms = Array.isArray(rec.arms) ? rec.arms : [];
         applied++;
     }
     return { next, applied, missing };
@@ -729,8 +754,8 @@ function parlayDecimal(legs) {
 const store = {
     async get(k, def) {
         try {
-            const r = localStorage.getItem(k);
-            return r != null ? JSON.parse(r) : def;
+            const r = await window.storage.get(k);
+            return r ? JSON.parse(r.value) : def;
         }
         catch {
             return def;
@@ -738,7 +763,7 @@ const store = {
     },
     async set(k, v) {
         try {
-            localStorage.setItem(k, JSON.stringify(v));
+            await window.storage.set(k, JSON.stringify(v));
         }
         catch (e) {
             console.error(e);
@@ -1424,6 +1449,9 @@ function consensusFromOddsApi(events) {
 // ===========================================================================
 function App() {
     const [view, setView] = useState("home"); // home | terminal | ledger | brain
+    // A game handed off from the board to the Terminal. The Terminal loads it once
+    // and clears it, so re-visiting the tab later doesn't silently reload an old game.
+    const [pendingGame, setPendingGame] = useState(null);
     const [teamsCount, setTeamsCount] = useState(0);
     const [netPreview, setNetPreview] = useState(null);
     const [brainTweaks, setBrainTweaks] = useState(0);
@@ -1477,11 +1505,11 @@ function App() {
                         brainTweaks === 1 ? "" : "s",
                         " tuned"))),
             React.createElement(BetOfTheDay, null),
-            React.createElement(SlateHub, null),
+            React.createElement(SlateHub, { onOpenInTerminal: (g) => { setPendingGame(g); setView("terminal"); } }),
             React.createElement(Backup, null),
             React.createElement(Journal, null),
             React.createElement("p", { className: "home-foot" }, "Research instrument. Projections and records are only as good as the data entered. Not betting advice."))),
-        view === "terminal" && React.createElement(Terminal, { onHome: () => setView("home") }),
+        view === "terminal" && React.createElement(Terminal, { onHome: () => setView("home"), pendingGame: pendingGame, onPendingConsumed: () => setPendingGame(null) }),
         view === "ledger" && React.createElement(Ledger, { onHome: () => setView("home") }),
         view === "brain" && React.createElement(Brain, { onHome: () => setView("home") })));
 }
@@ -1540,6 +1568,9 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
             const log = await store.get("ingenuity:results:log", {});
             if (Object.keys(log).length)
                 setStreaks({ away: teamOUStreak(log, g.away), home: teamOUStreak(log, g.home) });
+            // Final score for THIS game, when it's been graded. Prefer the number on the
+            // board game itself; fall back to the permanent results log keyed by the
+            // same date + matchup. So reviewing an archived board always shows the score.
             let fin = g.final != null ? g.final : null;
             let rec = null;
             if (dateKey) {
@@ -1759,6 +1790,7 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
                 React.createElement(CompareBar, { label: "Defense OAA", a: A.oaa, h: H.oaa, higherIsBetter: true, fmt: (x) => (x > 0 ? "+" : "") + x.toFixed(0) }),
                 React.createElement(CompareBar, { label: "Framing runs", a: A.framing, h: H.framing, higherIsBetter: true, fmt: (x) => (x > 0 ? "+" : "") + x.toFixed(0) }),
                 (() => {
+                    // platoon: away bats face home starter's hand; home bats face away starter's hand
                     const hHand = (hArm?.hand === "L" || hArm?.hand === "R") ? hArm.hand : null;
                     const aHand = (aArm?.hand === "L" || aArm?.hand === "R") ? aArm.hand : null;
                     const aSplit = hHand === "L" ? A.offVsL : hHand === "R" ? A.offVsR : null;
@@ -1770,6 +1802,7 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
                         React.createElement(CompareBar, { label: `wOBA vs ${aHand || "?"}HP (home)`, a: null, h: hSplit, higherIsBetter: true, fmt: (x) => x.toFixed(3) })));
                 })(),
                 React.createElement("p", { className: "gd-cmp-note" }, "Pitching rows: lower is better. Platoon rows show each lineup's wOBA against the opposing starter's hand (the matchup the model nudges toward). Blank means that stat hasn't been imported for this team yet \u2014 the model falls back to league average there, so a blank is a soft spot in the read, not a zero."))),
+            React.createElement(BullpenBoard, { A: A, H: H }),
             React.createElement("p", { className: "gd-foot" }, "Same engine, same guards as the Terminal \u2014 this is the deep dive, just anchored to the game. Research, not advice; the pass is always available."))));
 }
 // ===========================================================================
@@ -1778,6 +1811,10 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
 // what's actually deployed. Newest first.
 // ===========================================================================
 const CHANGELOG = [
+    { date: "2026-07-23b", items: [
+            "Bullpen board — you can now see the pen, not just its score. Both bullpens appear in the game breakdown and on the projection screen: unit quality (xwOBA, barrel%, hard-hit%) alongside every arm that has pitched in the last three days, with pitches thrown on each day, a back-to-back flag, that arm's recent line (IP, K/BB, ERA over those outings), and a plain-language availability read. Arms are ordered by heaviest recent workload, so whoever is most likely unavailable sits at the top. The availability read comes from workload alone — it can't see roster moves or a manager's plan — so it's labelled a lean, not a fact, and only the team-level fatigue score actually feeds the projection.",
+            "The board's game button now opens the Projection Terminal with that matchup loaded, instead of a separate breakdown page — one destination for the deep dive. A banner confirms what loaded and which starters resolved; if a team isn't in your database it says which one rather than quietly loading a half-filled matchup. The full breakdown page is still there on the ⤢ icon on each slate card, since it carries things the Terminal doesn't (O/U streaks, line movement, final score).",
+        ] },
     { date: "2026-07-23", items: [
             "Engine v1.7 — bullpen fatigue. A pen's quality was priced; its recent workload wasn't. One button ('Bullpen workload') reads the last 3 days of MLB box scores, tallies reliever pitch counts per team (starters excluded — their workload is already in the listed-starter market), flags arms working back-to-back, and scores each pen from rested to gassed. A tired pen prices slightly worse late. The effect is capped small and deliberately conservative: fully-rested to fully-gassed moves a total about 0.2 runs, and rest helps less than fatigue hurts. Free API, no odds credit, and the score is day-stamped so a stale reading is ignored rather than quietly applied.",
             "Run distribution rebuilt as a proper instrument. The old chart drew the book's number as an outlined BAR, which read as just another bar — the single biggest source of confusion. It's now a smooth density curve with: the book line as a dashed pin and flag across the curve; the peak marked with a dot and a 'MOST LIKELY' flag so the most common total is unmistakable; the two halves split at the true half-run (8.5, not a rounded bin) and shaded separately with each side's own percentage printed inside it; and the 80% band drawn behind. The axis now frames the range that matters instead of stretching to a 30-run blowout sim — and says what share of sims is in view when it clips.",
@@ -1917,8 +1954,9 @@ function Backup() {
 // ===========================================================================
 // TERMINAL
 // ===========================================================================
-function Terminal({ onHome }) {
+function Terminal({ onHome, pendingGame, onPendingConsumed }) {
     const [tab, setTab] = useState("project");
+    const [handoff, setHandoff] = useState("");
     const [teams, setTeams] = useState([]);
     const [loaded, setLoaded] = useState(false);
     const [result, setResult] = useState(null);
@@ -2136,6 +2174,23 @@ function Terminal({ onHome }) {
             setUnderPrice(String(g.under));
         return { ok: true, away: A.name, home: H.name, aStarter: aTeam.starter, hStarter: hTeam.starter };
     };
+    // Load a game handed over from the board. Runs once per handoff; if the teams
+    // aren't in the database we say which one is missing rather than loading a
+    // half-filled matchup that would project a different game.
+    useEffect(() => {
+        if (!pendingGame || !teams.length)
+            return;
+        const res = loadGameLine(pendingGame);
+        setTab("project");
+        if (res && res.ok) {
+            setHandoff(`Loaded ${res.away} @ ${res.home} from the board${res.aStarter && res.hStarter ? ` — ${res.aStarter} vs ${res.hStarter}` : ""}. Check the inputs, then run the projection.`);
+        }
+        else {
+            setHandoff(`Couldn't load that game — ${res && res.miss ? `"${res.miss}"` : "a team"} isn't in your database yet. Add it in Database, then try again.`);
+        }
+        if (onPendingConsumed)
+            onPendingConsumed();
+    }, [pendingGame, teams.length]);
     // Pull the selected starter's latest saved stats at run time, so a starter
     // picked before stats were uploaded still calculates with real numbers.
     const resolveSP = (t) => {
@@ -2263,6 +2318,10 @@ function Terminal({ onHome }) {
                     React.createElement("p", { className: "ing-empty-mark" }, "\u25C6"),
                     React.createElement("p", null, "Set the matchup and run a projection."),
                     React.createElement("p", { className: "ing-empty-sub" }, "Load teams from your database or enter numbers directly. Blank fields fall back to league average."))),
+                handoff && React.createElement("div", { className: "term-handoff" },
+                    handoff,
+                    React.createElement("button", { onClick: () => setHandoff(""), "aria-label": "Dismiss" }, "\u00D7")),
+                result && React.createElement(BullpenBoard, { A: matchTeamDb(away.name, teams) || away, H: matchTeamDb(home.name, teams) || home, compact: true }),
                 result && React.createElement(Readout, { r: result, onLog: logToLedger, logMsg: logMsg })))),
         tab === "database" && (React.createElement(React.Fragment, null,
             React.createElement("div", { className: "ing-db-import" },
@@ -2798,6 +2857,98 @@ function Field({ label, v, on }) {
 // The old version drew the book line as an outlined *bar*, which read as "a bar"
 // and was the main source of confusion. A continuous curve also lets the split
 // land on the true half-run (8.5), not a rounded bin.
+// v1.7 — the bullpen board. Shows both pens side by side: the unit's quality
+// (what the model prices) and each arm's recent workload (what decides who's
+// actually available tonight). Arms are ordered by how heavily they've been
+// used, so the ones most likely to be down are at the top.
+function BullpenBoard({ A, H, compact }) {
+    const [open, setOpen] = useState(!compact);
+    const sides = [{ t: A, label: "Away" }, { t: H, label: "Home" }].filter((s) => s.t);
+    if (!sides.length)
+        return null;
+    const anyData = sides.some((s) => (s.t.penArms || []).length);
+    const fresh = (t) => t && t.penFatigueAsOf === etDayKey();
+    const readState = (arm) => {
+        // A pure availability read from workload alone — no roster news, so it's a
+        // probability, not a fact. Named plainly so it can't be mistaken for one.
+        if (arm.b2b && arm.p1 >= 15)
+            return { k: "down", txt: "likely down" };
+        if (arm.p1 >= 30)
+            return { k: "down", txt: "likely down" };
+        if (arm.b2b || arm.p1 >= 15)
+            return { k: "watch", txt: "limited" };
+        if (arm.p1 === 0 && arm.p2 === 0)
+            return { k: "ready", txt: "rested" };
+        return { k: "ok", txt: "available" };
+    };
+    const fatigueWord = (score) => {
+        const s = parseFloat(score);
+        if (isNaN(s))
+            return null;
+        if (s >= 0.55)
+            return { k: "down", txt: "heavily used" };
+        if (s >= 0.2)
+            return { k: "watch", txt: "worked" };
+        if (s <= -0.5)
+            return { k: "ready", txt: "rested" };
+        return { k: "ok", txt: "normal" };
+    };
+    return (React.createElement("div", { className: "pen" },
+        React.createElement("button", { className: "pen-head", onClick: () => setOpen(!open), "aria-expanded": open },
+            React.createElement("span", null, "Bullpens"),
+            React.createElement("span", { className: "pen-head-r" },
+                anyData ? "last 3 days of box scores" : "no workload data yet",
+                " ",
+                open ? "▲" : "▼")),
+        open && (React.createElement("div", { className: "pen-body" },
+            sides.map((s, i) => {
+                const t = s.t;
+                const arms = fresh(t) ? (t.penArms || []) : [];
+                const fw = fresh(t) ? fatigueWord(t.penFatigue) : null;
+                return (React.createElement("div", { className: "pen-side", key: i },
+                    React.createElement("div", { className: "pen-side-head" },
+                        React.createElement("span", { className: "pen-team" }, t.name || s.label),
+                        fw && React.createElement("span", { className: "pen-chip " + fw.k }, fw.txt)),
+                    React.createElement("div", { className: "pen-qual" },
+                        React.createElement("span", null,
+                            React.createElement("em", null, "Pen xwOBA"),
+                            t.pen || "—"),
+                        React.createElement("span", null,
+                            React.createElement("em", null, "Barrel%"),
+                            t.penBarrel || "—"),
+                        React.createElement("span", null,
+                            React.createElement("em", null, "Hard-hit%"),
+                            t.penHardHit || "—")),
+                    !fresh(t) && (React.createElement("p", { className: "pen-empty" },
+                        "No workload read for today. Tap ",
+                        React.createElement("strong", null, "Bullpen workload"),
+                        " on the slate to pull the last 3 days from MLB box scores.")),
+                    fresh(t) && !arms.length && (React.createElement("p", { className: "pen-empty" }, "No relief appearances in the last 3 days \u2014 this pen is fully rested, or the team was off.")),
+                    !!arms.length && (React.createElement(React.Fragment, null,
+                        React.createElement("div", { className: "pen-legend" },
+                            React.createElement("span", null, "Arm"),
+                            React.createElement("span", { className: "pen-days" }, "3d \u00B7 2d \u00B7 1d"),
+                            React.createElement("span", null, "Recent line")),
+                        React.createElement("ul", { className: "pen-list" }, arms.map((arm, k) => {
+                            const st = readState(arm);
+                            const era = arm.ip > 0 ? (arm.er * 9 / arm.ip) : null;
+                            return (React.createElement("li", { key: k, className: "pen-arm " + st.k },
+                                React.createElement("span", { className: "pen-arm-name" },
+                                    arm.name,
+                                    arm.b2b && React.createElement("em", { title: "pitched on consecutive days" }, " b2b")),
+                                React.createElement("span", { className: "pen-arm-days" },
+                                    React.createElement("i", { className: arm.p3 ? "on" : "" }, arm.p3 || "–"),
+                                    React.createElement("i", { className: arm.p2 ? "on" : "" }, arm.p2 || "–"),
+                                    React.createElement("i", { className: arm.p1 ? "hot" : "" }, arm.p1 || "–")),
+                                React.createElement("span", { className: "pen-arm-line" }, arm.ip > 0 ? `${arm.ip.toFixed(1)} IP · ${arm.k}K/${arm.bb}BB${era != null ? ` · ${era.toFixed(1)} ERA` : ""}` : "—"),
+                                React.createElement("span", { className: "pen-arm-state " + st.k }, st.txt)));
+                        }))))));
+            }),
+            React.createElement("p", { className: "pen-note" },
+                "Numbers under ",
+                React.createElement("strong", null, "3d \u00B7 2d \u00B7 1d"),
+                " are pitches thrown on each of the last three days, yesterday on the right. The availability read comes from workload alone \u2014 it can't see roster moves, injuries, or a manager's plan, so treat it as a lean, not a fact. Only the team-level fatigue score feeds the projection; the per-arm view is here so you can see what's driving it.")))));
+}
 function RunCurve({ r }) {
     const uid = useMemo(() => "rc" + Math.random().toString(36).slice(2, 8), []);
     const bins = r.hist || {};
@@ -4609,7 +4760,7 @@ function BoardChart({ games, rows, onPick, onOpen }) {
             React.createElement("span", { className: "bc-detail-note" }, Math.abs(selected.edge ?? 0) >= 4
                 ? "Flagged by the scanner — the full 20k-sim deep dive is the only thing that can confirm it."
                 : "No meaningful gap. The board and the model agree here."),
-            onOpen && (React.createElement("button", { className: "bc-open", onClick: () => onOpen(selected.g) }, "Open full breakdown \u2192"))))));
+            onOpen && (React.createElement("button", { className: "bc-open", onClick: () => onOpen(selected.g) }, "Open in Projection Terminal \u2192"))))));
 }
 const SLATE_ARCHIVE_DAYS = 90; // keep a season's worth of full boards; a day is ~3KB
 // Full boards (odds + weather + pitchers) roll off at 90 days, but a graded
@@ -4661,7 +4812,7 @@ function teamOUStreak(log, teamName) {
     const last = games.slice(0, 6).map((g) => ({ date: g.date, ou: g.ou, final: g.final, line: g.line, vs: normName(g.away).includes(n) ? g.home : g.away }));
     return { n: games.length, streak, side: top, last };
 }
-function SlateHub() {
+function SlateHub({ onOpenInTerminal }) {
     const todayKey = etDayKey();
     const [slate, setSlate] = useState(null); // { date, games: [{away, home, awayP, homeP, line, over, under, openLine.., proj?}] }
     const [viewDate, setViewDate] = useState(todayKey); // the day the whole board is focused on
@@ -5126,7 +5277,7 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
                 r = await fetch(`https://api.the-odds-api.com/v4/sports/baseball_mlb/odds?regions=us&markets=totals&oddsFormat=american&commenceTimeFrom=${fromNow}&apiKey=${encodeURIComponent(key)}`);
             }
             catch (netErr) {
-                throw new Error("Network error reaching the-odds-api.com — check your connection and try again. The paste box below always works as a fallback.");
+                throw new Error("BLOCKED: this app can't reach the-odds-api.com — the sandbox only allows certain domains. Your key is fine; the request never left. Use the live feed from a browser/script outside this app, or paste the odds here instead.");
             }
             if (r.status === 401)
                 throw new Error("key rejected (401) — check it's copied exactly, with no spaces");
@@ -5451,7 +5602,7 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
                             ? `The model is running ${Math.abs(acc.bias).toFixed(2)} runs HIGH across ${acc.n} games. Worth a calibration look.`
                             : `Mean error is ${acc.bias.toFixed(2)} runs across ${acc.n} games — no systematic bias worth chasing. The typical miss is still ${acc.mae.toFixed(2)} runs, which is the honest width of this model's uncertainty.`))) : (React.createElement("p", { className: "grade-note" }, "Nothing graded yet. Each scan freezes its projection onto that day's board; once the games finish, this settles up against the real final scores and tracks how wrong the model actually was. It needs boards on file first \u2014 from Thursday, that starts accumulating on its own.")),
             gradeMsg && React.createElement("p", { className: "ing-hint" }, gradeMsg)),
-        games.length > 0 && (rows || games.some((g) => g.proj)) && (React.createElement(BoardChart, { games: games, rows: rows, onOpen: (g) => setDetailGame(g) })),
+        games.length > 0 && (rows || games.some((g) => g.proj)) && (React.createElement(BoardChart, { games: games, rows: rows, onOpen: (g) => (onOpenInTerminal ? onOpenInTerminal(g) : setDetailGame(g)) })),
         detailGame && (React.createElement(GameDetail, { g: detailGame, teams: teams, dateKey: viewDate, isToday: isToday, onClose: () => setDetailGame(null) })),
         games.length > 0 && (React.createElement("div", { className: "slate-chips" },
             React.createElement("span", { className: "slate-chip" },
@@ -6591,6 +6742,51 @@ const CSS = `
 .ing-curve-legend .lg-line { box-shadow: inset 0 0 0 1.5px var(--amber); }
 .ing-curve-legend .lg-mode { background: var(--phos); box-shadow: 0 0 8px var(--phos-dim); }
 .ing-curve-legend .lg-tail { background: var(--ink-dim); opacity: 0.4; }
+.term-handoff { display: flex; align-items: flex-start; gap: 10px; background: rgba(52,230,168,0.07); border: 1px solid rgba(52,230,168,0.3); border-left: 3px solid var(--phos); border-radius: 9px; padding: 11px 13px; font-size: 12.5px; line-height: 1.5; color: var(--ink); margin-bottom: 14px; }
+.term-handoff button { margin-left: auto; background: transparent; border: none; color: var(--ink-dim); font-size: 17px; line-height: 1; cursor: pointer; padding: 0 2px; }
+.term-handoff button:hover { color: var(--ink); }
+
+/* ---- bullpen board (v1.7) ---- */
+.pen { border: 1px solid var(--line); border-radius: 12px; background: var(--field2); overflow: hidden; margin-bottom: 16px; }
+.pen-head { width: 100%; display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 12px 15px; background: transparent; border: none; color: var(--ink); cursor: pointer; font-family: 'Archivo'; font-size: 11px; letter-spacing: 0.13em; text-transform: uppercase; text-align: left; }
+.pen-head-r { color: var(--ink-dim); font-size: 10px; letter-spacing: 0.06em; text-transform: none; }
+.pen-body { padding: 2px 15px 16px; border-top: 1px solid var(--line); }
+.pen-side { padding-top: 14px; }
+.pen-side + .pen-side { margin-top: 14px; border-top: 1px dashed var(--line); }
+.pen-side-head { display: flex; align-items: center; gap: 9px; margin-bottom: 9px; }
+.pen-team { font-weight: 600; font-size: 14px; }
+.pen-chip { font-family: 'Archivo'; font-size: 9px; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase; padding: 3px 8px; border-radius: 999px; }
+.pen-chip.down { background: rgba(232,115,79,0.16); color: var(--rust); }
+.pen-chip.watch { background: rgba(245,196,81,0.16); color: var(--amber); }
+.pen-chip.ok { background: rgba(122,153,140,0.16); color: var(--ink-dim); }
+.pen-chip.ready { background: rgba(52,230,168,0.16); color: var(--phos); }
+.pen-qual { display: flex; flex-wrap: wrap; gap: 8px 18px; margin-bottom: 10px; }
+.pen-qual span { font-size: 12.5px; display: flex; align-items: baseline; gap: 6px; }
+.pen-qual em { font-style: normal; font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-dim); font-family: 'Archivo'; }
+.pen-empty { font-size: 11.5px; color: var(--ink-dim); line-height: 1.55; }
+.pen-legend { display: grid; grid-template-columns: 1fr 88px 1fr auto; gap: 8px; font-family: 'Archivo'; font-size: 8.5px; letter-spacing: 0.11em; text-transform: uppercase; color: var(--ink-dim); padding: 0 0 5px; border-bottom: 1px solid var(--line); }
+.pen-legend .pen-days { text-align: center; }
+.pen-list { list-style: none; margin: 0; padding: 0; }
+.pen-arm { display: grid; grid-template-columns: 1fr 88px 1fr auto; gap: 8px; align-items: center; padding: 7px 0; border-bottom: 1px solid rgba(28,51,41,0.5); font-size: 12.5px; }
+.pen-arm:last-child { border-bottom: none; }
+.pen-arm-name { font-weight: 500; }
+.pen-arm-name em { font-style: normal; font-size: 9px; color: var(--rust); font-family: 'Archivo'; letter-spacing: 0.06em; }
+.pen-arm-days { display: flex; justify-content: center; gap: 4px; }
+.pen-arm-days i { font-style: normal; font-family: 'Archivo'; font-size: 10.5px; min-width: 24px; text-align: center; padding: 2px 0; border-radius: 4px; background: rgba(255,255,255,0.03); color: var(--ink-dim); }
+.pen-arm-days i.on { color: var(--ink); background: rgba(255,255,255,0.06); }
+.pen-arm-days i.hot { color: var(--field); background: var(--amber); font-weight: 700; }
+.pen-arm-line { font-size: 11.5px; color: var(--ink-dim); }
+.pen-arm-state { font-family: 'Archivo'; font-size: 9px; letter-spacing: 0.06em; text-transform: uppercase; white-space: nowrap; }
+.pen-arm-state.down { color: var(--rust); }
+.pen-arm-state.watch { color: var(--amber); }
+.pen-arm-state.ready { color: var(--phos); }
+.pen-arm-state.ok { color: var(--ink-dim); }
+.pen-note { font-size: 10.5px; color: var(--ink-dim); line-height: 1.6; margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
+@media (max-width: 560px) {
+  .pen-legend, .pen-arm { grid-template-columns: 1fr 84px auto; }
+  .pen-legend span:nth-child(3), .pen-arm-line { display: none; }
+}
+
 /* ---- run distribution instrument (v1.7) ---- */
 .rc { margin-bottom: 20px; }
 .rc-head { display: flex; justify-content: space-between; align-items: baseline; font-family: 'Archivo'; font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--ink-dim); margin-bottom: 8px; }
@@ -6853,6 +7049,7 @@ const CSS = `
   position: sticky; top: 0; z-index: 2;
 }
 .gd-bar-title { font-family: 'Archivo'; font-weight: 600; font-size: 13px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Final-score box on the full breakdown — clear "here's what happened" for graded games */
 .gd-final { margin: 14px 0; padding: 14px 16px; border-radius: 12px; background: var(--panel-2, rgba(255,255,255,0.03)); border: 1px solid var(--line); }
 .gd-final.ov { border-color: rgba(52,230,168,0.4); box-shadow: inset 0 0 0 1px rgba(52,230,168,0.12); }
 .gd-final.un { border-color: rgba(88,190,255,0.4); box-shadow: inset 0 0 0 1px rgba(88,190,255,0.12); }
@@ -6865,6 +7062,7 @@ const CSS = `
 .gd-final-tag.ps { background: rgba(245,196,81,0.16); color: var(--amber); }
 .gd-final-meta { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 8px; font-size: 11px; color: var(--ink-dim); }
 .gd-final-meta span:not(:last-child)::after { content: "·"; margin-left: 12px; opacity: 0.5; }
+/* Compact final row on the slate board card */
 .sg-final { display: flex; align-items: center; gap: 9px; margin-top: 7px; padding-top: 7px; border-top: 1px dashed var(--line); }
 .sg-final-label { font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-dim); }
 .sg-final strong { font-family: 'Archivo'; font-size: 17px; color: var(--ink); }
