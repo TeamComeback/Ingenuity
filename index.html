@@ -341,17 +341,25 @@ async function refreshMlbRosterMap() {
         const j = await r.json();
         const people = j.people || [];
         const map = {};
+        const hands = {}; // v1.6: MLB's own pitchHand — fills platoon handedness with no manual entry
         for (const p of people) {
             const team = p.currentTeam?.name;
-            if (!p.fullName || !team)
+            if (!p.fullName)
                 continue;
-            const resolved = resolveTeamName(team) || team;
-            map[normName(p.fullName)] = resolved;
+            if (team) {
+                const resolved = resolveTeamName(team) || team;
+                map[normName(p.fullName)] = resolved;
+            }
+            const ph = p.pitchHand?.code;
+            if (ph === "L" || ph === "R")
+                hands[normName(p.fullName)] = ph;
+            else if (ph === "S")
+                hands[normName(p.fullName)] = "R"; // switch-pitcher (vanishingly rare) → treat as R
         }
         const n = Object.keys(map).length;
         if (n)
-            await store.set("ingenuity:mlb:rosterMap", { asOf: etDayKey(), map });
-        return { ok: n > 0, n };
+            await store.set("ingenuity:mlb:rosterMap", { asOf: etDayKey(), map, hands });
+        return { ok: n > 0, n, hands: Object.keys(hands).length };
     }
     catch {
         return { ok: false, n: 0 };
@@ -1613,6 +1621,7 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
 const CHANGELOG = [
     { date: "2026-07-22", items: [
             "Engine v1.6 — platoon splits. Run scoring swings hard on the handedness matchup, so the model now nudges each lineup toward its wOBA vs the opposing starter's hand (LHP/RHP). The split is regressed toward the team's overall wOBA by sample size (a 40-PA split barely moves it; a full-season split gets real weight) and the net shift is hard-capped at ±0.030 wOBA, so a noisy split can't swing a total. Only fires when the starter's throwing hand is known.",
+            "Pitcher handedness now fills itself. MLB's own player feed publishes each player's throwing hand, and the app already syncs that feed for team routing — so one button ('Auto-fill hands from MLB') stamps L/R onto every pitcher already in your database. No typing ~150 names. Manual paste stays for anyone the name-match misses, and the panel says exactly who's still unhanded.",
             "New import spot for it (Database tab → 'Platoon splits'): paste team wOBA vs LHP / vs RHP one row per team (Team | wOBA vs L | PA vs L | wOBA vs R | PA vs R — tab, comma, pipe, or space separated), plus a pitcher-hand box (Name | L). FanGraphs Splits Leaderboards export these; a manual paste works too. A coverage line shows how many teams have splits and how many rostered arms are handed. The breakdown's side-by-side now shows each lineup's wOBA vs the opposing hand.",
         ] },
     { date: "2026-07-16", items: [
@@ -3323,12 +3332,13 @@ function parseTeamSplits(text) {
     const lines = String(text || "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
     const out = [];
     for (const line of lines) {
-        let cells = line.split(/\t|\s*\|\s*|\s*,\s*/).map((c) => c.trim()).filter((c) => c !== "");
-        // Fallback for pure space-delimited rows (no tab/pipe/comma): split on
-        // whitespace, but keep a leading multi-word team name intact by regrouping
-        // all leading non-numeric tokens back together below.
-        if (cells.length < 3)
-            cells = line.split(/\s+/).map((c) => c.trim()).filter(Boolean);
+        // Accept tab, pipe, comma, forward-slash, or plain whitespace as
+        // separators — so "Team .337/1011/.394/2804" (slash-packed), "Team,
+        // .337, 1011" (commas), and "Team .337 1011" (spaces) all parse the same
+        // way. A team name that's more than one word (e.g. "Red Sox") still comes
+        // back together below, since every leading NON-numeric token is regrouped
+        // into the team name regardless of how many separate cells it split into.
+        let cells = line.split(/\t|\s*\|\s*|\s*,\s*|\s*\/\s*|\s+/).map((c) => c.trim()).filter((c) => c !== "");
         if (cells.length < 3)
             continue;
         // skip an obvious header
@@ -3418,6 +3428,32 @@ function parsePitcherHands(text) {
     return out;
 }
 // Apply pitcher hands onto rotation entries across all teams. Matches by name.
+// v1.6 — fill every rostered pitcher's throwing hand from MLB's own pitchHand
+// data (free, keyless, authoritative). This is the no-typing path: sync rosters
+// once and every arm in the database gets handed, which is what activates the
+// platoon adjustment. Manual paste stays available for anyone the map misses.
+function applyHandsFromMap(handsMap, teams) {
+    if (!handsMap || !Object.keys(handsMap).length)
+        return { next: teams, applied: 0, missing: [] };
+    let applied = 0;
+    const missing = [];
+    const next = teams.map((t) => ({ ...t, rotation: (t.rotation || []).map((p) => ({ ...p })) }));
+    for (const t of next) {
+        for (const p of (t.rotation || [])) {
+            const h = handsMap[normName(p.name)];
+            if (h === "L" || h === "R") {
+                if (p.hand !== h) {
+                    p.hand = h;
+                    applied++;
+                }
+            }
+            else if (p.hand !== "L" && p.hand !== "R") {
+                missing.push(p.name);
+            }
+        }
+    }
+    return { next, applied, missing };
+}
 function applyPitcherHands(hands, teams) {
     let applied = 0;
     const unmatched = [];
@@ -4038,10 +4074,36 @@ function PlatoonImport({ teams, saveTeams }) {
     const [splitText, setSplitText] = useState("");
     const [handText, setHandText] = useState("");
     const [msg, setMsg] = useState("");
+    const [busy, setBusy] = useState(false);
+    // Pull MLB's own pitchHand for every player and stamp it onto the rotations
+    // already in the database. Uses the cached roster map when it's fresh, and
+    // re-syncs when it isn't — so this works as a single button press.
+    const autoHands = async () => {
+        setBusy(true);
+        setMsg("");
+        let cached = await store.get("ingenuity:mlb:rosterMap", null);
+        if (!cached || !cached.hands || !Object.keys(cached.hands).length) {
+            const res = await refreshMlbRosterMap();
+            if (!res.ok) {
+                setBusy(false);
+                setMsg("Couldn't reach MLB's player list from here. In the hosted app this works; inside the Claude artifact the sandbox blocks it. You can still paste hands manually below.");
+                return;
+            }
+            cached = await store.get("ingenuity:mlb:rosterMap", null);
+        }
+        const { next, applied, missing } = applyHandsFromMap(cached?.hands, teams);
+        await saveTeams(next);
+        setBusy(false);
+        const uniqMissing = [...new Set(missing)];
+        setMsg(`Throwing hand filled for ${applied} pitcher${applied === 1 ? "" : "s"} from MLB's own data.${uniqMissing.length ? ` ${uniqMissing.length} still unhanded (${uniqMissing.slice(0, 5).join(", ")}${uniqMissing.length > 5 ? "…" : ""}) — usually a name-spelling difference; paste those manually below.` : " Every rostered arm now has a hand — the platoon adjustment is live."}`);
+    };
     const importSplits = async () => {
         const parsed = parseTeamSplits(splitText);
         if (!parsed.length) {
-            setMsg("No team-split rows recognized. Use one row per team: Team | wOBA vs L | PA vs L | wOBA vs R | PA vs R");
+            const lineCount = splitText.split(/\r?\n/).map((l) => l.trim()).filter(Boolean).length;
+            setMsg(lineCount
+                ? `${lineCount} line${lineCount === 1 ? "" : "s"} pasted but none parsed as a team split. Each row needs a team name followed by 4 numbers (2 wOBA values under 1.000, 2 PA counts) — any mix of spaces, commas, pipes, or slashes works as a separator. Example: Dodgers .345/420/.330/1100`
+                : "Paste one row per team: Team | wOBA vs L | PA vs L | wOBA vs R | PA vs R");
             return;
         }
         const { next, applied, unmatched } = applyTeamSplits(parsed, teams);
@@ -4091,9 +4153,13 @@ function PlatoonImport({ teams, saveTeams }) {
                 React.createElement("textarea", { rows: 5, value: splitText, onChange: (e) => setSplitText(e.target.value), placeholder: "Dodgers | 0.345 | 420 | 0.330 | 1100\nYankees | 0.360 | 380 | 0.322 | 1050\nRed Sox, 0.310, 400, 0.340, 1000" })),
             React.createElement("button", { className: "ing-run small", onClick: importSplits }, "Import team splits"),
             React.createElement("div", { className: "ing-platoon-div" }),
+            React.createElement("div", { className: "ing-platoon-auto" },
+                React.createElement("strong", null, "Fastest path \u2014 no typing:"),
+                " MLB publishes every player's throwing hand. Sync once and every pitcher already in your database gets handed automatically. That's what switches the platoon adjustment on.",
+                React.createElement("button", { className: "ing-run small", onClick: autoHands, disabled: busy }, busy ? "Syncing MLB…" : "⟳ Auto-fill hands from MLB")),
             React.createElement("label", { className: "ing-f wide" },
                 React.createElement("span", null,
-                    "Pitcher throwing hand \u2014 one row per pitcher: ",
+                    "Or paste manually \u2014 one row per pitcher: ",
                     React.createElement("code", null, "Name | L"),
                     " or ",
                     React.createElement("code", null, "Name R")),
@@ -6382,6 +6448,9 @@ const CSS = `
 .ing-platoon-body textarea:focus { outline: none; border-color: var(--phos); box-shadow: 0 0 0 3px rgba(52,230,168,0.12); }
 .ing-platoon-body .ing-run.small { margin-top: 10px; }
 .ing-platoon-div { height: 1px; background: var(--line); margin: 18px 0 4px; }
+.ing-platoon-auto { margin-top: 14px; padding: 13px 15px; border-radius: 10px; background: rgba(52,230,168,0.06); border: 1px solid rgba(52,230,168,0.28); border-left: 3px solid var(--phos); font-size: 12.5px; color: var(--ink); line-height: 1.55; }
+.ing-platoon-auto strong { color: var(--phos); }
+.ing-platoon-auto .ing-run.small { display: block; margin-top: 11px; }
 .ing-platoon-msg { margin-top: 12px; font-size: 12.5px; color: var(--phos); line-height: 1.5; background: rgba(52,230,168,0.06); border-left: 2px solid var(--phos); padding: 9px 12px; border-radius: 6px; }
 .grade { background: var(--field2); border: 1px solid var(--line); border-radius: 12px; padding: 14px; margin-bottom: 14px; }
 .grade-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
