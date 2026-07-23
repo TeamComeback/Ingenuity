@@ -86,6 +86,16 @@ const DEFAULT_CFG = {
     BARREL_TO_WOBA_SCALE: 0.010, // wOBA pts per 1-pt barrel% deviation
     HARDHIT_TO_WOBA_SCALE: 0.004, // wOBA pts per 1-pt hard-hit% deviation
     PEN_CONTACT_WEIGHT: 0.4, // bullpen: barrel/hard-hit-derived quality vs raw xwOBA
+    // v1.7 — bullpen fatigue. A pen's QUALITY is only half the story; its recent
+    // WORKLOAD decides who's actually available tonight. Books anchor hard on the
+    // listed starters, so recent-usage state is one of the few inputs the market
+    // is genuinely slow on. Weighted pitch count over the last 3 days (yesterday
+    // weighted heaviest) plus a penalty for arms working back-to-back. Effect is
+    // deliberately small and capped — this is a nudge, not a thesis.
+    PEN_FATIGUE_BASE: 120, // weighted 3-day reliever pitch count treated as "normal"
+    PEN_FATIGUE_MAX_PENALTY: 0.012, // wOBA added to a maximally gassed pen
+    PEN_FATIGUE_MAX_BONUS: 0.005, // wOBA removed from a fully rested pen (smaller: rest helps less than fatigue hurts)
+    PEN_B2B_WEIGHT: 0.10, // each arm pitching back-to-back days adds this to the fatigue score
     DEFENSE_OAA_SCALE: 0.0025, // fractional runs shift per team OAA
     FRAMING_FACTOR_SCALE: 0.0015, // fractional runs shift per catcher framing run
     // v1.6 — platoon splits. A lineup's run output depends heavily on the
@@ -207,6 +217,36 @@ function contactQualityToWoba(barrel, hardHit) {
     if (!isNaN(h))
         woba += CFG.HARDHIT_TO_WOBA_SCALE * (h - CFG.LEAGUE_HARDHIT);
     return woba;
+}
+// v1.7 — turn a bullpen's recent workload into a fatigue score in [-1, +1].
+// usage = { d1, d2, d3, backToBack } where d1 is yesterday's reliever pitch
+// count and backToBack is how many arms threw on consecutive days.
+// -1 = fully rested, 0 = normal workload, +1 = maximally gassed.
+function penFatigueScore(usage) {
+    if (!usage)
+        return null;
+    const d1 = parseFloat(usage.d1) || 0, d2 = parseFloat(usage.d2) || 0, d3 = parseFloat(usage.d3) || 0;
+    const weighted = d1 * 1.0 + d2 * 0.65 + d3 * 0.35; // yesterday matters most
+    let s = (weighted - CFG.PEN_FATIGUE_BASE) / (CFG.PEN_FATIGUE_BASE * 0.8);
+    s += (parseFloat(usage.backToBack) || 0) * CFG.PEN_B2B_WEIGHT;
+    return Math.max(-1, Math.min(1, s));
+}
+// Apply that score to the bullpen's effective wOBA allowed. Tired pen = worse
+// (higher wOBA against); rested pen = slightly better. Both ends are capped.
+function applyPenFatigue(penWoba, score) {
+    const s = parseFloat(score);
+    if (isNaN(s))
+        return penWoba;
+    const c = Math.max(-1, Math.min(1, s));
+    return penWoba + (c >= 0 ? c * CFG.PEN_FATIGUE_MAX_PENALTY : c * CFG.PEN_FATIGUE_MAX_BONUS);
+}
+// Only trust a fatigue reading taken TODAY — yesterday's workload picture is
+// stale the moment a new slate starts, and a stale nudge is worse than none.
+function teamPenFatigue(t) {
+    if (!t || t.penFatigueAsOf !== etDayKey())
+        return null;
+    const v = parseFloat(t.penFatigue);
+    return isNaN(v) ? null : v;
 }
 function effectivePenWoba(pen, barrel, hardHit) {
     const p = parseFloat(pen);
@@ -332,6 +372,124 @@ function degToCompass(deg) {
 // button on Savant that puts "Team" into the CSV). Cached for a week; the
 // season rarely needs it fresher than that outside trade-deadline week.
 const ROSTER_MAP_MAX_AGE_DAYS = 7;
+// v1.7 — an ET day key offset by N days (negative = in the past).
+function etDayKeyOffset(nDays) {
+    return etDayKey(new Date(Date.now() + nDays * 86400000));
+}
+// v1.7 — build each bullpen's recent workload from MLB's own box scores.
+// For the last 3 days: pull the schedule, then each final game's box score, and
+// tally RELIEVER pitch counts per team (the starter — first arm listed — is
+// excluded, since his workload is already priced by the listed-starter market).
+// Also flags arms that threw on consecutive days, which is the strongest signal
+// that a pen is short tonight. Free, keyless, same API the roster sync uses.
+async function fetchBullpenFatigue() {
+    const days = [1, 2, 3].map((n) => etDayKeyOffset(-n)); // [yesterday, -2, -3]
+    const perTeam = {}; // team -> { d1,d2,d3, armDays: { armName: Set(dayIndex) } }
+    const touch = (team) => (perTeam[team] = perTeam[team] || { d1: 0, d2: 0, d3: 0, armDays: {} });
+    let games = 0, boxes = 0;
+    try {
+        for (let di = 0; di < days.length; di++) {
+            const sr = await fetch(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${days[di]}`);
+            if (!sr.ok)
+                continue;
+            const sj = await sr.json();
+            const pks = [];
+            for (const dt of (sj.dates || []))
+                for (const gm of (dt.games || [])) {
+                    const st = gm.status?.abstractGameState;
+                    if (gm.gamePk && st === "Final")
+                        pks.push(gm.gamePk);
+                }
+            games += pks.length;
+            // fetch box scores a few at a time — polite to a free public API
+            for (let i = 0; i < pks.length; i += 5) {
+                const chunk = pks.slice(i, i + 5);
+                const results = await Promise.all(chunk.map(async (pk) => {
+                    try {
+                        const br = await fetch(`https://statsapi.mlb.com/api/v1/game/${pk}/boxscore`);
+                        return br.ok ? await br.json() : null;
+                    }
+                    catch {
+                        return null;
+                    }
+                }));
+                for (const bj of results) {
+                    if (!bj?.teams)
+                        continue;
+                    boxes++;
+                    for (const sideKey of ["away", "home"]) {
+                        const sd = bj.teams[sideKey];
+                        const raw = sd?.team?.name;
+                        if (!raw)
+                            continue;
+                        const team = resolveTeamName(raw) || raw;
+                        const rec = touch(team);
+                        const ids = sd.pitchers || [];
+                        // index 0 is the starter — skip him, this is a BULLPEN measure
+                        for (let k = 1; k < ids.length; k++) {
+                            const pl = sd.players?.["ID" + ids[k]];
+                            const pitches = parseFloat(pl?.stats?.pitching?.pitchesThrown ?? pl?.stats?.pitching?.numberOfPitches);
+                            if (!isNaN(pitches))
+                                rec["d" + (di + 1)] += pitches;
+                            const nm = pl?.person?.fullName;
+                            if (nm) {
+                                (rec.armDays[nm] = rec.armDays[nm] || new Set()).add(di);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    catch (e) {
+        return { ok: false, err: String(e && e.message ? e.message : e) };
+    }
+    if (!Object.keys(perTeam).length)
+        return { ok: false, err: "no final games found in the last 3 days" };
+    // back-to-back = an arm that threw on two consecutive days in the window
+    const out = {};
+    for (const [team, rec] of Object.entries(perTeam)) {
+        let b2b = 0;
+        for (const set of Object.values(rec.armDays)) {
+            const d = [...set].sort();
+            for (let i = 1; i < d.length; i++)
+                if (d[i] - d[i - 1] === 1) {
+                    b2b++;
+                    break;
+                }
+        }
+        out[team] = { d1: rec.d1, d2: rec.d2, d3: rec.d3, backToBack: b2b, arms: Object.keys(rec.armDays).length };
+    }
+    await store.set("ingenuity:mlb:penFatigue", { asOf: etDayKey(), teams: out });
+    return { ok: true, teams: Object.keys(out).length, games, boxes };
+}
+// Stamp the computed fatigue score onto each team record so every projection
+// path picks it up. Scores are day-stamped; a stale one is ignored by the engine.
+function applyPenFatigueToTeams(fatigue, teams) {
+    if (!fatigue?.teams)
+        return { next: teams, applied: 0, missing: [] };
+    const today = etDayKey();
+    let applied = 0;
+    const missing = [];
+    const next = teams.map((t) => ({ ...t }));
+    for (const t of next) {
+        const rec = fatigue.teams[t.name] || fatigue.teams[resolveTeamName(t.name) || t.name];
+        if (!rec) {
+            missing.push(t.name);
+            continue;
+        }
+        const score = penFatigueScore(rec);
+        if (score == null) {
+            missing.push(t.name);
+            continue;
+        }
+        t.penFatigue = score.toFixed(3);
+        t.penFatigueAsOf = today;
+        t.penFatigueDetail = `${Math.round(rec.d1)}/${Math.round(rec.d2)}/${Math.round(rec.d3)} pitches (last 3d), ${rec.backToBack} arm${rec.backToBack === 1 ? "" : "s"} back-to-back`;
+        applied++;
+    }
+    return { next, applied, missing };
+}
 async function refreshMlbRosterMap() {
     try {
         const yr = new Date().getFullYear();
@@ -493,8 +651,8 @@ function projectGame(g, nOverride) {
     const homeOff = regress(blendRecent(homeBase, g.homePA, g.homeRecent, g.homeRecentPA, g.homeRecentBbk), g.homePA, CFG.REG_OFFENSE_PA);
     const awaySP = regress(effectivePitcherWoba(g.awaySP, g.awaySPera), g.awaySPbf, CFG.REG_STARTER_BF);
     const homeSP = regress(effectivePitcherWoba(g.homeSP, g.homeSPera), g.homeSPbf, CFG.REG_STARTER_BF);
-    const awayPen = regress(effectivePenWoba(g.awayPen, g.awayPenBarrel, g.awayPenHardHit), g.awayPenBf, CFG.REG_BULLPEN_BF);
-    const homePen = regress(effectivePenWoba(g.homePen, g.homePenBarrel, g.homePenHardHit), g.homePenBf, CFG.REG_BULLPEN_BF);
+    const awayPen = applyPenFatigue(regress(effectivePenWoba(g.awayPen, g.awayPenBarrel, g.awayPenHardHit), g.awayPenBf, CFG.REG_BULLPEN_BF), g.awayPenFatigue);
+    const homePen = applyPenFatigue(regress(effectivePenWoba(g.homePen, g.homePenBarrel, g.homePenHardHit), g.homePenBf, CFG.REG_BULLPEN_BF), g.homePenFatigue);
     // fielding side's D/framing applies to the OPPOSING lineup it faces
     const homeField = fieldFactor(g.homeOAA, g.homeFraming);
     const awayField = fieldFactor(g.awayOAA, g.awayFraming);
@@ -1293,7 +1451,7 @@ function App() {
             React.createElement("div", { className: "home-brand" },
                 React.createElement("span", { className: "ing-logo big" }, "\u25C6"),
                 React.createElement("h1", null, "INGENUITY"),
-                React.createElement("p", null, "MLB totals research suite \u00B7 projection engine v1.6 \u00B7 honest bookkeeping")),
+                React.createElement("p", null, "MLB totals research suite \u00B7 projection engine v1.7 \u00B7 honest bookkeeping")),
             React.createElement("div", { className: "home-cards" },
                 React.createElement("button", { className: "home-card", onClick: () => setView("terminal") },
                     React.createElement("span", { className: "home-card-glyph" }, "\u03A3"),
@@ -1439,6 +1597,7 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
                 recent: num(t.recent), recentPA: num(t.recentPA), recentBbk: num(t.recentBbk),
                 sp: num(arm.xwoba) ?? 0.32, spBf: num(arm.bf) ?? 200, spIp: num(arm.ip) ?? 5, spEra: num(arm.era), spHand: (arm.hand === "L" || arm.hand === "R") ? arm.hand : null,
                 pen: num(t.pen) ?? 0.318, penBf: num(t.penBf) ?? 800, penBarrel: num(t.penBarrel), penHardHit: num(t.penHardHit),
+                penFatigue: teamPenFatigue(t),
                 oaa: num(t.oaa), framing: num(t.framing),
             });
             const a = side(A, aArm), h = side(H, hArm);
@@ -1447,12 +1606,12 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
                 awayOff: a.off, awayXoff: a.xoff, awayPA: a.pa, awayRecent: a.recent, awayRecentPA: a.recentPA, awayRecentBbk: a.recentBbk,
                 awayOffVsL: num(A.offVsL), awayPaVsL: num(A.paVsL), awayOffVsR: num(A.offVsR), awayPaVsR: num(A.paVsR),
                 awaySP: a.sp, awaySPbf: a.spBf, awaySPip: a.spIp, awaySPera: a.spEra, awaySPHand: a.spHand,
-                awayPen: a.pen, awayPenBf: a.penBf, awayPenBarrel: a.penBarrel, awayPenHardHit: a.penHardHit,
+                awayPen: a.pen, awayPenBf: a.penBf, awayPenBarrel: a.penBarrel, awayPenHardHit: a.penHardHit, awayPenFatigue: a.penFatigue,
                 awayOAA: a.oaa, awayFraming: a.framing,
                 homeOff: h.off, homeXoff: h.xoff, homePA: h.pa, homeRecent: h.recent, homeRecentPA: h.recentPA, homeRecentBbk: h.recentBbk,
                 homeOffVsL: num(H.offVsL), homePaVsL: num(H.paVsL), homeOffVsR: num(H.offVsR), homePaVsR: num(H.paVsR),
                 homeSP: h.sp, homeSPbf: h.spBf, homeSPip: h.spIp, homeSPera: h.spEra, homeSPHand: h.spHand,
-                homePen: h.pen, homePenBf: h.penBf, homePenBarrel: h.penBarrel, homePenHardHit: h.penHardHit,
+                homePen: h.pen, homePenBf: h.penBf, homePenBarrel: h.penBarrel, homePenHardHit: h.penHardHit, homePenFatigue: h.penFatigue,
                 homeOAA: h.oaa, homeFraming: h.framing,
             });
             if (dead)
@@ -1619,6 +1778,10 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
 // what's actually deployed. Newest first.
 // ===========================================================================
 const CHANGELOG = [
+    { date: "2026-07-23", items: [
+            "Engine v1.7 — bullpen fatigue. A pen's quality was priced; its recent workload wasn't. One button ('Bullpen workload') reads the last 3 days of MLB box scores, tallies reliever pitch counts per team (starters excluded — their workload is already in the listed-starter market), flags arms working back-to-back, and scores each pen from rested to gassed. A tired pen prices slightly worse late. The effect is capped small and deliberately conservative: fully-rested to fully-gassed moves a total about 0.2 runs, and rest helps less than fatigue hurts. Free API, no odds credit, and the score is day-stamped so a stale reading is ignored rather than quietly applied.",
+            "Run distribution rebuilt as a proper instrument. The old chart drew the book's number as an outlined BAR, which read as just another bar — the single biggest source of confusion. It's now a smooth density curve with: the book line as a dashed pin and flag across the curve; the peak marked with a dot and a 'MOST LIKELY' flag so the most common total is unmistakable; the two halves split at the true half-run (8.5, not a rounded bin) and shaded separately with each side's own percentage printed inside it; and the 80% band drawn behind. The axis now frames the range that matters instead of stretching to a 30-run blowout sim — and says what share of sims is in view when it clips.",
+        ] },
     { date: "2026-07-22", items: [
             "Engine v1.6 — platoon splits. Run scoring swings hard on the handedness matchup, so the model now nudges each lineup toward its wOBA vs the opposing starter's hand (LHP/RHP). The split is regressed toward the team's overall wOBA by sample size (a 40-PA split barely moves it; a full-season split gets real weight) and the net shift is hard-capped at ±0.030 wOBA, so a noisy split can't swing a total. Only fires when the starter's throwing hand is known.",
             "Pitcher handedness now fills itself. MLB's own player feed publishes each player's throwing hand, and the app already syncs that feed for team routing — so one button ('Auto-fill hands from MLB') stamps L/R onto every pitcher already in your database. No typing ~150 names. Manual paste stays for anyone the name-match misses, and the panel says exactly who's still unhanded.",
@@ -1995,12 +2158,12 @@ function Terminal({ onHome }) {
                 awayOff: num(A.off) ?? CFG.LEAGUE_WOBA, awayXoff: num(A.xoff), awayPA: num(A.pa) ?? 600,
                 awayRecent: num(A.recent), awayRecentPA: num(A.recentPA), awayRecentBbk: num(A.recentBbk),
                 awaySP: num(A.sp) ?? 0.32, awaySPbf: num(A.spBf) ?? 200, awaySPip: num(A.spIp) ?? 5, awaySPera: num(A.spEra),
-                awayPen: num(A.pen) ?? 0.318, awayPenBf: num(A.penBf) ?? 800, awayPenBarrel: num(A.penBarrel), awayPenHardHit: num(A.penHardHit),
+                awayPen: num(A.pen) ?? 0.318, awayPenBf: num(A.penBf) ?? 800, awayPenBarrel: num(A.penBarrel), awayPenHardHit: num(A.penHardHit), awayPenFatigue: teamPenFatigue(A),
                 awayOAA: num(A.oaa), awayFraming: num(A.framing),
                 homeOff: num(H.off) ?? CFG.LEAGUE_WOBA, homeXoff: num(H.xoff), homePA: num(H.pa) ?? 600,
                 homeRecent: num(H.recent), homeRecentPA: num(H.recentPA), homeRecentBbk: num(H.recentBbk),
                 homeSP: num(H.sp) ?? 0.32, homeSPbf: num(H.spBf) ?? 200, homeSPip: num(H.spIp) ?? 5, homeSPera: num(H.spEra),
-                homePen: num(H.pen) ?? 0.318, homePenBf: num(H.penBf) ?? 800, homePenBarrel: num(H.penBarrel), homePenHardHit: num(H.penHardHit),
+                homePen: num(H.pen) ?? 0.318, homePenBf: num(H.penBf) ?? 800, homePenBarrel: num(H.penBarrel), homePenHardHit: num(H.penHardHit), homePenFatigue: teamPenFatigue(H),
                 homeOAA: num(H.oaa), homeFraming: num(H.framing),
             };
             setResult({
@@ -2049,7 +2212,7 @@ function Terminal({ onHome }) {
                 React.createElement("button", { className: "ing-home-btn", onClick: onHome, "aria-label": "Back to home" }, "\u2190 Home"),
                 React.createElement("div", null,
                     React.createElement("h1", null, "TERMINAL"),
-                    React.createElement("p", null, "Run projection \u00B7 v1.6 \u00B7 research"))),
+                    React.createElement("p", null, "Run projection \u00B7 v1.7 \u00B7 research"))),
             React.createElement("nav", { className: "ing-nav" },
                 React.createElement("button", { className: tab === "project" ? "on" : "", onClick: () => setTab("project") }, "Project"),
                 React.createElement("button", { className: tab === "database" ? "on" : "", onClick: () => setTab("database") }, "Database"),
@@ -2626,6 +2789,159 @@ function Field({ label, v, on }) {
         React.createElement("span", null, label),
         React.createElement("input", { value: v ?? "", onChange: on, inputMode: "decimal", placeholder: "\u2014" })));
 }
+// v1.7 — the run-distribution instrument.
+// Rebuilt to answer three questions at a glance, in this order:
+//   1. Which side is more likely?   → the two fills, each labelled with its own %
+//   2. Which total shows up most?   → a dot + "MOST LIKELY" flag on the peak
+//   3. Where did the book set it?   → a dashed pin with a "BOOK" flag, drawn as a
+//                                     LINE across the curve, never as a bar
+// The old version drew the book line as an outlined *bar*, which read as "a bar"
+// and was the main source of confusion. A continuous curve also lets the split
+// land on the true half-run (8.5), not a rounded bin.
+function RunCurve({ r }) {
+    const uid = useMemo(() => "rc" + Math.random().toString(36).slice(2, 8), []);
+    const bins = r.hist || {};
+    const keys = Object.keys(bins).map(Number).sort((a, b) => a - b);
+    if (!keys.length)
+        return null;
+    const total = Object.values(bins).reduce((s, x) => s + x, 0) || 1;
+    // Draw the range that actually matters. A handful of 25-run blowout sims would
+    // otherwise stretch the axis to 30+ and squash the real action into a third of
+    // the width. Frame on the 80% band with a margin, and always keep the book's
+    // number in view — the tails past this are a rounding error of the mass.
+    const rawLo = keys[0], rawHi = keys[keys.length - 1];
+    const lineNum = parseFloat(r.line);
+    let lo = Math.max(rawLo, Math.floor(r.p10) - 3);
+    let hi = Math.min(rawHi, Math.ceil(r.p90) + 3);
+    if (!isNaN(lineNum)) {
+        lo = Math.min(lo, Math.floor(lineNum) - 1);
+        hi = Math.max(hi, Math.ceil(lineNum) + 1);
+    }
+    lo = Math.max(0, lo);
+    if (hi - lo < 4)
+        hi = lo + 4;
+    let maxC = 1;
+    for (let b = lo; b <= hi; b++)
+        maxC = Math.max(maxC, bins[b] || 0);
+    const shownMass = (() => { let s = 0; for (let b = lo; b <= hi; b++)
+        s += bins[b] || 0; return s / total; })();
+    const W = 440, H = 208, padL = 20, padR = 20, top = 40, bot = 158, axisY = 162;
+    const span = Math.max(1e-9, hi - lo);
+    const xFor = (v) => padL + ((v - lo) / span) * (W - padL - padR);
+    const yFor = (c) => bot - (c / maxC) * (bot - top);
+    const pts = [];
+    for (let b = lo; b <= hi; b++)
+        pts.push({ b, c: bins[b] || 0, x: xFor(b), y: yFor(bins[b] || 0) });
+    // Catmull-Rom through the bin tops, converted to cubic beziers
+    const curve = (p) => {
+        if (p.length < 2)
+            return "";
+        let d = `M ${p[0].x.toFixed(1)} ${p[0].y.toFixed(1)}`;
+        for (let i = 0; i < p.length - 1; i++) {
+            const p0 = p[i - 1] || p[i], p1 = p[i], p2 = p[i + 1], p3 = p[i + 2] || p2;
+            const c1x = p1.x + (p2.x - p0.x) / 6, c1y = p1.y + (p2.y - p0.y) / 6;
+            const c2x = p2.x - (p3.x - p1.x) / 6, c2y = p2.y - (p3.y - p1.y) / 6;
+            d += ` C ${c1x.toFixed(1)} ${c1y.toFixed(1)}, ${c2x.toFixed(1)} ${c2y.toFixed(1)}, ${p2.x.toFixed(1)} ${p2.y.toFixed(1)}`;
+        }
+        return d;
+    };
+    const linePath = curve(pts);
+    const areaPath = `${linePath} L ${pts[pts.length - 1].x.toFixed(1)} ${bot} L ${pts[0].x.toFixed(1)} ${bot} Z`;
+    const lineVal = Math.max(lo, Math.min(hi, parseFloat(r.line)));
+    const lineX = xFor(lineVal);
+    let modeB = lo, modeC = -1;
+    for (const p of pts)
+        if (p.c > modeC) {
+            modeC = p.c;
+            modeB = p.b;
+        }
+    const modeX = xFor(modeB), modeY = yFor(modeC);
+    const modePct = (modeC / total) * 100;
+    const p10X = xFor(Math.max(lo, Math.min(hi, r.p10)));
+    const p90X = xFor(Math.max(lo, Math.min(hi, r.p90)));
+    const step = (hi - lo) > 14 ? 2 : 1;
+    const ticks = [];
+    for (let b = Math.ceil(lo); b <= hi; b += step)
+        ticks.push(b);
+    const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+    const underMid = (padL + lineX) / 2, overMid = (lineX + (W - padR)) / 2;
+    const underRoom = lineX - padL, overRoom = (W - padR) - lineX;
+    const favUnder = r.pUnder >= r.pOver;
+    return (React.createElement("div", { className: "rc" },
+        React.createElement("div", { className: "rc-head" },
+            React.createElement("span", null, "Run distribution"),
+            React.createElement("span", { className: "rc-head-sub" }, "20,000 simulated games")),
+        React.createElement("svg", { className: "rc-svg", viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": `Simulated run totals. Most likely total ${modeB} runs. Book line ${r.line}. Under ${(r.pUnder * 100).toFixed(0)} percent, over ${(r.pOver * 100).toFixed(0)} percent.` },
+            React.createElement("defs", null,
+                React.createElement("linearGradient", { id: `${uid}-u`, x1: "0", y1: "0", x2: "0", y2: "1" },
+                    React.createElement("stop", { offset: "0%", stopColor: "#5fd9e8", stopOpacity: "0.55" }),
+                    React.createElement("stop", { offset: "100%", stopColor: "#5fd9e8", stopOpacity: "0.04" })),
+                React.createElement("linearGradient", { id: `${uid}-o`, x1: "0", y1: "0", x2: "0", y2: "1" },
+                    React.createElement("stop", { offset: "0%", stopColor: "#34e6a8", stopOpacity: "0.55" }),
+                    React.createElement("stop", { offset: "100%", stopColor: "#34e6a8", stopOpacity: "0.04" })),
+                React.createElement("clipPath", { id: `${uid}-cu` },
+                    React.createElement("rect", { x: "0", y: "0", width: lineX, height: H })),
+                React.createElement("clipPath", { id: `${uid}-co` },
+                    React.createElement("rect", { x: lineX, y: "0", width: W - lineX, height: H }))),
+            React.createElement("rect", { x: p10X, y: top - 6, width: Math.max(0, p90X - p10X), height: bot - top + 6, className: "rc-band" }),
+            React.createElement("path", { d: areaPath, fill: `url(#${uid}-u)`, clipPath: `url(#${uid}-cu)`, className: "rc-area" }),
+            React.createElement("path", { d: areaPath, fill: `url(#${uid}-o)`, clipPath: `url(#${uid}-co)`, className: "rc-area" }),
+            React.createElement("path", { d: linePath, className: "rc-stroke-u", clipPath: `url(#${uid}-cu)` }),
+            React.createElement("path", { d: linePath, className: "rc-stroke-o", clipPath: `url(#${uid}-co)` }),
+            React.createElement("line", { x1: padL, y1: bot, x2: W - padR, y2: bot, className: "rc-axis" }),
+            underRoom > 52 && (React.createElement("g", null,
+                React.createElement("text", { x: clamp(underMid, padL + 24, lineX - 24), y: bot - 22, className: "rc-pct" + (favUnder ? " on" : ""), textAnchor: "middle" },
+                    (r.pUnder * 100).toFixed(0),
+                    "%"),
+                React.createElement("text", { x: clamp(underMid, padL + 24, lineX - 24), y: bot - 9, className: "rc-pct-lbl", textAnchor: "middle" }, "UNDER"))),
+            overRoom > 52 && (React.createElement("g", null,
+                React.createElement("text", { x: clamp(overMid, lineX + 24, W - padR - 24), y: bot - 22, className: "rc-pct" + (!favUnder ? " on" : ""), textAnchor: "middle" },
+                    (r.pOver * 100).toFixed(0),
+                    "%"),
+                React.createElement("text", { x: clamp(overMid, lineX + 24, W - padR - 24), y: bot - 9, className: "rc-pct-lbl", textAnchor: "middle" }, "OVER"))),
+            React.createElement("line", { x1: modeX, y1: modeY, x2: modeX, y2: bot, className: "rc-modestem" }),
+            React.createElement("circle", { cx: modeX, cy: modeY, r: "4.5", className: "rc-modedot" }),
+            React.createElement("g", { transform: `translate(${clamp(modeX, padL + 46, W - padR - 46)}, ${Math.max(top - 12, modeY - 14)})` },
+                React.createElement("rect", { x: "-45", y: "-11", width: "90", height: "16", rx: "8", className: "rc-flag mode" }),
+                React.createElement("text", { x: "0", y: "1", className: "rc-flag-t mode", textAnchor: "middle" },
+                    "MOST LIKELY ",
+                    modeB)),
+            React.createElement("line", { x1: lineX, y1: top - 14, x2: lineX, y2: bot, className: "rc-pin" }),
+            React.createElement("g", { transform: `translate(${clamp(lineX, padL + 34, W - padR - 34)}, ${top - 20})` },
+                React.createElement("rect", { x: "-33", y: "-10", width: "66", height: "16", rx: "8", className: "rc-flag book" }),
+                React.createElement("text", { x: "0", y: "2", className: "rc-flag-t book", textAnchor: "middle" },
+                    "BOOK ",
+                    r.line)),
+            ticks.map((b) => (React.createElement("g", { key: b },
+                React.createElement("line", { x1: xFor(b), y1: bot, x2: xFor(b), y2: bot + 4, className: "rc-tick" }),
+                React.createElement("text", { x: xFor(b), y: axisY + 9, className: "rc-tick-t", textAnchor: "middle" }, b)))),
+            React.createElement("text", { x: p10X, y: H - 4, className: "rc-range-t", textAnchor: "start" }, r.p10.toFixed(0)),
+            React.createElement("text", { x: (p10X + p90X) / 2, y: H - 4, className: "rc-range-t dim", textAnchor: "middle" }, "80% of games land here"),
+            React.createElement("text", { x: p90X, y: H - 4, className: "rc-range-t", textAnchor: "end" }, r.p90.toFixed(0)),
+            shownMass < 0.995 && (React.createElement("text", { x: W - padR, y: top - 26, className: "rc-clip-t", textAnchor: "end" },
+                (shownMass * 100).toFixed(1),
+                "% of sims in view"))),
+        React.createElement("div", { className: "rc-key" },
+            React.createElement("span", null,
+                React.createElement("i", { className: "k-u" }),
+                "Under ",
+                r.line),
+            React.createElement("span", null,
+                React.createElement("i", { className: "k-o" }),
+                "Over ",
+                r.line),
+            React.createElement("span", null,
+                React.createElement("i", { className: "k-b" }),
+                "Book line"),
+            React.createElement("span", null,
+                React.createElement("i", { className: "k-m" }),
+                "Peak = most common total (",
+                modeB,
+                ", ",
+                modePct.toFixed(1),
+                "% of sims)")),
+        React.createElement("p", { className: "rc-note" }, "The curve is where the 20,000 simulated finals landed. Taller means that total came up more often. The two shaded halves are split at the book's number, so the bigger half is the side the model favours \u2014 and the thin ends are the blowout and pitcher's-duel games that decide first-five bets.")));
+}
 function Readout({ r, onLog, logMsg }) {
     // win probability conditional on no push — the right basis for pricing a bet
     const pPush = r.pPush || 0;
@@ -2778,47 +3094,7 @@ function Readout({ r, onLog, logMsg }) {
             ": ",
             (pPush * 100).toFixed(1),
             "% of sims land exactly on the number (stake refunded, win probabilities shown are push-excluded).")),
-        React.createElement("div", { className: "ing-curve" },
-            React.createElement("div", { className: "ing-curve-head" },
-                "Run distribution ",
-                React.createElement("span", null,
-                    "80% of games land ",
-                    r.p10.toFixed(0),
-                    "\u2013",
-                    r.p90.toFixed(0),
-                    " runs")),
-            React.createElement("div", { className: "ing-bars" }, bars.map((bar) => (React.createElement("div", { className: "ing-bar-wrap", key: bar.b, title: `${bar.b} runs · ${(bar.pct * 100).toFixed(1)}% of sims · ${bar.side === "push" ? "on the line" : bar.side}${bar.tail ? " · tail/outlier" : ""}${bar.isMode ? " · most likely" : ""}` },
-                bar.isMode && React.createElement("span", { className: "ing-bar-mode" }, "\u25B2"),
-                React.createElement("div", { className: "ing-bar", style: { height: `${(bar.c / maxBin) * 100}%` }, "data-line": bar.isLine, "data-side": bar.side, "data-tail": bar.tail, "data-mode": bar.isMode }),
-                React.createElement("span", { className: "ing-bar-label" + (bar.b % 2 === 0 ? "" : " dim") }, bar.b))))),
-            React.createElement("div", { className: "ing-curve-legend" },
-                React.createElement("span", null,
-                    React.createElement("i", { className: "lg-under" }),
-                    "Under ",
-                    r.line),
-                React.createElement("span", null,
-                    React.createElement("i", { className: "lg-over" }),
-                    "Over ",
-                    r.line),
-                React.createElement("span", null,
-                    React.createElement("i", { className: "lg-line" }),
-                    "Book line (",
-                    lineBin,
-                    ")"),
-                React.createElement("span", null,
-                    React.createElement("i", { className: "lg-mode" }),
-                    "Most likely (",
-                    modeBin,
-                    ")"),
-                React.createElement("span", null,
-                    React.createElement("i", { className: "lg-tail" }),
-                    "Tails (outlier runs)")),
-            React.createElement("p", { className: "ing-curve-note" },
-                "The tails \u2014 games under ",
-                r.p10.toFixed(0),
-                " or over ",
-                r.p90.toFixed(0),
-                " \u2014 are the blowout and pitcher's-duel scenarios. Thick tails on the low side favor first-5 unders and a quiet early game; a fat high tail flags shootout risk that a full-game over captures better than an F5 bet.")),
+        React.createElement(RunCurve, { r: r }),
         React.createElement("div", { className: "ing-teamtotals" },
             React.createElement("div", { className: "ing-tt-head" }, "Team totals"),
             teamTotals.map((t, i) => (React.createElement("div", { className: "ing-tt-row", key: i },
@@ -4789,6 +5065,27 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
         setBusy("");
         await pullLive(); // rebuild from scratch: odds → pitchers → weather
     };
+    // v1.7 — pull each pen's last-3-days workload from MLB box scores and stamp a
+    // fatigue score onto the teams. Free API, no odds credit. Honest failure: if
+    // the fetch can't reach MLB, say so rather than leaving a silent stale score.
+    const refreshPenFatigue = async () => {
+        if (busy)
+            return;
+        setBusy("pen");
+        setMsg("");
+        const res = await fetchBullpenFatigue();
+        if (!res.ok) {
+            setBusy("");
+            setMsg(`Bullpen workload didn't load — ${res.err}. In the hosted app this works; inside the Claude artifact the sandbox blocks MLB's API. Projections just run without the fatigue nudge until it does.`);
+            return;
+        }
+        const cached = await store.get("ingenuity:mlb:penFatigue", null);
+        const { next, applied, missing } = applyPenFatigueToTeams(cached, teams);
+        setTeams(next);
+        await store.set("ingenuity:teams", next);
+        setBusy("");
+        setMsg(`Bullpen workload read from ${res.boxes} box score${res.boxes === 1 ? "" : "s"} across the last 3 days — ${applied} pen${applied === 1 ? "" : "s"} scored.${missing.length ? ` No recent games found for ${missing.length} team${missing.length === 1 ? "" : "s"} (off days).` : ""} Tired pens now price slightly worse late; the effect is capped small on purpose.`);
+    };
     const refreshWeather = async () => {
         if (!isToday) {
             setMsg("Weather refresh applies to today's board.");
@@ -4901,7 +5198,7 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
                 resolved = num(hit.xwoba) != null;
             }
         }
-        return { off: num(t.off) ?? CFG.LEAGUE_WOBA, xoff: num(t.xoff), pa: num(t.pa) ?? 600, recent: num(t.recent), recentPA: num(t.recentPA), recentBbk: num(t.recentBbk), sp, spBf, spIp, spEra, pen: num(t.pen) ?? 0.318, penBf: num(t.penBf) ?? 800, penBarrel: num(t.penBarrel), penHardHit: num(t.penHardHit), oaa: num(t.oaa), framing: num(t.framing), resolved };
+        return { off: num(t.off) ?? CFG.LEAGUE_WOBA, xoff: num(t.xoff), pa: num(t.pa) ?? 600, recent: num(t.recent), recentPA: num(t.recentPA), recentBbk: num(t.recentBbk), sp, spBf, spIp, spEra, pen: num(t.pen) ?? 0.318, penBf: num(t.penBf) ?? 800, penBarrel: num(t.penBarrel), penHardHit: num(t.penHardHit), oaa: num(t.oaa), framing: num(t.framing), penFatigue: teamPenFatigue(t), resolved };
     };
     const scan = async () => {
         setBusy("scan");
@@ -4935,8 +5232,8 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
             const homePark = parkForTeam(H.name);
             const r = projectGame({
                 park: homePark, line, temp: g.wx ? g.wx.temp : null, windOut: g.wx ? g.wx.windOut : null,
-                awayOff: a.off, awayXoff: a.xoff, awayPA: a.pa, awayRecent: a.recent, awayRecentPA: a.recentPA, awayRecentBbk: a.recentBbk, awaySP: a.sp, awaySPbf: a.spBf, awaySPip: a.spIp, awaySPera: a.spEra, awayPen: a.pen, awayPenBf: a.penBf, awayPenBarrel: a.penBarrel, awayPenHardHit: a.penHardHit, awayOAA: a.oaa, awayFraming: a.framing,
-                homeOff: h.off, homeXoff: h.xoff, homePA: h.pa, homeRecent: h.recent, homeRecentPA: h.recentPA, homeRecentBbk: h.recentBbk, homeSP: h.sp, homeSPbf: h.spBf, homeSPip: h.spIp, homeSPera: h.spEra, homePen: h.pen, homePenBf: h.penBf, homePenBarrel: h.penBarrel, homePenHardHit: h.penHardHit, homeOAA: h.oaa, homeFraming: h.framing,
+                awayOff: a.off, awayXoff: a.xoff, awayPA: a.pa, awayRecent: a.recent, awayRecentPA: a.recentPA, awayRecentBbk: a.recentBbk, awaySP: a.sp, awaySPbf: a.spBf, awaySPip: a.spIp, awaySPera: a.spEra, awayPen: a.pen, awayPenBf: a.penBf, awayPenBarrel: a.penBarrel, awayPenHardHit: a.penHardHit, awayPenFatigue: a.penFatigue, awayOAA: a.oaa, awayFraming: a.framing,
+                homeOff: h.off, homeXoff: h.xoff, homePA: h.pa, homeRecent: h.recent, homeRecentPA: h.recentPA, homeRecentBbk: h.recentBbk, homeSP: h.sp, homeSPbf: h.spBf, homeSPip: h.spIp, homeSPera: h.spEra, homePen: h.pen, homePenBf: h.penBf, homePenBarrel: h.penBarrel, homePenHardHit: h.penHardHit, homePenFatigue: h.penFatigue, homeOAA: h.oaa, homeFraming: h.framing,
             }, 8000);
             const pW = r.pOver / (r.pOver + r.pUnder);
             const dO = amToDec(over), dU = amToDec(under);
@@ -5181,6 +5478,7 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
         React.createElement("div", { className: "slate-controls" },
             React.createElement("button", { className: "ing-run small", onClick: fetchMatchups, disabled: !!busy || !isToday, title: isToday ? "" : "Live fetch only applies to today's board" }, busy === "fetch" ? "Fetching…" : games.length ? "Refresh matchups + pitchers" : "1 · Fetch matchups + pitchers"),
             games.length > 0 && isToday && (React.createElement("button", { className: "ing-run small ghosty", onClick: refreshWeather, disabled: !!busy, title: "Re-fetch game-time weather without spending an odds credit" }, busy === "wx" ? "Checking sky…" : "Refresh weather")),
+            isToday && (React.createElement("button", { className: "ing-run small ghosty", onClick: refreshPenFatigue, disabled: !!busy, title: "Read the last 3 days of box scores to see which bullpens are short tonight (free, no odds credit)" }, busy === "pen" ? "Reading box scores…" : "Bullpen workload")),
             games.length > 0 && isToday && (React.createElement("button", { className: "ing-run small ghosty warn", onClick: refreshSlate, disabled: !!busy, title: "Clear today's board and pull everything fresh (uses one odds credit)" }, busy === "refresh" ? "Rebuilding…" : "↻ Refresh slate")),
             React.createElement("label", { className: "slate-filebtn" },
                 busy === "vision" ? "Reading…" : "2 · Import odds (screenshot / file)",
@@ -5390,7 +5688,7 @@ function BetOfTheDay() {
                         resolved = num(hit.xwoba) != null;
                     }
                 }
-                return { off: num(t.off) ?? CFG.LEAGUE_WOBA, xoff: num(t.xoff), pa: num(t.pa) ?? 600, recent: num(t.recent), recentPA: num(t.recentPA), recentBbk: num(t.recentBbk), sp, spBf, spIp, spEra, pen: num(t.pen) ?? 0.318, penBf: num(t.penBf) ?? 800, penBarrel: num(t.penBarrel), penHardHit: num(t.penHardHit), oaa: num(t.oaa), framing: num(t.framing), resolved };
+                return { off: num(t.off) ?? CFG.LEAGUE_WOBA, xoff: num(t.xoff), pa: num(t.pa) ?? 600, recent: num(t.recent), recentPA: num(t.recentPA), recentBbk: num(t.recentBbk), sp, spBf, spIp, spEra, pen: num(t.pen) ?? 0.318, penBf: num(t.penBf) ?? 800, penBarrel: num(t.penBarrel), penHardHit: num(t.penHardHit), oaa: num(t.oaa), framing: num(t.framing), penFatigue: teamPenFatigue(t), resolved };
             };
             if (g.inPlay || (g.start && new Date(g.start).getTime() <= Date.now()))
                 continue; // underway — not a pregame question
@@ -5404,8 +5702,8 @@ function BetOfTheDay() {
             const line = parseFloat(g.line), over = parseFloat(g.over) || -110, under = parseFloat(g.under) || -110;
             const r = projectGame({
                 park: parkForTeam(H.name), line, temp: g.wx ? g.wx.temp : null, windOut: g.wx ? g.wx.windOut : null,
-                awayOff: a.off, awayXoff: a.xoff, awayPA: a.pa, awayRecent: a.recent, awayRecentPA: a.recentPA, awayRecentBbk: a.recentBbk, awaySP: a.sp, awaySPbf: a.spBf, awaySPip: a.spIp, awaySPera: a.spEra, awayPen: a.pen, awayPenBf: a.penBf, awayPenBarrel: a.penBarrel, awayPenHardHit: a.penHardHit, awayOAA: a.oaa, awayFraming: a.framing,
-                homeOff: h.off, homeXoff: h.xoff, homePA: h.pa, homeRecent: h.recent, homeRecentPA: h.recentPA, homeRecentBbk: h.recentBbk, homeSP: h.sp, homeSPbf: h.spBf, homeSPip: h.spIp, homeSPera: h.spEra, homePen: h.pen, homePenBf: h.penBf, homePenBarrel: h.penBarrel, homePenHardHit: h.penHardHit, homeOAA: h.oaa, homeFraming: h.framing,
+                awayOff: a.off, awayXoff: a.xoff, awayPA: a.pa, awayRecent: a.recent, awayRecentPA: a.recentPA, awayRecentBbk: a.recentBbk, awaySP: a.sp, awaySPbf: a.spBf, awaySPip: a.spIp, awaySPera: a.spEra, awayPen: a.pen, awayPenBf: a.penBf, awayPenBarrel: a.penBarrel, awayPenHardHit: a.penHardHit, awayPenFatigue: a.penFatigue, awayOAA: a.oaa, awayFraming: a.framing,
+                homeOff: h.off, homeXoff: h.xoff, homePA: h.pa, homeRecent: h.recent, homeRecentPA: h.recentPA, homeRecentBbk: h.recentBbk, homeSP: h.sp, homeSPbf: h.spBf, homeSPip: h.spIp, homeSPera: h.spEra, homePen: h.pen, homePenBf: h.penBf, homePenBarrel: h.penBarrel, homePenHardHit: h.penHardHit, homePenFatigue: h.penFatigue, homeOAA: h.oaa, homeFraming: h.framing,
             }, 8000);
             const pW = r.pOver / (r.pOver + r.pUnder);
             const dO = amToDec(over), dU = amToDec(under);
@@ -6293,6 +6591,44 @@ const CSS = `
 .ing-curve-legend .lg-line { box-shadow: inset 0 0 0 1.5px var(--amber); }
 .ing-curve-legend .lg-mode { background: var(--phos); box-shadow: 0 0 8px var(--phos-dim); }
 .ing-curve-legend .lg-tail { background: var(--ink-dim); opacity: 0.4; }
+/* ---- run distribution instrument (v1.7) ---- */
+.rc { margin-bottom: 20px; }
+.rc-head { display: flex; justify-content: space-between; align-items: baseline; font-family: 'Archivo'; font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--ink-dim); margin-bottom: 8px; }
+.rc-head-sub { color: var(--phos-dim); letter-spacing: 0.1em; }
+.rc-svg { width: 100%; height: auto; display: block; overflow: visible; }
+.rc-band { fill: rgba(255,255,255,0.028); }
+.rc-area { animation: rcrise 0.55s cubic-bezier(0.2,0.8,0.2,1) both; transform-origin: bottom; }
+@keyframes rcrise { from { transform: scaleY(0.55); opacity: 0; } to { transform: scaleY(1); opacity: 1; } }
+.rc-stroke-u { fill: none; stroke: var(--cyan); stroke-width: 2; stroke-linejoin: round; }
+.rc-stroke-o { fill: none; stroke: var(--phos); stroke-width: 2; stroke-linejoin: round; }
+.rc-axis { stroke: var(--line); stroke-width: 1; }
+.rc-tick { stroke: var(--line); stroke-width: 1; }
+.rc-tick-t { fill: var(--ink-dim); font-family: 'Archivo'; font-size: 9px; }
+.rc-pct { font-family: 'Archivo'; font-weight: 700; font-size: 21px; fill: var(--ink-dim); opacity: 0.7; }
+.rc-pct.on { fill: var(--ink); opacity: 1; }
+.rc-pct-lbl { font-family: 'Archivo'; font-size: 8px; letter-spacing: 0.16em; fill: var(--ink-dim); }
+.rc-modestem { stroke: var(--phos); stroke-width: 1; stroke-dasharray: 2 3; opacity: 0.45; }
+.rc-modedot { fill: var(--phos); filter: drop-shadow(0 0 6px var(--phos-dim)); }
+.rc-pin { stroke: var(--amber); stroke-width: 1.5; stroke-dasharray: 4 3; }
+.rc-flag { stroke-width: 1; }
+.rc-flag.book { fill: rgba(245,196,81,0.16); stroke: var(--amber); }
+.rc-flag.mode { fill: rgba(52,230,168,0.14); stroke: var(--phos-dim); }
+.rc-flag-t { font-family: 'Archivo'; font-weight: 700; font-size: 9px; letter-spacing: 0.08em; }
+.rc-flag-t.book { fill: var(--amber); }
+.rc-flag-t.mode { fill: var(--phos); }
+.rc-range-t { font-family: 'Archivo'; font-size: 8.5px; fill: var(--phos-dim); letter-spacing: 0.06em; }
+.rc-range-t.dim { fill: var(--ink-dim); opacity: 0.65; }
+.rc-clip-t { font-family: 'Archivo'; font-size: 8px; fill: var(--ink-dim); opacity: 0.7; letter-spacing: 0.06em; }
+.rc-key { display: flex; flex-wrap: wrap; gap: 9px 14px; margin-top: 12px; }
+.rc-key span { display: flex; align-items: center; gap: 6px; font-size: 10.5px; color: var(--ink-dim); font-family: 'Archivo'; letter-spacing: 0.03em; }
+.rc-key i { width: 12px; height: 4px; border-radius: 2px; display: inline-block; flex: none; }
+.rc-key .k-u { background: var(--cyan); }
+.rc-key .k-o { background: var(--phos); }
+.rc-key .k-b { background: repeating-linear-gradient(90deg, var(--amber) 0 4px, transparent 4px 7px); }
+.rc-key .k-m { width: 8px; height: 8px; border-radius: 50%; background: var(--phos); box-shadow: 0 0 6px var(--phos-dim); }
+.rc-note { font-size: 11px; color: var(--ink-dim); line-height: 1.6; margin-top: 11px; border-top: 1px solid var(--line); padding-top: 10px; }
+@media (prefers-reduced-motion: reduce) { .rc-area { animation: none; } }
+
 .ing-curve-note { font-size: 11px; color: var(--ink-dim); line-height: 1.55; margin-top: 10px; border-top: 1px solid var(--line); padding-top: 9px; }
 .ing-teamtotals { background: var(--field2); border: 1px solid var(--line); border-radius: 11px; padding: 15px; }
 .ing-tt-row { display: flex; align-items: center; gap: 12px; padding: 9px 0; border-top: 1px solid var(--line); }
