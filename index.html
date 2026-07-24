@@ -1833,6 +1833,10 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
 // what's actually deployed. Newest first.
 // ===========================================================================
 const CHANGELOG = [
+    { date: "2026-07-24f", items: [
+            "FIXED PROPERLY — the previous fix for the misaligned FantasyPros paste only covered space-separated text. A browser copy usually produces TAB-separated text, which returned early and skipped the repair entirely, so the bug was untouched for the shape that actually occurs. The repair now lives in the shared parser where every paste shape passes through: if the data rows have more columns than the header, the unnamed leading columns are identified by their content (numeric = rank, text = name) and the header is restored before anything is read. Tab and space pastes now produce identical results.",
+            "The failure message no longer misdiagnoses this. When the parsed name column comes through as numbers, it now says the columns are misaligned instead of suggesting nicknames, suffixes and typos — advice that was useless here and cost real time chasing the wrong cause.",
+        ] },
     { date: "2026-07-24e", items: [
             "FIXED — the real cause of '0 of 300 matched.' It wasn't the roster sync (that was verified working, and correctly). It was that copying this specific FantasyPros table on mobile drops the frozen '#'/'Player' column HEADERS while every row still carries their data — so every stat column read one or two positions off, and the name field ended up reading a rank number or garbage instead of an actual player name. Nothing could ever match, because nothing being compared was really a name. The importer now detects this exact shape (every present header label is real, but the first data row starts with a rank number followed by a \"Name (TEAM - POS)\" cell) and restores the missing header before parsing. Verified against the actual pasted data: all rows parse, names are clean, and team codes resolve correctly, including names with commas in their position list (e.g. \"1B,LF,RF\") which no longer break the split. Same fix covers the pitcher tables.",
         ] },
@@ -4405,6 +4409,30 @@ function savantCsvToRows(csv) {
             rows[0] = rows[0].slice(); // header now aligns 1:1 with data rows
         }
     }
+    // REPAIR (covers every paste shape, tab or space): a two-pane table — a
+    // frozen rank/name column beside scrollable stat columns, which is how
+    // FantasyPros renders — can be copied such that the frozen column's HEADER
+    // text is dropped while every data row still carries its VALUES. The header
+    // then has fewer columns than the data, every column reads offset by that
+    // many positions, and the name field lands on a rank number. That parses
+    // "successfully" and matches nothing, which is the silent-garbage failure
+    // this app exists to refuse. Detect it by shape and restore the missing
+    // labels: numeric leading cells are rank-like, a text cell is the name.
+    {
+        const dataCols = rows[1] ? rows[1].length : 0;
+        const missing = dataCols - head.length;
+        if (missing > 0 && missing <= 3) {
+            const prefix = [];
+            for (let i = 0; i < missing; i++) {
+                const cell = String(rows[1][i] ?? "").trim();
+                const numeric = cell !== "" && /^[-+]?[\d.,]+%?$/.test(cell);
+                prefix.push(numeric ? (i === 0 ? "#" : "col" + i) : "player");
+            }
+            // only trust the repair if it actually produced a name column
+            if (prefix.includes("player"))
+                head = [...prefix, ...head];
+        }
+    }
     const find = (cands) => { for (const c of cands) {
         const i = head.indexOf(c);
         if (i !== -1)
@@ -4543,6 +4571,14 @@ function SmartImport({ teams, saveTeams, onGameLine, statsFocus }) {
         const seededNote = seeded ? ` Auto-rostered ${seeded} new player${seeded === 1 ? "" : "s"} (${hadTeamCol ? "from the file's team column" : "matched against MLB's current rosters"}).` : "";
         // If nothing landed, say WHY — the three real causes are distinguishable.
         const diagnose = () => {
+            // Check the shape of what we parsed BEFORE blaming name spellings. If the
+            // "names" are numbers, the columns were misaligned and no spelling advice
+            // is useful — that misdiagnosis cost real time, so name it explicitly.
+            const looksNumeric = (s) => /^[-+]?[\d.,]+%?$/.test(String(s || "").trim());
+            const numericNames = rows.filter((r) => looksNumeric(r.name)).length;
+            if (numericNames > rows.length / 2) {
+                return `${label}: parsed ${rows.length} rows, but the name column came through as numbers — the columns are misaligned, so nothing could match. This happens when a copied table loses its leading header labels. Re-copy including the header row, or use the site's CSV export.`;
+            }
             if (!hadTeamCol)
                 return rosterMap && Object.keys(rosterMap).length
                     ? `${label}: parsed ${rows.length} players, but none matched MLB's current rosters by name — check for nicknames, suffixes, or typos, or tap "Sync MLB rosters" if it's been a while.`
