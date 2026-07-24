@@ -472,19 +472,22 @@ async function fetchBullpenFatigue() {
             if (isB2B)
                 b2b++;
             const p1 = a.pitches[0] || 0, p2 = a.pitches[1] || 0, p3 = a.pitches[2] || 0;
+            // Keep this record lean — it's written for all 30 clubs on every refresh,
+            // and a bloated payload is what pushes browser storage over its limit.
             arms.push({
-                name, p1, p2, p3, b2b: isB2B,
-                appearances: d.length,
-                ip: (a.outs / 3),
-                er: a.er, k: a.k, bb: a.bb, h: a.h,
-                // heaviest-recent-day drives the availability read; yesterday matters most
-                load: p1 * 1.0 + p2 * 0.65 + p3 * 0.35,
+                name, p1: Math.round(p1), p2: Math.round(p2), p3: Math.round(p3), b2b: isB2B,
+                ip: Math.round((a.outs / 3) * 10) / 10,
+                er: a.er, k: a.k, bb: a.bb,
+                // heaviest recent day drives the availability read; yesterday matters most
+                load: Math.round((p1 * 1.0 + p2 * 0.65 + p3 * 0.35) * 10) / 10,
             });
         }
         arms.sort((x, y) => y.load - x.load);
         out[team] = { d1: rec.d1, d2: rec.d2, d3: rec.d3, backToBack: b2b, arms };
     }
-    await store.set("ingenuity:mlb:penFatigue", { asOf: etDayKey(), teams: out });
+    const wrote = await store.set("ingenuity:mlb:penFatigue", { asOf: etDayKey(), teams: out });
+    if (!wrote)
+        return { ok: false, err: `couldn't save the workload — ${store.lastError || "the browser refused the write"}` };
     return { ok: true, teams: Object.keys(out).length, games, boxes };
 }
 // Stamp the computed fatigue score onto each team record so every projection
@@ -751,11 +754,17 @@ function parlayDecimal(legs) {
 // ---------------------------------------------------------------------------
 // storage
 // ---------------------------------------------------------------------------
+// Hosted build: browser localStorage, keyed to this origin.
+// set() reports whether the write actually landed. A silently-dropped write
+// (usually a full quota) used to look identical to success, which meant data
+// could vanish with no signal — the exact failure mode this app is built to
+// refuse. lastError carries the reason so callers can say something true.
 const store = {
+    lastError: null,
     async get(k, def) {
         try {
-            const r = await window.storage.get(k);
-            return r ? JSON.parse(r.value) : def;
+            const r = localStorage.getItem(k);
+            return r != null ? JSON.parse(r) : def;
         }
         catch {
             return def;
@@ -763,10 +772,15 @@ const store = {
     },
     async set(k, v) {
         try {
-            await window.storage.set(k, JSON.stringify(v));
+            localStorage.setItem(k, JSON.stringify(v));
+            store.lastError = null;
+            return true;
         }
         catch (e) {
-            console.error(e);
+            const quota = e && (e.name === "QuotaExceededError" || e.code === 22 || e.code === 1014);
+            store.lastError = quota ? "browser storage is full" : String(e && e.message ? e.message : e);
+            console.error("storage write failed:", k, e);
+            return false;
         }
     },
 };
@@ -1811,6 +1825,11 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
 // what's actually deployed. Newest first.
 // ===========================================================================
 const CHANGELOG = [
+    { date: "2026-07-23d", items: [
+            "FIXED — the hosted build was writing to the wrong storage. A rebuild had carried the artifact's window.storage API into the hosted file; that object doesn't exist on a normal web page, so every read came back empty and every write was silently dropped. Restored to localStorage, and the build now refuses to produce a hosted file that references window.storage or lacks localStorage.",
+            "Storage failures are no longer silent. store.set() now reports whether the write actually landed and names the reason when it doesn't (a full browser quota being the usual one). A dropped write used to be indistinguishable from success — the exact failure mode this app is supposed to refuse.",
+            "'Bullpen workload' now says which step came up empty instead of reporting '0 pens scored'. It separates: the workload didn't save (with the reason), your team database is empty, and the pens scored but none matched your saved team names. The stored record was also trimmed so it's less likely to push storage over its limit.",
+        ] },
     { date: "2026-07-23c", items: [
             "FanGraphs leaderboards now import straight from a copy-paste off the page — no CSV export, no retyping. A browser hands a copied table over in one of three shapes and all three now work: tab-separated, every cell on its own line, or whole rows separated by plain spaces. The space case is the tricky one because player names contain spaces, so the parser counts columns from the stat end and treats the last all-caps token as the team — 'CJ Abrams WSN' and 'Fernando Tatis Jr. SDP' both come through intact. Percent signs on BB%/K% are handled, a copied slice doesn't have to start at row 1, and a header plus a single player is enough. Keep the header row; it's what names the columns.",
         ] },
@@ -5322,11 +5341,27 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
             return;
         }
         const cached = await store.get("ingenuity:mlb:penFatigue", null);
+        // Say exactly which step came up empty rather than reporting "0 scored",
+        // which reads like the pull worked when it didn't.
+        if (!cached || !cached.teams || !Object.keys(cached.teams).length) {
+            setBusy("");
+            setMsg(`Read ${res.boxes} box scores, but the workload didn't save${store.lastError ? ` — ${store.lastError}` : ""}. Nothing was applied. If storage is full, clearing old slates in Settings will free room.`);
+            return;
+        }
+        if (!teams.length) {
+            setBusy("");
+            setMsg("Read the box scores, but your team database is empty, so there was nothing to attach the workload to. Import roster stats first, then run this again.");
+            return;
+        }
         const { next, applied, missing } = applyPenFatigueToTeams(cached, teams);
         setTeams(next);
-        await store.set("ingenuity:teams", next);
+        const saved = await store.set("ingenuity:teams", next);
         setBusy("");
-        setMsg(`Bullpen workload read from ${res.boxes} box score${res.boxes === 1 ? "" : "s"} across the last 3 days — ${applied} pen${applied === 1 ? "" : "s"} scored.${missing.length ? ` No recent games found for ${missing.length} team${missing.length === 1 ? "" : "s"} (off days).` : ""} Tired pens now price slightly worse late; the effect is capped small on purpose.`);
+        if (!applied) {
+            setMsg(`Read ${res.boxes} box scores and scored ${Object.keys(cached.teams).length} pens, but none matched your ${teams.length} saved teams by name. That's a naming mismatch, not missing data — check how the teams are named in Database.`);
+            return;
+        }
+        setMsg(`Bullpen workload read from ${res.boxes} box score${res.boxes === 1 ? "" : "s"} across the last 3 days — ${applied} pen${applied === 1 ? "" : "s"} scored.${missing.length ? ` No recent games found for ${missing.length} team${missing.length === 1 ? "" : "s"} (off days).` : ""}${saved ? "" : ` Warning: couldn't save — ${store.lastError || "storage refused the write"}.`} Tired pens now price slightly worse late; the effect is capped small on purpose.`);
     };
     const refreshWeather = async () => {
         if (!isToday) {
