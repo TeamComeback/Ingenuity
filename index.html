@@ -1833,6 +1833,12 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
 // what's actually deployed. Newest first.
 // ===========================================================================
 const CHANGELOG = [
+    { date: "2026-07-24g", items: [
+            "One-tap morning refresh. Six chores that used to be separate taps with separate failure messages now run as a single pass, in dependency order: MLB rosters \u2192 pitcher hands \u2192 board and probable starters \u2192 market lines \u2192 weather \u2192 bullpen workload. A live checklist shows each step as it runs and what it actually loaded. Only the odds step spends an API request, and it's labelled as such.",
+            "Steps are independent by design. One failure marks that step and the run continues rather than dropping everything after it \u2014 a dead weather service shouldn't cost you the bullpen read. Steps that genuinely depend on an earlier one (handedness needs rosters; weather needs a board) skip with the reason stated instead of failing silently.",
+            "Every step reports what actually persisted, re-read from storage afterwards, rather than trusting that a handler returned without throwing. That distinction is exactly what produced the false 'rosters synced' and '0 pens scored' successes, so the new pipeline is built to be incapable of the same lie: if a save is refused, the step says so and names the reason.",
+            "The projection and the decision stay manual on purpose. This automates the chores, not the read \u2014 the board still waits for you to scan it, and games missing a starter or a line stay unpriced rather than being guessed.",
+        ] },
     { date: "2026-07-24f", items: [
             "FIXED PROPERLY — the previous fix for the misaligned FantasyPros paste only covered space-separated text. A browser copy usually produces TAB-separated text, which returned early and skipped the repair entirely, so the bug was untouched for the shape that actually occurs. The repair now lives in the shared parser where every paste shape passes through: if the data rows have more columns than the header, the unnamed leading columns are identified by their content (numeric = rank, text = name) and the header is restored before anything is read. Tab and space pastes now produce identical results.",
             "The failure message no longer misdiagnoses this. When the parsed name column comes through as numbers, it now says the columns are misaligned instead of suggesting nicknames, suffixes and typos — advice that was useless here and cost real time chasing the wrong cause.",
@@ -5170,6 +5176,17 @@ function teamOUStreak(log, teamName) {
     const last = games.slice(0, 6).map((g) => ({ date: g.date, ou: g.ou, final: g.final, line: g.line, vs: normName(g.away).includes(n) ? g.home : g.away }));
     return { n: games.length, streak, side: top, last };
 }
+// v2.1 — the morning chore list, in dependency order. Rosters feed name
+// routing and handedness; the board must exist before odds, weather or a scan
+// can attach to it. Only the odds step spends an API request.
+const MORNING_PLAN = [
+    { key: "rosters", label: "MLB rosters", hint: "name routing + handedness" },
+    { key: "hands", label: "Pitcher hands", hint: "switches on platoon splits" },
+    { key: "board", label: "Board + probables", hint: "today's matchups and starters" },
+    { key: "odds", label: "Market lines", hint: "the one step that costs a request" },
+    { key: "weather", label: "Weather", hint: "game-time, per park" },
+    { key: "bullpen", label: "Bullpen workload", hint: "last 3 days of box scores" },
+];
 function SlateHub({ onOpenInTerminal }) {
     const todayKey = etDayKey();
     const [slate, setSlate] = useState(null); // { date, games: [{away, home, awayP, homeP, line, over, under, openLine.., proj?}] }
@@ -5188,6 +5205,7 @@ function SlateHub({ onOpenInTerminal }) {
     const [lean, setLean] = useState(null);
     const [acc, setAcc] = useState(null);
     const [detailGame, setDetailGame] = useState(null);
+    const [morning, setMorning] = useState(null); // one-tap refresh: per-step progress
     const [gradeMsg, setGradeMsg] = useState("");
     const [grading, setGrading] = useState(false);
     // Every board is archived under its own date. Nothing a day produced is ever
@@ -5554,6 +5572,138 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
     };
     // Clear today's board and pull it fresh — removes any games that rolled off,
     // stale pitchers, or old lines, and rebuilds cleanly. Uses one odds credit.
+    // v2.1 — one-tap morning refresh. Six chores, in dependency order, each one
+    // independent: a failure marks that step and the run continues rather than
+    // dropping the rest. Every step reports what ACTUALLY landed by re-reading
+    // stored state afterwards, never by trusting that a handler returned — that
+    // distinction is what caused the roster-sync and bullpen false successes.
+    const runMorning = async () => {
+        if (morning?.running || busy)
+            return;
+        const steps = {};
+        MORNING_PLAN.forEach((s) => { steps[s.key] = { state: "wait", note: "" }; });
+        setMorning({ running: true, steps, summary: "" });
+        setMsg("");
+        const mark = (key, state, note) => setMorning((m) => (m ? { ...m, steps: { ...m.steps, [key]: { state, note } } } : m));
+        const run = async (key, fn) => {
+            mark(key, "run", "");
+            try {
+                const r = await fn();
+                mark(key, r.state, r.note);
+                return r;
+            }
+            catch (e) {
+                const note = String(e && e.message ? e.message : e);
+                mark(key, "fail", note);
+                return { state: "fail", note };
+            }
+        };
+        // 1 — MLB rosters. Everything downstream routes names through this.
+        let workingTeams = teams;
+        const rosters = await run("rosters", async () => {
+            const res = await refreshMlbRosterMap();
+            if (!res.ok)
+                return { state: "fail", note: res.err || "unreachable" };
+            const cached = await store.get("ingenuity:mlb:rosterMap", null);
+            const n = cached?.map ? Object.keys(cached.map).length : 0;
+            return n ? { state: "ok", note: `${n} players` } : { state: "fail", note: "saved nothing" };
+        });
+        // 2 — Throwing hands. Without these the platoon adjustment never fires.
+        await run("hands", async () => {
+            if (rosters.state !== "ok")
+                return { state: "skip", note: "needs rosters" };
+            const cached = await store.get("ingenuity:mlb:rosterMap", null);
+            if (!cached?.hands || !Object.keys(cached.hands).length)
+                return { state: "warn", note: "no handedness in feed" };
+            if (!workingTeams.length)
+                return { state: "skip", note: "database empty" };
+            const { next, applied, missing } = applyHandsFromMap(cached.hands, workingTeams);
+            workingTeams = next;
+            setTeams(next);
+            const saved = await store.set("ingenuity:teams", next);
+            if (!saved)
+                return { state: "fail", note: store.lastError || "save refused" };
+            const left = [...new Set(missing)].length;
+            return { state: left ? "warn" : "ok", note: applied ? `${applied} set${left ? `, ${left} unmatched` : ""}` : (left ? `${left} still unhanded` : "already current") };
+        });
+        // 3 — Board + probable starters.
+        await run("board", async () => {
+            if (!isToday)
+                return { state: "skip", note: "viewing another day" };
+            await fetchMatchups();
+            const arch = await store.get("ingenuity:slate:archive", {});
+            const board = arch[todayKey];
+            const n = board?.games?.length || 0;
+            if (!n)
+                return { state: "fail", note: "no games on the board" };
+            const withArm = board.games.filter((g) => g.awayP && g.homeP).length;
+            return { state: withArm ? "ok" : "warn", note: `${n} game${n === 1 ? "" : "s"} · ${withArm}/${n} with both starters` };
+        });
+        // 4 — Market lines. The only step that spends an odds-API request.
+        await run("odds", async () => {
+            if (!isToday)
+                return { state: "skip", note: "viewing another day" };
+            if (!apiKey.trim())
+                return { state: "skip", note: "no odds-API key saved" };
+            await pullLive();
+            const arch = await store.get("ingenuity:slate:archive", {});
+            const board = arch[todayKey];
+            const games = board?.games || [];
+            const priced = games.filter((g) => g.line !== "" && g.line != null && !isNaN(parseFloat(g.line))).length;
+            if (!games.length)
+                return { state: "fail", note: "board still empty" };
+            return { state: priced ? "ok" : "warn", note: `${priced}/${games.length} with a total` };
+        });
+        // 5 — Weather, per park, at game time.
+        await run("weather", async () => {
+            if (!isToday)
+                return { state: "skip", note: "viewing another day" };
+            const arch = await store.get("ingenuity:slate:archive", {});
+            if (!arch[todayKey]?.games?.length)
+                return { state: "skip", note: "no board yet" };
+            const wx = await attachWeather([todayKey]);
+            if (wx.reachErr)
+                return { state: "fail", note: "weather service unreachable" };
+            return { state: wx.attached ? "ok" : "warn", note: `${wx.attached}/${wx.tried} parks` };
+        });
+        // 6 — Bullpen workload from the last three days of box scores.
+        await run("bullpen", async () => {
+            const res = await fetchBullpenFatigue();
+            if (!res.ok)
+                return { state: "fail", note: res.err || "unreachable" };
+            const cached = await store.get("ingenuity:mlb:penFatigue", null);
+            if (!cached?.teams || !Object.keys(cached.teams).length)
+                return { state: "fail", note: "nothing saved" };
+            if (!workingTeams.length)
+                return { state: "skip", note: "database empty" };
+            const { next, applied } = applyPenFatigueToTeams(cached, workingTeams);
+            workingTeams = next;
+            setTeams(next);
+            const saved = await store.set("ingenuity:teams", next);
+            if (!saved)
+                return { state: "fail", note: store.lastError || "save refused" };
+            return { state: applied ? "ok" : "warn", note: applied ? `${applied} pens scored` : "no pens matched" };
+        });
+        // Refresh the on-screen board from what actually persisted.
+        const finalArch = await store.get("ingenuity:slate:archive", {});
+        if (finalArch[todayKey])
+            setSlate(finalArch[todayKey]);
+        setArchDates(Object.keys(finalArch).sort().reverse());
+        setMorning((m) => {
+            if (!m)
+                return m;
+            const vals = Object.values(m.steps);
+            const bad = vals.filter((s) => s.state === "fail").length;
+            const warn = vals.filter((s) => s.state === "warn").length;
+            const skip = vals.filter((s) => s.state === "skip").length;
+            const summary = bad
+                ? `${bad} step${bad === 1 ? "" : "s"} failed — everything else still ran. Fix those and re-run; nothing here is all-or-nothing.`
+                : warn || skip
+                    ? "Ready, with gaps noted above. Games missing a starter or a line stay unpriced rather than being guessed."
+                    : "Everything's loaded. The board is ready to scan.";
+            return { ...m, running: false, summary };
+        });
+    };
     const refreshSlate = async () => {
         if (!isToday) {
             setMsg("Refresh applies to today's board. Use the day picker to return to today first.");
@@ -6000,6 +6150,23 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
             React.createElement("span", { className: "slate-chip good" },
                 "\u2713 saved for ",
                 viewDate))),
+        isToday && (React.createElement(React.Fragment, null,
+            React.createElement("button", { className: "mr-cta", onClick: runMorning, disabled: !!busy || !!morning?.running }, morning?.running ? "Running the morning refresh…" : (React.createElement("span", null,
+                "Morning refresh",
+                React.createElement("small", null, "Rosters, hands, board, lines, weather, bullpens \u2014 in one pass")))),
+            morning && (React.createElement("div", { className: "mr-panel" },
+                React.createElement("ol", { className: "mr-steps" }, MORNING_PLAN.map((s) => {
+                    const st = morning.steps[s.key] || { state: "wait", note: "" };
+                    const ic = st.state === "ok" ? "\u2713" : st.state === "warn" ? "!" : st.state === "fail" ? "\u2715"
+                        : st.state === "run" ? "\u25c6" : st.state === "skip" ? "\u2013" : "\u25cb";
+                    return (React.createElement("li", { key: s.key, className: "mr-step " + st.state },
+                        React.createElement("span", { className: "mr-ic", "aria-hidden": "true" }, ic),
+                        React.createElement("span", { className: "mr-label" },
+                            s.label,
+                            React.createElement("em", null, s.hint)),
+                        React.createElement("span", { className: "mr-note" }, st.note)));
+                })),
+                morning.summary && React.createElement("p", { className: "mr-sum" }, morning.summary))))),
         React.createElement("div", { className: "slate-controls" },
             React.createElement("button", { className: "ing-run small", onClick: fetchMatchups, disabled: !!busy || !isToday, title: isToday ? "" : "Live fetch only applies to today's board" }, busy === "fetch" ? "Fetching…" : games.length ? "Refresh matchups + pitchers" : "1 · Fetch matchups + pitchers"),
             games.length > 0 && isToday && (React.createElement("button", { className: "ing-run small ghosty", onClick: refreshWeather, disabled: !!busy, title: "Re-fetch game-time weather without spending an odds credit" }, busy === "wx" ? "Checking sky…" : "Refresh weather")),
@@ -7133,6 +7300,35 @@ const CSS = `
   .ing-hero { padding: 22px 18px 18px; }
   .ing-hero-rail strong { font-size: 19px; }
   .ing-ev { padding: 16px; }
+}
+
+/* ---- one-tap morning refresh (v2.1) ---- */
+.mr-cta { width: 100%; display: flex; align-items: center; justify-content: center; gap: 10px; font-family: 'Archivo'; font-weight: 700; font-size: 13px; letter-spacing: 0.12em; text-transform: uppercase; background: linear-gradient(135deg, var(--phos) 0%, #6ff0c4 100%); color: var(--field); border: none; padding: 17px; border-radius: 12px; cursor: pointer; box-shadow: 0 0 26px rgba(52,230,168,0.3); transition: box-shadow 0.2s, transform 0.15s; }
+.mr-cta:hover:not(:disabled) { box-shadow: 0 0 38px rgba(52,230,168,0.5); transform: translateY(-1px); }
+.mr-cta:disabled { opacity: 0.75; cursor: wait; transform: none; }
+.mr-cta small { display: block; font-family: 'Space Grotesk'; font-size: 10.5px; font-weight: 400; letter-spacing: 0.02em; text-transform: none; opacity: 0.72; margin-top: 3px; }
+.mr-panel { margin-top: 14px; background: var(--field2); border: 1px solid var(--line); border-radius: 13px; padding: 16px 18px; }
+.mr-steps { list-style: none; margin: 0; padding: 0; }
+.mr-step { display: grid; grid-template-columns: 20px 1fr auto; gap: 11px; align-items: baseline; padding: 10px 0; border-bottom: 1px solid rgba(28,51,41,0.55); }
+.mr-step:last-child { border-bottom: none; }
+.mr-ic { font-size: 13px; line-height: 1.3; text-align: center; }
+.mr-step.wait .mr-ic, .mr-step.skip .mr-ic { color: var(--ink-dim); opacity: 0.55; }
+.mr-step.run .mr-ic { color: var(--phos); animation: mrpulse 1s ease-in-out infinite; }
+.mr-step.ok .mr-ic { color: var(--phos); }
+.mr-step.warn .mr-ic { color: var(--amber); }
+.mr-step.fail .mr-ic { color: var(--rust); }
+@keyframes mrpulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+.mr-label { font-size: 13.5px; font-weight: 500; color: var(--ink); min-width: 0; }
+.mr-step.wait .mr-label { color: var(--ink-dim); }
+.mr-label em { display: block; font-style: normal; font-size: 10.5px; color: var(--ink-dim); margin-top: 2px; }
+.mr-note { font-size: 11.5px; color: var(--ink-dim); text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.mr-step.ok .mr-note { color: var(--phos); }
+.mr-step.warn .mr-note { color: var(--amber); }
+.mr-step.fail .mr-note { color: var(--rust); white-space: normal; }
+.mr-sum { margin-top: 13px; padding-top: 12px; border-top: 1px solid var(--line); font-size: 12.5px; line-height: 1.6; color: var(--ink); }
+@media (max-width: 560px) {
+  .mr-step { grid-template-columns: 18px 1fr; }
+  .mr-note { grid-column: 2; text-align: left; white-space: normal; margin-top: 3px; }
 }
 
 /* ---- bullpen board (v1.7) ---- */
