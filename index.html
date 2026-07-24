@@ -1833,6 +1833,9 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
 // what's actually deployed. Newest first.
 // ===========================================================================
 const CHANGELOG = [
+    { date: "2026-07-24e", items: [
+            "FIXED — the real cause of '0 of 300 matched.' It wasn't the roster sync (that was verified working, and correctly). It was that copying this specific FantasyPros table on mobile drops the frozen '#'/'Player' column HEADERS while every row still carries their data — so every stat column read one or two positions off, and the name field ended up reading a rank number or garbage instead of an actual player name. Nothing could ever match, because nothing being compared was really a name. The importer now detects this exact shape (every present header label is real, but the first data row starts with a rank number followed by a \"Name (TEAM - POS)\" cell) and restores the missing header before parsing. Verified against the actual pasted data: all rows parse, names are clean, and team codes resolve correctly, including names with commas in their position list (e.g. \"1B,LF,RF\") which no longer break the split. Same fix covers the pitcher tables.",
+        ] },
     { date: "2026-07-24d", items: [
             "FIXED — 'MLB rosters synced' could report success even when the save silently failed. refreshMlbRosterMap fired the storage write and reported success based purely on the in-memory fetch count, never checking whether the write actually landed — the same failure shape as an earlier bullpen-fatigue bug. If the browser's storage was near its limit, the sync could say '545 players' while the matching pool was actually empty, which is exactly what makes a stats paste come back '0 of 300 matched' right after a sync that looked clean. Both the sync button and the auto-fill-hands button now verify the write and report the real reason when it fails, instead of a false-positive success.",
         ] },
@@ -4288,9 +4291,30 @@ function normalizeFangraphsPaste(text) {
         }
     }
     // ---- shape C: whole rows, space separated ----
-    const headTokens = lines[0].split(/\s+/).filter(Boolean);
-    const lowerHead = headTokens.map((t) => t.toLowerCase());
-    const nameIdx = lowerHead.indexOf("name") !== -1 ? lowerHead.indexOf("name") : lowerHead.indexOf("player");
+    let headTokens = lines[0].split(/\s+/).filter(Boolean);
+    let lowerHead = headTokens.map((t) => t.toLowerCase());
+    let nameIdx = lowerHead.indexOf("name") !== -1 ? lowerHead.indexOf("name") : lowerHead.indexOf("player");
+    // REPAIR: copying a two-pane table (a frozen rank/name column beside
+    // scrollable stat columns — FantasyPros renders exactly this way) can drop
+    // the frozen column's HEADER text on mobile while every row still carries
+    // its DATA. That leaves a header entirely missing "#"/"Player" while every
+    // data row still starts with a rank number and a name — every column then
+    // reads one or two positions off, which is why parsing "succeeds" (numbers
+    // exist somewhere) but the name comes out as garbage and nothing matches.
+    // Detect it from the shape alone: every header token we DO have is a real
+    // stat label, and the first data line starts with a rank number followed by
+    // a "Name (TEAM - POS)" cell — then restore the header that should be there.
+    if (nameIdx === -1 && headTokens.length && headTokens.every(fgIsLabel)) {
+        const firstDataLine = lines[1] || "";
+        const rankMatch = firstDataLine.match(/^(\d+)\s+(.+)$/);
+        const afterRank = rankMatch ? rankMatch[2] : "";
+        const looksLikeNameCell = /^.+?\([A-Za-z]{2,4}\s*[-\u2013]\s*[^)]*\)/.test(afterRank);
+        if (rankMatch && looksLikeNameCell) {
+            headTokens = ["#", "player", ...headTokens];
+            lowerHead = headTokens.map((t) => t.toLowerCase());
+            nameIdx = 1;
+        }
+    }
     if (nameIdx === -1 || !headTokens.every(fgIsLabel))
         return raw;
     const teamIdx = lowerHead.indexOf("team");
