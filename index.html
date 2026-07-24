@@ -1833,6 +1833,10 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
 // what's actually deployed. Newest first.
 // ===========================================================================
 const CHANGELOG = [
+    { date: "2026-07-24h", items: [
+            "FIXED \u2014 opening a game from the board loaded the wrong matchup. The Terminal restores your last session on mount, and that restore runs several storage reads after it hands teams to the rest of the screen. The handoff fires as soon as teams land, so the restore finished afterwards and silently replaced the game you'd just opened: the banner said Cubs @ Pirates while the form showed the previous matchup. An explicit handoff from the board now wins \u2014 the session restore is skipped entirely when you arrive from a game.",
+            "Slate controls consolidated to two buttons. Morning refresh does the six chores; Scan the slate does the read, and now says how many games it will actually run and why it's disabled when it can't. Everything else \u2014 the individual refreshes, odds import, paste box and the destructive full rebuild \u2014 moved behind an 'Individual steps' drawer that starts closed. Nothing was removed, and the stale '1 \u00b7' / '2 \u00b7' / '3 \u00b7' numbering is gone now that the order isn't something you have to follow by hand.",
+        ] },
     { date: "2026-07-24g", items: [
             "One-tap morning refresh. Six chores that used to be separate taps with separate failure messages now run as a single pass, in dependency order: MLB rosters \u2192 pitcher hands \u2192 board and probable starters \u2192 market lines \u2192 weather \u2192 bullpen workload. A live checklist shows each step as it runs and what it actually loaded. Only the odds step spends an API request, and it's labelled as such.",
             "Steps are independent by design. One failure marks that step and the run continues rather than dropping everything after it \u2014 a dead weather service shouldn't cost you the bullpen read. Steps that genuinely depend on an earlier one (handedness needs rosters; weather needs a board) skip with the reason stated instead of failing silently.",
@@ -2050,8 +2054,13 @@ function Terminal({ onHome, pendingGame, onPendingConsumed }) {
             const dayBoard = await store.get("ingenuity:slate:day", null);
             if (dayBoard && dayBoard.date === etDayKey())
                 setDaySlate(dayBoard);
-            // restore last matchup setup so a session picks up where it left off
-            const last = await store.get("ingenuity:lastMatchup", null);
+            // Restore the last matchup so a session picks up where it left off — but
+            // NOT when a game was just handed over from the board. This effect calls
+            // setTeams and then awaits several more reads before it gets here, so the
+            // handoff (which fires as soon as teams land) would already have set the
+            // matchup and this restore would silently replace it: the banner said one
+            // game while the form showed another. An explicit handoff always wins.
+            const last = pendingGame ? null : await store.get("ingenuity:lastMatchup", null);
             if (last) {
                 if (last.park)
                     setPark(last.park);
@@ -5206,6 +5215,7 @@ function SlateHub({ onOpenInTerminal }) {
     const [acc, setAcc] = useState(null);
     const [detailGame, setDetailGame] = useState(null);
     const [morning, setMorning] = useState(null); // one-tap refresh: per-step progress
+    const [stepsOpen, setStepsOpen] = useState(false); // individual-step drawer
     const [gradeMsg, setGradeMsg] = useState("");
     const [grading, setGrading] = useState(false);
     // Every board is archived under its own date. Nothing a day produced is ever
@@ -6167,17 +6177,22 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
                         React.createElement("span", { className: "mr-note" }, st.note)));
                 })),
                 morning.summary && React.createElement("p", { className: "mr-sum" }, morning.summary))))),
-        React.createElement("div", { className: "slate-controls" },
-            React.createElement("button", { className: "ing-run small", onClick: fetchMatchups, disabled: !!busy || !isToday, title: isToday ? "" : "Live fetch only applies to today's board" }, busy === "fetch" ? "Fetching…" : games.length ? "Refresh matchups + pitchers" : "1 · Fetch matchups + pitchers"),
+        React.createElement("button", { className: "mr-cta scan", onClick: scan, disabled: !!busy || !withOdds || !!morning?.running }, busy === "scan" ? "Scanning the board\u2026" : (React.createElement("span", null,
+            "Scan the slate",
+            React.createElement("small", null, withOdds ? `${withOdds} game${withOdds === 1 ? "" : "s"} with a line \u2014 8k sims each, flags 4+ pt gaps` : "Needs at least one game with a total")))),
+        React.createElement("button", { className: "slate-more", onClick: () => setStepsOpen(!stepsOpen), "aria-expanded": stepsOpen },
+            stepsOpen ? "Hide individual steps" : "Individual steps",
+            React.createElement("em", null, stepsOpen ? "" : "run one at a time, or import odds by hand")),
+        stepsOpen && (React.createElement("div", { className: "slate-controls" },
+            React.createElement("button", { className: "ing-run small", onClick: fetchMatchups, disabled: !!busy || !isToday, title: isToday ? "" : "Live fetch only applies to today's board" }, busy === "fetch" ? "Fetching…" : games.length ? "Refresh matchups + pitchers" : "Fetch matchups + pitchers"),
             games.length > 0 && isToday && (React.createElement("button", { className: "ing-run small ghosty", onClick: refreshWeather, disabled: !!busy, title: "Re-fetch game-time weather without spending an odds credit" }, busy === "wx" ? "Checking sky…" : "Refresh weather")),
             isToday && (React.createElement("button", { className: "ing-run small ghosty", onClick: refreshPenFatigue, disabled: !!busy, title: "Read the last 3 days of box scores to see which bullpens are short tonight (free, no odds credit)" }, busy === "pen" ? "Reading box scores…" : "Bullpen workload")),
             games.length > 0 && isToday && (React.createElement("button", { className: "ing-run small ghosty warn", onClick: refreshSlate, disabled: !!busy, title: "Clear today's board and pull everything fresh (uses one odds credit)" }, busy === "refresh" ? "Rebuilding…" : "↻ Refresh slate")),
             React.createElement("label", { className: "slate-filebtn" },
-                busy === "vision" ? "Reading…" : "2 · Import odds (screenshot / file)",
+                busy === "vision" ? "Reading…" : "Import odds (screenshot / file)",
                 React.createElement("input", { key: inputKey, type: "file", accept: ".csv,.txt,image/*", onChange: (e) => stageFile(e.target.files[0]), disabled: !!busy, hidden: true })),
             React.createElement("button", { className: "ing-ghost", onClick: () => setPasteOpen(!pasteOpen) }, pasteOpen ? "hide paste" : "…or paste odds"),
-            React.createElement("button", { className: "ing-ghost", onClick: () => setLiveOpen(!liveOpen) }, liveOpen ? "hide" : "⚡ live feed?"),
-            React.createElement("button", { className: "ing-run small", onClick: scan, disabled: !!busy || !withOdds }, busy === "scan" ? "Scanning…" : "3 · Scan the slate")),
+            React.createElement("button", { className: "ing-ghost", onClick: () => setLiveOpen(!liveOpen) }, liveOpen ? "hide" : "⚡ live feed?"))),
         staged && (React.createElement("div", { className: "ing-staged" },
             staged.url && React.createElement("img", { src: staged.url, alt: "staged", className: "ing-staged-thumb" }),
             React.createElement("span", { className: "ing-staged-name" }, staged.name),
@@ -7330,6 +7345,14 @@ const CSS = `
   .mr-step { grid-template-columns: 18px 1fr; }
   .mr-note { grid-column: 2; text-align: left; white-space: normal; margin-top: 3px; }
 }
+
+/* two-primary slate layout (v2.2) */
+.mr-cta.scan { margin-top: 12px; background: linear-gradient(135deg, #5fd9e8 0%, #8fe8f2 100%); box-shadow: 0 0 26px rgba(95,217,232,0.28); }
+.mr-cta.scan:hover:not(:disabled) { box-shadow: 0 0 38px rgba(95,217,232,0.46); }
+.mr-cta:disabled { background: var(--field2); color: var(--ink-dim); box-shadow: none; border: 1px solid var(--line); }
+.slate-more { width: 100%; margin-top: 12px; background: transparent; border: 1px dashed var(--line); color: var(--ink-dim); border-radius: 10px; padding: 12px; cursor: pointer; font-family: 'Archivo'; font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; transition: color 0.15s, border-color 0.15s; }
+.slate-more:hover { color: var(--ink); border-color: var(--ink-dim); }
+.slate-more em { display: block; font-style: normal; font-family: 'Space Grotesk'; font-size: 11px; letter-spacing: 0.01em; text-transform: none; opacity: 0.75; margin-top: 4px; }
 
 /* ---- bullpen board (v1.7) ---- */
 .pen { border: 1px solid var(--line); border-radius: 12px; background: var(--field2); overflow: hidden; margin-bottom: 16px; }
