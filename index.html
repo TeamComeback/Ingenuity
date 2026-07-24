@@ -1172,6 +1172,73 @@ const SPORT_NAMES = { B: "MLB", b: "MLB", A: "NFL", F: "NFL", S: "SOC", I: "NHL"
 // ---- slate scanner utilities ----
 const normName = (x) => (x || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/\./g, "").replace(/\b(jr|sr|ii|iii|iv)\b/g, "").replace(/[^a-z ]/g, " ").replace(/\s+/g, " ").trim();
 // Match a schedule/full name ("Chicago Cubs") to a DB team ("Cubs")
+// v2.3 — fold duplicate team records into one. A bug in the lineup save matched
+// team names by exact string, so MLB's "Colorado Rockies" never matched the
+// stored "Rockies" and a second record was created carrying only OBP/SLG
+// lineup estimates. Two records for one club is worse than untidy: a projection
+// can bind to whichever it finds first, so the same game could price off real
+// imported stats or off estimates depending on ordering. This merges them onto
+// the canonical name, and a REAL stat always beats an estimate regardless of
+// which record it came from.
+function dedupeTeams(teams) {
+    const byCanon = new Map();
+    let merged = 0;
+    const realer = (a, b) => {
+        // prefer a value that exists and isn't flagged as an estimate
+        if (!b)
+            return a;
+        if (!a)
+            return b;
+        const aEst = !!a.est, bEst = !!b.est;
+        if (aEst !== bEst)
+            return aEst ? b : a;
+        const av = parseFloat(a.woba ?? a.xwoba), bv = parseFloat(b.woba ?? b.xwoba);
+        if (isNaN(av) && !isNaN(bv))
+            return b;
+        return a;
+    };
+    const mergeList = (x = [], y = []) => {
+        const out = [], idx = new Map();
+        for (const p of [...x, ...y]) {
+            const k = normName(p.name);
+            if (!k)
+                continue;
+            if (idx.has(k))
+                out[idx.get(k)] = realer(out[idx.get(k)], p);
+            else {
+                idx.set(k, out.length);
+                out.push(p);
+            }
+        }
+        return out;
+    };
+    for (const t of teams) {
+        const canon = resolveTeamName(t.name) || t.name;
+        const k = normName(canon);
+        if (!byCanon.has(k)) {
+            byCanon.set(k, { ...t, name: canon });
+            continue;
+        }
+        merged++;
+        const a = byCanon.get(k);
+        // field-level: keep whichever record actually has the value
+        const pick = (f) => {
+            const av = a[f], bv = t[f];
+            const has = (v) => v !== "" && v != null && !(typeof v === "number" && isNaN(v));
+            return has(av) ? av : (has(bv) ? bv : av);
+        };
+        const out = { ...a };
+        for (const f of ["off", "xoff", "pa", "recent", "recentPA", "recentBbk", "offVsL", "paVsL", "offVsR", "paVsR",
+            "pen", "penBf", "penBarrel", "penHardHit", "oaa", "framing", "penFatigue", "penFatigueAsOf",
+            "penFatigueDetail", "lineup", "lineupAsOf", "splitsAsOf"])
+            out[f] = pick(f);
+        out.players = mergeList(a.players, t.players);
+        out.rotation = mergeList(a.rotation, t.rotation);
+        out.penArms = (a.penArms && a.penArms.length) ? a.penArms : (t.penArms || []);
+        byCanon.set(k, out);
+    }
+    return { teams: [...byCanon.values()], merged };
+}
 function matchTeamDb(name, teams) {
     const n = normName(name);
     let best = null;
@@ -1833,6 +1900,11 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
 // what's actually deployed. Newest first.
 // ===========================================================================
 const CHANGELOG = [
+    { date: "2026-07-24i", items: [
+            "FIXED \u2014 saving a lineup created a duplicate club. MLB's feed says 'Colorado Rockies'; the database stores 'Rockies'. The save matched on an exact string, missed, and pushed a SECOND record carrying only OBP/SLG lineup estimates \u2014 sitting alongside the real one with your imported stats. That's worse than untidy: a projection binds to whichever record it finds first, so the same game could price off real numbers or off estimates depending on ordering. Both the lineup save and the JSON paste import now resolve to the canonical club name before matching.",
+            "Duplicates already in your database are merged automatically on load. The two records fold into one under the canonical nickname, rosters are unioned, and a REAL stat always beats a lineup estimate regardless of which record it came from \u2014 so the cleanup can't quietly downgrade a team. The pass is idempotent and only writes when it actually changed something.",
+            "Note on scope: the morning refresh pulls probable STARTERS, not batting orders. Orders don't post until roughly 2\u20134 hours before first pitch, so a morning run would only ever capture yesterday's. Batting orders stay on the Lineups screen, where they're day-stamped, and are worth a second pass closer to game time.",
+        ] },
     { date: "2026-07-24h", items: [
             "FIXED \u2014 opening a game from the board loaded the wrong matchup. The Terminal restores your last session on mount, and that restore runs several storage reads after it hands teams to the rest of the screen. The handoff fires as soon as teams land, so the restore finished afterwards and silently replaced the game you'd just opened: the banner said Cubs @ Pirates while the form showed the previous matchup. An explicit handoff from the board now wins \u2014 the session restore is skipped entirely when you arrive from a game.",
             "Slate controls consolidated to two buttons. Morning refresh does the six chores; Scan the slate does the read, and now says how many games it will actually run and why it's disabled when it can't. Everything else \u2014 the individual refreshes, odds import, paste box and the destructive full rebuild \u2014 moved behind an 'Individual steps' drawer that starts closed. Nothing was removed, and the stale '1 \u00b7' / '2 \u00b7' / '3 \u00b7' numbering is gone now that the order isn't something you have to follow by hand.",
@@ -2045,9 +2117,11 @@ function Terminal({ onHome, pendingGame, onPendingConsumed }) {
             const seedVer = await store.get("ingenuity:seedVersion", 0);
             const force = seedVer !== CFG.SEED_VERSION; // stats refresh shipped
             const { merged, changed } = mergeSeedRosters(migrated, force);
-            setTeams(merged);
-            if (changed)
-                await store.set("ingenuity:teams", merged);
+            // Collapse any duplicate club records left by the old exact-name match.
+            const dd = dedupeTeams(merged);
+            setTeams(dd.teams);
+            if (changed || dd.merged)
+                await store.set("ingenuity:teams", dd.teams);
             if (force)
                 await store.set("ingenuity:seedVersion", CFG.SEED_VERSION);
             // today's board feeds the one-tap game picker
@@ -2682,8 +2756,13 @@ function LineupFetcher({ teams, saveTeams }) {
     // keep the full roster, and only estimate for players we've never seen.
     const importTeam = (t) => {
         const next = [...teams];
-        const i = next.findIndex((x) => x.name.toLowerCase() === t.name.toLowerCase());
-        const base = i >= 0 ? next[i] : { ...EMPTY_TEAM, name: t.name };
+        // MLB's feed says "Colorado Rockies"; the database stores "Rockies". An
+        // exact string compare misses, which used to push a SECOND team with only
+        // lineup estimates on it — sitting alongside the real one with your
+        // imported stats. Resolve to the canonical name before matching.
+        const canon = resolveTeamName(t.name) || t.name;
+        const i = next.findIndex((x) => normName(x.name) === normName(canon));
+        const base = i >= 0 ? next[i] : { ...EMPTY_TEAM, name: canon };
         const roster = [...(base.players || [])];
         const byName = new Map(roster.map((p, idx) => [normName(p.name), idx]));
         const isReal = (p) => p && !p.est && p.woba !== "" && p.woba != null && !isNaN(parseFloat(p.woba));
@@ -2748,8 +2827,9 @@ function LineupFetcher({ teams, saveTeams }) {
             for (const raw of arr) {
                 if (!raw.name)
                     continue;
-                const i = next.findIndex((x) => x.name.toLowerCase() === String(raw.name).toLowerCase());
-                const base = i >= 0 ? next[i] : { ...EMPTY_TEAM };
+                const canon = resolveTeamName(raw.name) || String(raw.name);
+                const i = next.findIndex((x) => normName(x.name) === normName(canon));
+                const base = i >= 0 ? next[i] : { ...EMPTY_TEAM, name: canon };
                 const merged = { ...base, ...raw, players: raw.players || base.players || [], rotation: raw.rotation || base.rotation || [] };
                 if (i >= 0)
                     next[i] = merged;
@@ -5237,9 +5317,10 @@ function SlateHub({ onOpenInTerminal }) {
             const raw = await store.get("ingenuity:teams", []);
             const migrated = raw.map((x) => ({ ...EMPTY_TEAM, ...x, players: x.players || [], rotation: x.rotation || [] }));
             const { merged, changed } = mergeSeedRosters(migrated, false);
-            if (changed)
-                await store.set("ingenuity:teams", merged);
-            setTeams(merged);
+            const dd = dedupeTeams(merged);
+            if (changed || dd.merged)
+                await store.set("ingenuity:teams", dd.teams);
+            setTeams(dd.teams);
             setApiKey(await store.get("ingenuity:oddsapi:key", ""));
             const arch = await store.get("ingenuity:slate:archive", {});
             const day = await store.get("ingenuity:slate:day", null);
@@ -6333,7 +6414,8 @@ function BetOfTheDay() {
         (async () => {
             const raw = await store.get("ingenuity:teams", []);
             const migrated = raw.map((x) => ({ ...EMPTY_TEAM, ...x, players: x.players || [], rotation: x.rotation || [] }));
-            const { merged } = mergeSeedRosters(migrated, false);
+            const { merged: seeded } = mergeSeedRosters(migrated, false);
+            const merged = dedupeTeams(seeded).teams;
             setTeams(merged);
             await loadSlate();
             const saved = await store.get("ingenuity:botd", null);
