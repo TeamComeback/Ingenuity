@@ -1493,7 +1493,7 @@ function App() {
             React.createElement("div", { className: "home-brand" },
                 React.createElement("span", { className: "ing-logo big" }, "\u25C6"),
                 React.createElement("h1", null, "INGENUITY"),
-                React.createElement("p", null, "MLB totals research suite \u00B7 projection engine v1.7 \u00B7 honest bookkeeping")),
+                React.createElement("p", null, "MLB totals research suite \u00B7 projection engine v1.7 \u00B7 UI v1.9 \u00B7 honest bookkeeping")),
             React.createElement("div", { className: "home-cards" },
                 React.createElement("button", { className: "home-card", onClick: () => setView("terminal") },
                     React.createElement("span", { className: "home-card-glyph" }, "\u03A3"),
@@ -1825,6 +1825,11 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
 // what's actually deployed. Newest first.
 // ===========================================================================
 const CHANGELOG = [
+    { date: "2026-07-24", items: [
+            "FIXED — the projection page was laying out sideways. The output column was a flex row with no direction set, so anything sitting beside the readout (the handoff banner, the bullpen board) was pushed into a column next to it and got clipped, and the page scrolled horizontally. It stacks now, with real space between blocks.",
+            "Projection readout rebuilt with room to breathe. The total is now a hero panel with a luminous top edge and a figure that scales to the screen instead of a fixed 64px, and underneath it a rail showing Book, Median, and — new — the Gap, so the distance between the model and the book is a number you read rather than subtraction you do in your head (green over, cyan under, grey when it's inside half a run). Model-vs-book rows were a three-column grid that squeezed 'model 55.1% · book implies 54.5%' into a sliver; the price and EV now share a top line and the probabilities get a full line under it. Every figure uses tabular numerals so columns line up. Panels are larger and rounder, spacing roughly doubled.",
+            "Stylesheet cleaned: 47 dead rules removed — the old bar-chart styling left over from the distribution rebuild, plus the superseded hero and probability rules that were being overridden anyway.",
+        ] },
     { date: "2026-07-23d", items: [
             "FIXED — the hosted build was writing to the wrong storage. A rebuild had carried the artifact's window.storage API into the hosted file; that object doesn't exist on a normal web page, so every read came back empty and every write was silently dropped. Restored to localStorage, and the build now refuses to produce a hosted file that references window.storage or lacks localStorage.",
             "Storage failures are no longer silent. store.set() now reports whether the write actually landed and names the reason when it doesn't (a full browser quota being the usual one). A dropped write used to be indistinguishable from success — the exact failure mode this app is supposed to refuse.",
@@ -3190,17 +3195,30 @@ function Readout({ r, onLog, logMsg }) {
         }
     }
     return (React.createElement("div", { className: "ing-readout" },
-        React.createElement("div", { className: "ing-bignum" },
-            React.createElement("div", { className: "ing-total" },
-                React.createElement("span", { className: "ing-total-val" }, r.mean.toFixed(2)),
-                React.createElement("span", { className: "ing-total-label" }, "projected total")),
-            React.createElement("div", { className: "ing-vs-line" },
-                React.createElement("span", null,
-                    "book ",
-                    r.line),
-                React.createElement("span", { className: "ing-med" },
-                    "median ",
-                    r.median.toFixed(1)))),
+        React.createElement("div", { className: "ing-hero" },
+            React.createElement("div", { className: "ing-hero-main" },
+                React.createElement("span", { className: "ing-hero-label" }, "Projected total"),
+                React.createElement("span", { className: "ing-hero-val" }, r.mean.toFixed(2))),
+            React.createElement("div", { className: "ing-hero-rail" },
+                React.createElement("div", null,
+                    React.createElement("em", null, "Book"),
+                    React.createElement("strong", null, r.line)),
+                React.createElement("div", null,
+                    React.createElement("em", null, "Median"),
+                    React.createElement("strong", null, r.median.toFixed(1))),
+                (() => {
+                    // The gap is the whole point of the screen — show it, don't make it
+                    // a subtraction the reader has to do in their head.
+                    const d = r.mean - parseFloat(r.line);
+                    if (isNaN(d))
+                        return null;
+                    const k = Math.abs(d) < 0.5 ? "flat" : d > 0 ? "over" : "under";
+                    return React.createElement("div", null,
+                        React.createElement("em", null, "Gap"),
+                        React.createElement("strong", { className: "ing-hero-gap " + k },
+                            d > 0 ? "+" : "",
+                            d.toFixed(2)));
+                })())),
         (r.awayStarter || r.homeStarter) && (React.createElement("p", { className: "ing-matchup-sp" },
             r.awayStarter || "TBD",
             " v ",
@@ -3209,22 +3227,29 @@ function Readout({ r, onLog, logMsg }) {
         evRows.length > 0 && (React.createElement("div", { className: "ing-ev" },
             React.createElement("div", { className: "ing-tt-head" }, "Model vs book (per $100)"),
             evRows.map((e, i) => (React.createElement("div", { className: "ing-ev-row", key: i },
-                React.createElement("span", { className: "ing-ev-label" },
-                    e.label,
-                    " ",
-                    React.createElement("em", null,
-                        e.price > 0 ? "+" : "",
-                        e.price)),
-                React.createElement("span", { className: "ing-ev-probs" },
-                    "model ",
-                    e.p.toFixed(1),
-                    "% \u00B7 book implies ",
-                    e.implied.toFixed(1),
-                    "%"),
-                React.createElement("span", { className: `ing-ev-val ${e.ev > 0 ? "pos" : "neg"}` },
-                    e.ev > 0 ? "+" : "",
-                    "$",
-                    e.ev.toFixed(1))))),
+                React.createElement("div", { className: "ing-ev-top" },
+                    React.createElement("span", { className: "ing-ev-label" },
+                        e.label,
+                        " ",
+                        React.createElement("em", null,
+                            e.price > 0 ? "+" : "",
+                            e.price)),
+                    React.createElement("span", { className: `ing-ev-val ${e.ev > 0 ? "pos" : "neg"}` },
+                        e.ev > 0 ? "+" : "",
+                        "$",
+                        e.ev.toFixed(1))),
+                React.createElement("div", { className: "ing-ev-probs" },
+                    React.createElement("span", null,
+                        "model ",
+                        React.createElement("b", null,
+                            e.p.toFixed(1),
+                            "%")),
+                    React.createElement("span", { className: "ing-ev-sep" }),
+                    React.createElement("span", null,
+                        "book implies ",
+                        React.createElement("b", null,
+                            e.implied.toFixed(1),
+                            "%")))))),
             devig && (React.createElement("div", { className: "ing-devig" },
                 "No-vig book opinion: Over ",
                 (devig.fairOver * 100).toFixed(1),
@@ -6745,16 +6770,9 @@ const CSS = `
 .ing-sp-note { font-size: 11.5px; color: var(--phos); margin: -4px 0 12px; }
 .ing-sp-note.warn { color: var(--amber); }
 .ing-matchup-sp { font-size: 12.5px; color: var(--cyan); margin: -8px 0 14px; }
-.ing-ev { background: var(--field2); border: 1px solid var(--line); border-radius: 11px; padding: 14px 16px; margin-bottom: 18px; }
-.ing-ev-row { display: grid; grid-template-columns: auto 1fr auto; gap: 12px; align-items: baseline; padding: 7px 0; border-top: 1px solid var(--line); }
 .ing-ev-row:first-of-type { border-top: none; }
-.ing-ev-label { font-weight: 600; font-size: 13.5px; }
-.ing-ev-label em { font-style: normal; color: var(--ink-dim); font-size: 12px; margin-left: 5px; }
-.ing-ev-probs { font-size: 11.5px; color: var(--ink-dim); text-align: right; }
-.ing-ev-val { font-family: 'Archivo'; font-weight: 700; font-size: 17px; }
 .ing-ev-val.pos { color: var(--phos); }
 .ing-ev-val.neg { color: var(--rust); }
-.ing-ev-note { font-size: 11px; color: var(--ink-dim); margin-top: 9px; line-height: 1.5; }
 .ing-push-note { font-size: 11px; color: var(--amber); margin: -10px 0 18px; line-height: 1.5; }
 .ing-devig { font-size: 11.5px; color: var(--cyan); margin-top: 9px; padding-top: 9px; border-top: 1px dashed var(--line); }
 .ing-odds { display: flex; gap: 5px; align-items: stretch; }
@@ -6818,59 +6836,81 @@ const CSS = `
 .ing-run:disabled { opacity: 0.6; cursor: wait; }
 .ing-run.small { width: auto; padding: 11px 22px; margin-top: 0; }
 
-.ing-output { padding: 26px 28px; display: flex; align-items: flex-start; }
 .ing-empty { margin: auto; text-align: center; color: var(--ink-dim); max-width: 320px; }
 .ing-empty.small { margin: 20px 0; text-align: left; }
 .ing-empty-mark { font-size: 40px; color: var(--phos-dim); margin-bottom: 14px; }
 .ing-empty-sub { font-size: 12.5px; margin-top: 8px; color: var(--ink-dim); opacity: 0.75; }
 
-.ing-readout { width: 100%; animation: fadein 0.4s ease; }
 @keyframes fadein { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
-.ing-bignum { display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 16px; }
-.ing-total { display: flex; flex-direction: column; }
-.ing-total-val { font-family: 'Archivo'; font-weight: 700; font-size: 64px; line-height: 0.9; color: var(--phos); filter: drop-shadow(0 0 20px rgba(52,230,168,0.35)); letter-spacing: -0.02em; }
-.ing-total-label { font-size: 10px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--ink-dim); margin-top: 8px; }
-.ing-vs-line { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; font-size: 13px; color: var(--ink-dim); }
-.ing-med { font-size: 11px; }
-.ing-verdict { padding: 12px 15px; border-radius: 8px; font-size: 13.5px; margin-bottom: 18px; border-left: 3px solid; font-weight: 500; }
 .ing-verdict.flat { background: rgba(122,153,140,0.08); border-color: var(--ink-dim); color: var(--ink); }
 .ing-verdict.lean { background: rgba(245,196,81,0.08); border-color: var(--amber); color: #f3d68a; }
 .ing-verdict.strong { background: rgba(52,230,168,0.08); border-color: var(--phos); color: #8ff0cd; }
-.ing-probs { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 20px; }
-.ing-prob { background: var(--field2); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; display: flex; flex-direction: column; gap: 3px; }
-.ing-prob-label { font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--ink-dim); font-family: 'Archivo'; }
-.ing-prob-val { font-family: 'Archivo'; font-weight: 700; font-size: 28px; }
-.ing-prob-odds { font-size: 11.5px; color: var(--cyan); }
-.ing-curve { margin-bottom: 20px; }
 .ing-curve-head, .ing-tt-head { font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--ink-dim); font-family: 'Archivo'; margin-bottom: 10px; display: flex; justify-content: space-between; }
-.ing-curve-head span { color: var(--phos-dim); }
-.ing-bars { display: flex; align-items: flex-end; gap: 3px; height: 110px; padding: 0 2px; }
-.ing-bar-wrap { flex: 1; display: flex; flex-direction: column; align-items: center; height: 100%; justify-content: flex-end; gap: 5px; }
-.ing-bar { width: 100%; border-radius: 2px 2px 0 0; min-height: 2px; transition: height 0.5s cubic-bezier(0.2,0.8,0.2,1); opacity: 0.72; }
-/* under vs over shaded distinctly so the split around the line reads at a glance */
-.ing-bar[data-side="under"] { background: linear-gradient(to top, #2a6b8f, var(--cyan)); }
-.ing-bar[data-side="over"] { background: linear-gradient(to top, var(--phos-dim), var(--phos)); }
-.ing-bar[data-side="push"] { background: linear-gradient(to top, #8a7320, var(--amber)); }
-/* tails (outside the 80% range) dimmed + desaturated — the outlier zone */
-.ing-bar[data-tail="true"] { opacity: 0.34; }
-/* the book line: bright amber outline marker */
-.ing-bar[data-line="true"] { box-shadow: 0 0 0 1.5px var(--amber), 0 0 12px rgba(245,196,81,0.5); opacity: 1; }
-/* the mode (most likely total): full-strength + glow */
-.ing-bar[data-mode="true"] { opacity: 1; box-shadow: 0 0 14px rgba(52,230,168,0.55); }
-.ing-bar-mode { font-size: 8px; color: var(--phos); line-height: 1; margin-bottom: 2px; filter: drop-shadow(0 0 4px var(--phos-dim)); }
-.ing-bar-label { font-size: 8.5px; color: var(--ink-dim); font-family: 'Archivo'; }
-.ing-bar-label.dim { opacity: 0.45; }
-.ing-curve-legend { display: flex; flex-wrap: wrap; gap: 11px; margin-top: 11px; }
-.ing-curve-legend span { display: flex; align-items: center; gap: 5px; font-size: 10px; color: var(--ink-dim); font-family: 'Archivo'; letter-spacing: 0.04em; }
-.ing-curve-legend i { width: 11px; height: 11px; border-radius: 3px; display: inline-block; }
-.ing-curve-legend .lg-under { background: var(--cyan); }
-.ing-curve-legend .lg-over { background: var(--phos); }
-.ing-curve-legend .lg-line { box-shadow: inset 0 0 0 1.5px var(--amber); }
-.ing-curve-legend .lg-mode { background: var(--phos); box-shadow: 0 0 8px var(--phos-dim); }
-.ing-curve-legend .lg-tail { background: var(--ink-dim); opacity: 0.4; }
 .term-handoff { display: flex; align-items: flex-start; gap: 10px; background: rgba(52,230,168,0.07); border: 1px solid rgba(52,230,168,0.3); border-left: 3px solid var(--phos); border-radius: 9px; padding: 11px 13px; font-size: 12.5px; line-height: 1.5; color: var(--ink); margin-bottom: 14px; }
 .term-handoff button { margin-left: auto; background: transparent; border: none; color: var(--ink-dim); font-size: 17px; line-height: 1; cursor: pointer; padding: 0 2px; }
 .term-handoff button:hover { color: var(--ink); }
+
+/* ================= projection readout — v1.9 layout ================= */
+/* The output column was a flex ROW with no direction set, so anything added
+   beside the readout (handoff banner, bullpen board) laid out horizontally and
+   collided. It stacks now, with real space between blocks. */
+.ing-output { padding: 30px 30px 40px; display: flex; flex-direction: column; align-items: stretch; gap: 20px; min-width: 0; }
+.ing-readout { width: 100%; min-width: 0; animation: fadein 0.4s ease; display: flex; flex-direction: column; gap: 22px; }
+.ing-readout > * { margin-bottom: 0 !important; }
+
+/* hero — the number, then the three figures that give it meaning */
+.ing-hero {
+  position: relative; overflow: hidden;
+  background: linear-gradient(160deg, rgba(52,230,168,0.09) 0%, rgba(15,32,25,0.6) 55%, rgba(10,23,18,0.4) 100%);
+  border: 1px solid var(--line); border-radius: 16px; padding: 26px 24px 20px;
+}
+.ing-hero::before { content: ""; position: absolute; inset: 0 0 auto 0; height: 1px; background: linear-gradient(90deg, transparent, var(--phos), transparent); opacity: 0.85; }
+.ing-hero-main { display: flex; flex-direction: column; gap: 6px; }
+.ing-hero-label { font-family: 'Archivo'; font-size: 9.5px; letter-spacing: 0.24em; text-transform: uppercase; color: var(--ink-dim); }
+.ing-hero-val {
+  font-family: 'Archivo'; font-weight: 700; font-size: clamp(52px, 17vw, 82px); line-height: 0.86;
+  color: var(--phos); letter-spacing: -0.035em; font-variant-numeric: tabular-nums;
+  filter: drop-shadow(0 0 26px rgba(52,230,168,0.34));
+}
+.ing-hero-rail { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--line); }
+.ing-hero-rail > div { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.ing-hero-rail em { font-style: normal; font-family: 'Archivo'; font-size: 8.5px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--ink-dim); }
+.ing-hero-rail strong { font-family: 'Archivo'; font-weight: 700; font-size: 21px; color: var(--ink); font-variant-numeric: tabular-nums; }
+.ing-hero-gap.over { color: var(--phos); }
+.ing-hero-gap.under { color: var(--cyan); }
+.ing-hero-gap.flat { color: var(--ink-dim); }
+
+.ing-matchup-sp { font-size: 13.5px; color: var(--cyan); letter-spacing: 0.01em; }
+
+/* verdict band */
+.ing-verdict { padding: 16px 18px; border-radius: 12px; font-size: 14px; line-height: 1.5; border-left: 3px solid; font-weight: 500; }
+
+/* model vs book — label+value on top, probabilities underneath with room */
+.ing-ev { background: var(--field2); border: 1px solid var(--line); border-radius: 14px; padding: 18px 20px; }
+.ing-ev-row { display: flex; flex-direction: column; gap: 7px; padding: 14px 0; border-top: 1px solid var(--line); }
+.ing-ev-row:first-of-type { border-top: none; padding-top: 4px; }
+.ing-ev-top { display: flex; align-items: baseline; justify-content: space-between; gap: 14px; }
+.ing-ev-label { font-weight: 600; font-size: 15px; letter-spacing: 0.01em; }
+.ing-ev-label em { font-style: normal; color: var(--ink-dim); font-size: 13px; margin-left: 7px; font-variant-numeric: tabular-nums; }
+.ing-ev-probs { display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--ink-dim); flex-wrap: wrap; text-align: left; }
+.ing-ev-probs b { font-weight: 600; color: var(--ink); font-variant-numeric: tabular-nums; }
+.ing-ev-sep { width: 3px; height: 3px; border-radius: 50%; background: var(--ink-dim); opacity: 0.5; flex: none; }
+.ing-ev-val { font-family: 'Archivo'; font-weight: 700; font-size: 20px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ing-ev-note { font-size: 12px; color: var(--ink-dim); margin-top: 14px; line-height: 1.6; }
+
+/* over/under probability pair */
+.ing-probs { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.ing-prob { background: var(--field2); border: 1px solid var(--line); border-radius: 14px; padding: 18px; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.ing-prob-label { font-family: 'Archivo'; font-size: 9px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--ink-dim); }
+.ing-prob-val { font-family: 'Archivo'; font-weight: 700; font-size: 32px; color: var(--ink); font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }
+.ing-prob-odds { font-size: 12px; color: var(--cyan); font-variant-numeric: tabular-nums; }
+
+@media (max-width: 620px) {
+  .ing-output { padding: 22px 18px 34px; gap: 18px; }
+  .ing-hero { padding: 22px 18px 18px; }
+  .ing-hero-rail strong { font-size: 19px; }
+  .ing-ev { padding: 16px; }
+}
 
 /* ---- bullpen board (v1.7) ---- */
 .pen { border: 1px solid var(--line); border-radius: 12px; background: var(--field2); overflow: hidden; margin-bottom: 16px; }
