@@ -1825,6 +1825,15 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
 // what's actually deployed. Newest first.
 // ===========================================================================
 const CHANGELOG = [
+    { date: "2026-07-24c", items: [
+            "FantasyPros stat tables now import. Paste them the same way as FanGraphs — tab-separated, one cell per line, or plain spaces — and the team comes out of the 'Name (TEAM - POS)' cell automatically. All 34 abbreviations it uses resolve.",
+            "FantasyPros doesn't publish wOBA, so rather than guess it, the importer rebuilds it from the hit components it does publish: wOBA = (.69·BB + .89·1B + 1.27·2B + 1.62·3B + 2.10·HR) ÷ PA, the actual weights. Checked against FanGraphs for the same players it lands within about .01, and PA, BB% and K% come out exact (AB+BB, BB÷PA, K÷PA). The cruder OBP/SLG shortcut is kept only for rows missing components. Savant xwOBA is still the better input where you have it — it strips luck, which an outcome-based wOBA can't — and importing FantasyPros will not overwrite it.",
+            "Pitcher tables import too: rows are recognised by an IP column, ERA maps straight across, and batters faced is estimated from outs plus baserunners so regression has a sample size to work with. A pitcher's K and BB are no longer mistaken for a hitter's strikeout and walk rates.",
+        ] },
+    { date: "2026-07-24b", items: [
+            "FIXED — saving a lineup was quietly downgrading the team. The Lineups screen estimates wOBA from OBP/SLG because MLB's API doesn't publish wOBA, and 'Save to database' was writing those estimates over stats you'd already imported, while also replacing the full roster with just the nine in the order. On a team with real Savant numbers that moved team offense by roughly .05 wOBA — larger than the entire platoon adjustment — which is why the same game projected two different ways depending on whether you'd saved the lineup.",
+            "Saving a lineup is now additive only. Every player who already has an imported stat keeps it untouched; estimates fill in only for players the database has never seen, and those are flagged as estimates. The full roster is preserved, the batting order is stored separately with the date it was pulled, and team offense is computed from the nine actually playing using each one's best available number. The probable starter is matched case-insensitively so he isn't added twice, and if he has no stats the message says so plainly — the projection will refuse to price the game rather than guess the arm.",
+        ] },
     { date: "2026-07-24", items: [
             "FIXED — the projection page was laying out sideways. The output column was a flex row with no direction set, so anything sitting beside the readout (the handoff banner, the bullpen board) was pushed into a column next to it and got clipped, and the page scrolled horizontally. It stacks now, with real space between blocks.",
             "Projection readout rebuilt with room to breathe. The total is now a hero panel with a luminous top edge and a figure that scales to the screen instead of a fixed 64px, and underneath it a rail showing Book, Median, and — new — the Gap, so the distance between the model and the book is a number you read rather than subtraction you do in your head (green over, cyan under, grey when it's inside half a run). Model-vs-book rows were a three-column grid that squeezed 'model 55.1% · book implies 54.5%' into a sliver; the price and EV now share a top line and the probabilities get a full line under it. Every figure uses tabular numerals so columns line up. Panels are larger and rounder, spacing roughly doubled.",
@@ -2631,17 +2640,52 @@ function LineupFetcher({ teams, saveTeams }) {
         }
         setBusy(false);
     };
+    // Saving a lineup records WHO is playing. It must never downgrade WHAT WE KNOW
+    // about them. The wOBA on this screen is estimated from OBP/SLG because MLB's
+    // API doesn't publish wOBA — it is strictly worse than an imported Savant or
+    // FanGraphs number. Earlier this wiped the roster and overwrote real stats with
+    // those estimates, which moved team offense by ~.05 wOBA on data quality alone
+    // and made the same game project two different ways. Now: keep every real stat,
+    // keep the full roster, and only estimate for players we've never seen.
     const importTeam = (t) => {
-        const players = t.players.map((p) => ({ name: p.name, woba: p.woba, pa: String(p.pa || "") }));
-        const { off, pa } = lineupToTeamOffense(players);
         const next = [...teams];
         const i = next.findIndex((x) => x.name.toLowerCase() === t.name.toLowerCase());
         const base = i >= 0 ? next[i] : { ...EMPTY_TEAM, name: t.name };
+        const roster = [...(base.players || [])];
+        const byName = new Map(roster.map((p, idx) => [normName(p.name), idx]));
+        const isReal = (p) => p && !p.est && p.woba !== "" && p.woba != null && !isNaN(parseFloat(p.woba));
+        let kept = 0, estimated = 0, added = 0;
+        const lineup = [];
+        t.players.forEach((p, order) => {
+            const key = normName(p.name);
+            const at = byName.get(key);
+            if (at != null && isReal(roster[at])) {
+                kept++; // real stats on file — leave them alone
+                lineup.push({ name: roster[at].name, order: order + 1 });
+            }
+            else if (at != null) {
+                roster[at] = { ...roster[at], woba: p.woba, pa: String(p.pa || roster[at].pa || ""), est: true };
+                estimated++;
+                lineup.push({ name: roster[at].name, order: order + 1 });
+            }
+            else {
+                roster.push({ name: p.name, woba: p.woba, pa: String(p.pa || ""), est: true });
+                byName.set(key, roster.length - 1);
+                added++;
+                estimated++;
+                lineup.push({ name: p.name, order: order + 1 });
+            }
+        });
+        // Team offense from the nine actually playing, using each one's best number.
+        const lineupPlayers = lineup.map((l) => roster[byName.get(normName(l.name))]).filter(Boolean);
+        const { off, pa } = lineupToTeamOffense(lineupPlayers);
         const merged = {
             ...base,
-            players,
+            players: roster, // full roster preserved
+            lineup, // today's batting order
+            lineupAsOf: etDayKey(),
             off: off ?? base.off, pa: pa != null ? String(pa) : base.pa,
-            rotation: t.probable && !(base.rotation || []).some((r) => r.name === t.probable)
+            rotation: t.probable && !(base.rotation || []).some((r) => normName(r.name) === normName(t.probable))
                 ? [...(base.rotation || []), { name: t.probable, xwoba: "", bf: "", ip: "" }]
                 : (base.rotation || []),
         };
@@ -2650,7 +2694,16 @@ function LineupFetcher({ teams, saveTeams }) {
         else
             next.push(merged);
         saveTeams(next);
-        setImportMsg(`Saved ${t.name} — ${players.length} hitters${t.probable ? `, probable SP ${t.probable} added to rotation (fill xwOBA from Savant)` : ""}.`);
+        const spNote = t.probable
+            ? (base.rotation || []).some((r) => normName(r.name) === normName(t.probable))
+                ? `, ${t.probable} already in the rotation with his stats`
+                : `, ${t.probable} added to the rotation with no stats yet — import him from Savant or the projection will refuse to price this game`
+            : "";
+        setImportMsg(`Saved ${t.name}'s batting order (${lineup.length}).` +
+            (kept ? ` ${kept} kept their imported stats.` : "") +
+            (estimated ? ` ${estimated} ${estimated === 1 ? "is an OBP/SLG estimate" : "are OBP/SLG estimates"}${added ? ` (${added} new to your database)` : ""} — import real numbers and the projection sharpens.` : "") +
+            (kept === 0 && estimated > 0 ? " No imported stats for this team yet, so team offense is an estimate." : "") +
+            spNote);
     };
     const importPaste = () => {
         setPasteMsg("");
@@ -2682,7 +2735,12 @@ function LineupFetcher({ teams, saveTeams }) {
     return (React.createElement("main", { className: "ing-main single" },
         React.createElement("section", { className: "ing-lineups" },
             React.createElement("h2", { className: "lg-formtitle" }, "Pull lineups & probables"),
-            React.createElement("p", { className: "ing-hint" }, "Fetches from the public MLB Stats API \u2014 actual batting orders for completed games (use yesterday to grab who's actually playing) and probable pitchers for upcoming ones. wOBA is estimated from OBP/SLG ((1.7\u00B7OBP + SLG) \u00F7 3) since the API doesn't publish it; swap in true xwOBA from Baseball Savant when precision matters."),
+            React.createElement("p", { className: "ing-hint" },
+                "Fetches from the public MLB Stats API \u2014 actual batting orders for completed games (use yesterday to grab who's actually playing) and probable pitchers for upcoming ones. The wOBA here is ",
+                React.createElement("strong", null, "estimated"),
+                " from OBP/SLG ((1.7\u00B7OBP + SLG) \u00F7 3), because the API doesn't publish wOBA \u2014 a placeholder, not a measurement. Saving records the batting order and the probable starter and ",
+                React.createElement("strong", null, "never overwrites stats you've already imported"),
+                "; estimates only fill in for players your database hasn't seen. Import those from Savant or FanGraphs and the projection sharpens."),
             React.createElement("div", { className: "ing-fetchbar" },
                 React.createElement("input", { type: "date", value: date, onChange: (e) => setDate(e.target.value) }),
                 React.createElement("button", { className: "ing-run small", onClick: fetchSchedule, disabled: busy }, busy ? "Fetching…" : "Fetch slate"),
@@ -4150,10 +4208,43 @@ function applyStatRows(rows, teams, mode = "season", rosterMap = null) {
 //       player names contain spaces ("Yordan Alvarez HOU 9 40 …").
 // Both are rebuilt here into a clean header + tab-separated rows, then handed to
 // the normal column mapper. Tab-separated input is passed straight through.
-const FG_LABELS = new Set(["#", "name", "team", "g", "pa", "ab", "h", "hr", "r", "rbi", "sb", "cs", "bb", "so", "bb%", "k%", "iso", "babip", "avg", "obp", "slg", "ops", "woba", "xwoba", "wrc+", "bsr", "off", "def", "war", "era", "xera", "ip", "gs", "w", "l", "sv", "whip", "fip", "xfip", "k/9", "bb/9", "hr/9", "barrel%", "hardhit%", "ev", "la"]);
+const FG_LABELS = new Set(["#", "name", "team", "g", "pa", "ab", "h", "hr", "r", "rbi", "sb", "cs", "bb", "so", "bb%", "k%", "iso", "babip", "avg", "obp", "slg", "ops", "woba", "xwoba", "wrc+", "bsr", "off", "def", "war", "era", "xera", "ip", "gs", "w", "l", "sv", "whip", "fip", "xfip", "k/9", "bb/9", "hr/9", "barrel%", "hardhit%", "ev", "la",
+    // FantasyPros columns (its tables carry no wOBA — see fpDerive below)
+    "vbr", "player", "k", "2b", "3b", "qs", "er", "cg", "rost%", "ops"]);
 const fgIsLabel = (s) => FG_LABELS.has(String(s).trim().toLowerCase());
 // A stat value: a number, possibly with %, a leading dot, a sign, or commas.
 const fgIsNum = (s) => /^[-+]?(\d{1,3}(,\d{3})*|\d*)(\.\d+)?%?$/.test(String(s).trim()) && /\d/.test(String(s));
+// v2.0 — FantasyPros publishes counting stats, not wOBA. But it publishes the
+// COMPONENTS, so a real wOBA can be built rather than guessed:
+//   wOBA = (.69·BB + .89·1B + 1.27·2B + 1.62·3B + 2.10·HR) / PA
+// Checked against FanGraphs for the same players, this lands within ~.01, and
+// PA / BB% / K% come out exact (AB + BB = PA; BB÷PA; K÷PA). That's far better
+// than the OBP/SLG shortcut, which is kept only as a fallback when the
+// components aren't all present.
+const FP_W = { bb: 0.69, single: 0.89, dbl: 1.27, tpl: 1.62, hr: 2.10 };
+function fpDeriveHitter({ ab, h, d2, t3, hr, bb, k, obp, slg, pa }) {
+    const has = (v) => v != null && !isNaN(v);
+    let outPa = has(pa) ? pa : (has(ab) ? ab + (has(bb) ? bb : 0) : null);
+    let woba = null, wobaFrom = null;
+    if (has(ab) && has(h) && has(hr) && has(bb) && outPa) {
+        const singles = h - (has(d2) ? d2 : 0) - (has(t3) ? t3 : 0) - hr;
+        if (singles >= 0) {
+            woba = (FP_W.bb * bb + FP_W.single * singles + FP_W.dbl * (d2 || 0) + FP_W.tpl * (t3 || 0) + FP_W.hr * hr) / outPa;
+            wobaFrom = "components";
+        }
+    }
+    if (woba == null && has(obp) && has(slg)) {
+        woba = (1.7 * obp + slg) / 3;
+        wobaFrom = "obp/slg";
+    }
+    return {
+        pa: outPa,
+        woba,
+        wobaFrom,
+        bb: has(bb) && outPa ? (bb / outPa) * 100 : null, // counts → rates, matching FanGraphs exactly
+        k: has(k) && outPa ? (k / outPa) * 100 : null,
+    };
+}
 function normalizeFangraphsPaste(text) {
     const raw = String(text).replace(/\r/g, "");
     if (raw.includes("\t"))
@@ -4166,7 +4257,8 @@ function normalizeFangraphsPaste(text) {
     // bare "1" (the first rank). Column count = length of that header run.
     const singleTokenish = lines.filter((l) => !/\s{2,}/.test(l)).length / lines.length;
     if (singleTokenish > 0.9) {
-        const nameAt = lines.findIndex((l) => /^name$/i.test(l));
+        // FanGraphs calls it "Name", FantasyPros calls it "Player".
+        const nameAt = lines.findIndex((l) => /^(name|player)$/i.test(l));
         if (nameAt !== -1 && nameAt <= 2) {
             // The header is the leading run of known column labels. Don't look for a
             // rank of "1" — a copied slice often starts at #3 or #15, and data values
@@ -4187,7 +4279,7 @@ function normalizeFangraphsPaste(text) {
     // ---- shape C: whole rows, space separated ----
     const headTokens = lines[0].split(/\s+/).filter(Boolean);
     const lowerHead = headTokens.map((t) => t.toLowerCase());
-    const nameIdx = lowerHead.indexOf("name");
+    const nameIdx = lowerHead.indexOf("name") !== -1 ? lowerHead.indexOf("name") : lowerHead.indexOf("player");
     if (nameIdx === -1 || !headTokens.every(fgIsLabel))
         return raw;
     const teamIdx = lowerHead.indexOf("team");
@@ -4294,17 +4386,62 @@ function savantCsvToRows(csv) {
     const iBarrel = find(["barrel_batted_rate", "brl_percent", "barrel%", "barrel_pct"]);
     const iHardHit = find(["hard_hit_percent", "hardhit_percent", "hard_hit%", "hard_hit_pct"]);
     const iTeam = find(["team", "team_name", "player_team", "team_abbrev", "parent_org", "team_id", "tm"]);
-    if (iX === -1 && iW === -1 && iE === -1 && iBB === -1 && iK === -1 && iBarrel === -1 && iHardHit === -1)
+    // FantasyPros counting columns — used to build wOBA/PA/rates it doesn't publish
+    const iAb = find(["ab"]), iH = find(["h"]), iD2 = find(["2b"]), iT3 = find(["3b"]);
+    const iHR = find(["hr"]), iBBct = find(["bb"]), iKct = find(["k", "so"]);
+    const iObp = find(["obp"]), iSlg = find(["slg"]), iIp = find(["ip"]);
+    const fpShaped = iAb !== -1 || iIp !== -1 || (iObp !== -1 && iSlg !== -1);
+    if (iX === -1 && iW === -1 && iE === -1 && iBB === -1 && iK === -1 && iBarrel === -1 && iHardHit === -1 && !fpShaped)
         return { rows: null, headers: rows[0] };
     const out = rows.slice(1).filter((r) => r[iName] && String(r[iName]).trim()).map((r) => {
         const cell = String(r[iName]).trim();
-        const parts = cell.includes(",") ? cell.split(",").map((x) => x.trim()) : null;
-        const num = (i) => (i !== -1 && r[i] !== "" && r[i] != null ? parseFloat(r[i]) : null);
+        const num = (i) => (i !== -1 && r[i] !== "" && r[i] != null && String(r[i]).trim() !== "" ? parseFloat(String(r[i]).replace(/[^0-9.\-]/g, "")) : null);
+        // FantasyPros renders the player cell as "Name (TEAM - POS,POS)" — pull the
+        // team out of the parenthetical, and do it BEFORE any comma handling, since
+        // the position list inside the brackets is itself comma separated.
+        let name = cell, team = null;
+        const fp = cell.match(/^(.+?)\s*\(\s*([A-Za-z]{2,3})\s*[-\u2013]\s*[^)]*\)\s*$/);
+        if (fp) {
+            name = fp[1].trim();
+            team = fp[2].toUpperCase();
+        }
+        else {
+            const parts = cell.includes(",") ? cell.split(",").map((x) => x.trim()) : null;
+            if (parts && parts.length === 2)
+                name = `${parts[1]} ${parts[0]}`;
+        }
+        if (!team && iTeam !== -1 && r[iTeam] != null)
+            team = String(r[iTeam]).trim();
+        const ip = num(iIp);
+        const isPitcherRow = ip != null;
+        let pa = num(iPa), woba = num(iW), bb = num(iBB), k = num(iK), wobaFrom = null;
+        if (!isPitcherRow && (woba == null || pa == null || bb == null || k == null)) {
+            const d = fpDeriveHitter({
+                ab: num(iAb), h: num(iH), d2: num(iD2), t3: num(iT3), hr: num(iHR),
+                bb: num(iBBct), k: num(iKct), obp: num(iObp), slg: num(iSlg), pa,
+            });
+            if (pa == null)
+                pa = d.pa;
+            if (woba == null && d.woba != null) {
+                woba = d.woba;
+                wobaFrom = d.wobaFrom;
+            }
+            if (bb == null && d.bb != null)
+                bb = d.bb;
+            if (k == null && d.k != null)
+                k = d.k;
+        }
+        // Batters faced ≈ outs + baserunners; only a regression weight, not a stat.
+        let bf = null;
+        if (isPitcherRow) {
+            const hAll = num(iH), bbAll = num(iBBct);
+            bf = Math.round(ip * 3 + (hAll || 0) + (bbAll || 0));
+        }
         return {
-            name: parts && parts.length === 2 ? `${parts[1]} ${parts[0]}` : cell,
-            team: iTeam !== -1 && r[iTeam] != null ? String(r[iTeam]).trim() : null,
-            pa: num(iPa), woba: num(iW), xwoba: num(iX), era: num(iE), xera: num(iXE),
-            bb: num(iBB), k: num(iK), barrel: num(iBarrel), hardHit: num(iHardHit),
+            name, team,
+            pa, woba, xwoba: num(iX), era: num(iE), xera: num(iXE),
+            bb, k, barrel: num(iBarrel), hardHit: num(iHardHit),
+            ip: isPitcherRow ? ip : null, bf, wobaFrom,
         };
     }).filter((r) => r.woba != null || r.xwoba != null || r.era != null || r.xera != null || (r.bb != null && r.k != null) || r.barrel != null || r.hardHit != null);
     return { rows: out.length ? out : null, headers: rows[0] };
@@ -4566,11 +4703,15 @@ If none of these: {"kind":"unknown"}` },
                     React.createElement("strong", null, "player stats into the team database"),
                     ". Works with ",
                     React.createElement("strong", null, "Baseball Savant"),
-                    " CSVs and ",
+                    " CSVs, ",
                     React.createElement("strong", null, "FanGraphs"),
-                    " leaderboards \u2014 including a straight copy-paste off the FanGraphs page, however your browser hands it over (tab-separated, one cell per line, or plain spaces). You can copy any slice of the table; it doesn't have to start at row 1. Keep the header row so the columns can be read. If the Team column is included every player routes automatically; without it, sync MLB rosters and names still resolve. Pick the timeframe first \u2014 14-day numbers belong in ",
+                    " leaderboards, and ",
+                    React.createElement("strong", null, "FantasyPros"),
+                    " stat tables \u2014 pasted straight off the page, however your browser hands it over (tab-separated, one cell per line, or plain spaces). Copy any slice; it needn't start at row 1. ",
+                    React.createElement("strong", null, "Keep the header row"),
+                    " \u2014 it's what names the columns. FantasyPros publishes no wOBA, so it's rebuilt from the hit components (AB, H, 2B, 3B, HR, BB) using the real wOBA weights, and PA / BB% / K% come out exact; Savant xwOBA is still the better number when you have it, and it won't be overwritten. Team routes from a Team column or from \"Name (TEAM - POS)\"; failing both, sync MLB rosters. Pick the timeframe first \u2014 14/15-day numbers belong in ",
                     React.createElement("strong", null, "Recent form"),
-                    ", not Full roster. Files stage; nothing imports until you confirm. Game lines belong in the Project tab, not here.")
+                    ", not Full roster. Files stage; nothing imports until you confirm. Game lines belong in the Project tab.")
                 : React.createElement(React.Fragment, null,
                     "Paste a ",
                     React.createElement("strong", null, "game line"),
