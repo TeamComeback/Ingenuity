@@ -1811,6 +1811,9 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
 // what's actually deployed. Newest first.
 // ===========================================================================
 const CHANGELOG = [
+    { date: "2026-07-23c", items: [
+            "FanGraphs leaderboards now import straight from a copy-paste off the page — no CSV export, no retyping. A browser hands a copied table over in one of three shapes and all three now work: tab-separated, every cell on its own line, or whole rows separated by plain spaces. The space case is the tricky one because player names contain spaces, so the parser counts columns from the stat end and treats the last all-caps token as the team — 'CJ Abrams WSN' and 'Fernando Tatis Jr. SDP' both come through intact. Percent signs on BB%/K% are handled, a copied slice doesn't have to start at row 1, and a header plus a single player is enough. Keep the header row; it's what names the columns.",
+        ] },
     { date: "2026-07-23b", items: [
             "Bullpen board — you can now see the pen, not just its score. Both bullpens appear in the game breakdown and on the projection screen: unit quality (xwOBA, barrel%, hard-hit%) alongside every arm that has pitched in the last three days, with pitches thrown on each day, a back-to-back flag, that arm's recent line (IP, K/BB, ERA over those outings), and a plain-language availability read. Arms are ordered by heaviest recent workload, so whoever is most likely unavailable sits at the top. The availability read comes from workload alone — it can't see roster moves or a manager's plan — so it's labelled a lean, not a fact, and only the team-level fatigue score actually feeds the projection.",
             "The board's game button now opens the Projection Terminal with that matchup loaded, instead of a separate breakdown page — one destination for the deep dive. A banner confirms what loaded and which starters resolved; if a team isn't in your database it says which one rather than quietly loading a half-filled matchup. The full breakdown page is still there on the ⤢ icon on each slate card, since it carries things the Terminal doesn't (O/U streaks, line movement, final score).",
@@ -4094,7 +4097,93 @@ function applyStatRows(rows, teams, mode = "season", rosterMap = null) {
     teamsTouched.sort((a, b) => b.n - a.n);
     return { next, hitters, pitchers, teamsTouched, seeded, unroutable };
 }
+// v1.8 — normalise a FanGraphs leaderboard COPY-PASTE into tab-separated rows.
+// Exporting a CSV already works; copying the rendered table off the page does
+// not, because a browser hands it over in one of two awkward shapes:
+//   (B) every single cell on its own line — header labels first, then all the
+//       values in reading order, with no row boundaries at all;
+//   (C) whole rows on one line separated by spaces — which is ambiguous because
+//       player names contain spaces ("Yordan Alvarez HOU 9 40 …").
+// Both are rebuilt here into a clean header + tab-separated rows, then handed to
+// the normal column mapper. Tab-separated input is passed straight through.
+const FG_LABELS = new Set(["#", "name", "team", "g", "pa", "ab", "h", "hr", "r", "rbi", "sb", "cs", "bb", "so", "bb%", "k%", "iso", "babip", "avg", "obp", "slg", "ops", "woba", "xwoba", "wrc+", "bsr", "off", "def", "war", "era", "xera", "ip", "gs", "w", "l", "sv", "whip", "fip", "xfip", "k/9", "bb/9", "hr/9", "barrel%", "hardhit%", "ev", "la"]);
+const fgIsLabel = (s) => FG_LABELS.has(String(s).trim().toLowerCase());
+// A stat value: a number, possibly with %, a leading dot, a sign, or commas.
+const fgIsNum = (s) => /^[-+]?(\d{1,3}(,\d{3})*|\d*)(\.\d+)?%?$/.test(String(s).trim()) && /\d/.test(String(s));
+function normalizeFangraphsPaste(text) {
+    const raw = String(text).replace(/\r/g, "");
+    if (raw.includes("\t"))
+        return raw; // already tabular — leave it alone
+    const lines = raw.split("\n").map((l) => l.trim()).filter((l) => l !== "");
+    if (lines.length < 2)
+        return raw; // a header plus one player is a valid paste
+    // ---- shape B: one cell per line ----
+    // The header is the run of known labels at the top; data begins at the first
+    // bare "1" (the first rank). Column count = length of that header run.
+    const singleTokenish = lines.filter((l) => !/\s{2,}/.test(l)).length / lines.length;
+    if (singleTokenish > 0.9) {
+        const nameAt = lines.findIndex((l) => /^name$/i.test(l));
+        if (nameAt !== -1 && nameAt <= 2) {
+            // The header is the leading run of known column labels. Don't look for a
+            // rank of "1" — a copied slice often starts at #3 or #15, and data values
+            // are numbers or player names, so neither can be mistaken for a label.
+            let dataAt = 0;
+            while (dataAt < lines.length && fgIsLabel(lines[dataAt]))
+                dataAt++;
+            const nCols = dataAt;
+            if (dataAt > 2 && (lines.length - nCols) % nCols === 0) {
+                const header = lines.slice(0, nCols);
+                const body = [];
+                for (let i = nCols; i < lines.length; i += nCols)
+                    body.push(lines.slice(i, i + nCols).join("\t"));
+                return [header.join("\t"), ...body].join("\n");
+            }
+        }
+    }
+    // ---- shape C: whole rows, space separated ----
+    const headTokens = lines[0].split(/\s+/).filter(Boolean);
+    const lowerHead = headTokens.map((t) => t.toLowerCase());
+    const nameIdx = lowerHead.indexOf("name");
+    if (nameIdx === -1 || !headTokens.every(fgIsLabel))
+        return raw;
+    const teamIdx = lowerHead.indexOf("team");
+    const anchorIdx = teamIdx !== -1 ? teamIdx : nameIdx;
+    const nTrailing = headTokens.length - 1 - anchorIdx; // stat columns after name/team
+    const out = [headTokens.join("\t")];
+    for (let i = 1; i < lines.length; i++) {
+        const tk = lines[i].split(/\s+/).filter(Boolean);
+        if (tk.length < nTrailing + 2)
+            continue;
+        const lead = tk.slice(0, nameIdx); // rank etc. before the name
+        const stats = tk.slice(tk.length - nTrailing); // the numeric tail
+        let middle = tk.slice(nameIdx, tk.length - nTrailing); // name (+ team) in between
+        if (!middle.length)
+            continue;
+        let team = null;
+        if (teamIdx !== -1) {
+            // the team code is the LAST all-caps token in the middle ("CJ Abrams WSN" → WSN)
+            for (let k = middle.length - 1; k >= 0; k--) {
+                const t = middle[k];
+                if (/^[A-Z]{2,4}$/.test(t)) {
+                    team = t;
+                    middle = middle.slice(0, k).concat(middle.slice(k + 1));
+                    break;
+                }
+            }
+            if (team == null) {
+                team = middle[middle.length - 1];
+                middle = middle.slice(0, -1);
+            }
+        }
+        const name = middle.join(" ").trim();
+        if (!name)
+            continue;
+        out.push([...lead, name, ...(teamIdx !== -1 ? [team] : []), ...stats].join("\t"));
+    }
+    return out.length > 1 ? out.join("\n") : raw;
+}
 function savantCsvToRows(csv) {
+    csv = normalizeFangraphsPaste(csv);
     // FanGraphs paste shape: the header is transposed — each column label sits on
     // its OWN line (#, Name, Team, G, PA, ... wOBA, xwOBA, ... WAR), and the data
     // rows begin only after the last label. A normal parse sees just the first
@@ -4435,7 +4524,9 @@ If none of these: {"kind":"unknown"}` },
                     React.createElement("strong", null, "Baseball Savant"),
                     " CSVs and ",
                     React.createElement("strong", null, "FanGraphs"),
-                    " leaderboards (including the copy-paste format where the column names stack vertically). FanGraphs includes a Team column, so it sorts every player automatically. Pick the timeframe first. Files stage \u2014 nothing imports until you confirm. Game lines belong in the Project tab, not here.")
+                    " leaderboards \u2014 including a straight copy-paste off the FanGraphs page, however your browser hands it over (tab-separated, one cell per line, or plain spaces). You can copy any slice of the table; it doesn't have to start at row 1. Keep the header row so the columns can be read. If the Team column is included every player routes automatically; without it, sync MLB rosters and names still resolve. Pick the timeframe first \u2014 14-day numbers belong in ",
+                    React.createElement("strong", null, "Recent form"),
+                    ", not Full roster. Files stage; nothing imports until you confirm. Game lines belong in the Project tab, not here.")
                 : React.createElement(React.Fragment, null,
                     "Paste a ",
                     React.createElement("strong", null, "game line"),
