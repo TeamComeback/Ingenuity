@@ -543,12 +543,20 @@ async function refreshMlbRosterMap() {
                 hands[normName(p.fullName)] = "R"; // switch-pitcher (vanishingly rare) → treat as R
         }
         const n = Object.keys(map).length;
-        if (n)
-            await store.set("ingenuity:mlb:rosterMap", { asOf: etDayKey(), map, hands });
-        return { ok: n > 0, n, hands: Object.keys(hands).length };
+        if (!n)
+            return { ok: false, n: 0, err: "MLB returned no players" };
+        // The fetch succeeding is NOT the same as the save landing. A prior bug
+        // reported success here purely from the in-memory count, so "rosters
+        // synced" could be shown even when the write silently failed (usually a
+        // full browser storage quota) — leaving the actual matching pool empty
+        // while the UI claimed it was populated. Verify the write, don't assume it.
+        const wrote = await store.set("ingenuity:mlb:rosterMap", { asOf: etDayKey(), map, hands });
+        if (!wrote)
+            return { ok: false, n: 0, err: `fetched ${n} players but couldn't save them — ${store.lastError || "the browser refused the write"}` };
+        return { ok: true, n, hands: Object.keys(hands).length };
     }
-    catch {
-        return { ok: false, n: 0 };
+    catch (e) {
+        return { ok: false, n: 0, err: String(e && e.message ? e.message : e) };
     } // offline or blocked — team-column CSVs and manual entry still work
 }
 function parkForTeam(teamName) {
@@ -1825,6 +1833,9 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
 // what's actually deployed. Newest first.
 // ===========================================================================
 const CHANGELOG = [
+    { date: "2026-07-24d", items: [
+            "FIXED — 'MLB rosters synced' could report success even when the save silently failed. refreshMlbRosterMap fired the storage write and reported success based purely on the in-memory fetch count, never checking whether the write actually landed — the same failure shape as an earlier bullpen-fatigue bug. If the browser's storage was near its limit, the sync could say '545 players' while the matching pool was actually empty, which is exactly what makes a stats paste come back '0 of 300 matched' right after a sync that looked clean. Both the sync button and the auto-fill-hands button now verify the write and report the real reason when it fails, instead of a false-positive success.",
+        ] },
     { date: "2026-07-24c", items: [
             "FantasyPros stat tables now import. Paste them the same way as FanGraphs — tab-separated, one cell per line, or plain spaces — and the team comes out of the 'Name (TEAM - POS)' cell automatically. All 34 abbreviations it uses resolve.",
             "FantasyPros doesn't publish wOBA, so rather than guess it, the importer rebuilds it from the hit components it does publish: wOBA = (.69·BB + .89·1B + 1.27·2B + 1.62·3B + 2.10·HR) ÷ PA, the actual weights. Checked against FanGraphs for the same players it lands within about .01, and PA, BB% and K% come out exact (AB+BB, BB÷PA, K÷PA). The cruder OBP/SLG shortcut is kept only for rows missing components. Savant xwOBA is still the better input where you have it — it strips luck, which an outcome-based wOBA can't — and importing FantasyPros will not overwrite it.",
@@ -4475,12 +4486,21 @@ function SmartImport({ teams, saveTeams, onGameLine, statsFocus }) {
             setRosterSync("Syncing MLB rosters…");
         const res = await refreshMlbRosterMap();
         if (res.ok) {
+            // Read back what actually saved, rather than trusting the fetch alone —
+            // this is the check that was missing before. If it doesn't match what
+            // refreshMlbRosterMap just verified, say so instead of claiming success.
             const cached = await store.get("ingenuity:mlb:rosterMap", null);
+            const count = cached?.map ? Object.keys(cached.map).length : 0;
             setRosterMap(cached?.map || null);
-            setRosterSync(`MLB rosters synced just now — ${res.n} players. This lets stats CSVs with no team column still route correctly.`);
+            if (count > 0) {
+                setRosterSync(`MLB rosters synced just now — ${count} players. This lets stats CSVs with no team column still route correctly.`);
+            }
+            else {
+                setRosterSync("Fetched MLB rosters but the save didn't stick — matching won't work until this succeeds. Try again, and if it keeps failing, some old data may need clearing to free storage.");
+            }
         }
         else {
-            setRosterSync(quiet ? "" : "Couldn't reach MLB's roster list from here — team-column CSVs still work; sync again later.");
+            setRosterSync(quiet ? "" : `Couldn't sync MLB rosters — ${res.err || "unreachable from here"}. Team-column CSVs still work; sync again later.`);
         }
     };
     const [text, setText] = useState("");
@@ -4789,7 +4809,9 @@ function PlatoonImport({ teams, saveTeams }) {
             const res = await refreshMlbRosterMap();
             if (!res.ok) {
                 setBusy(false);
-                setMsg("Couldn't reach MLB's player list from here. In the hosted app this works; inside the Claude artifact the sandbox blocks it. You can still paste hands manually below.");
+                setMsg(res.err
+                    ? `Couldn't sync MLB's player list — ${res.err}. You can still paste hands manually below.`
+                    : "Couldn't reach MLB's player list from here. In the hosted app this works; inside the Claude artifact the sandbox blocks it. You can still paste hands manually below.");
                 return;
             }
             cached = await store.get("ingenuity:mlb:rosterMap", null);
