@@ -1239,6 +1239,79 @@ function dedupeTeams(teams) {
     }
     return { teams: [...byCanon.values()], merged };
 }
+// v2.4 — data coverage. Which engine inputs are actually filled, and what each
+// gap costs. The impact figures are measured, not guessed: each is the swing in
+// projected total when that input moves from one realistic extreme to the other
+// with everything else held at league average (see the table in COVERAGE_NOTE).
+// A blank never breaks a projection — it silently falls back to league average,
+// which is exactly why gaps are worth surfacing rather than leaving to be
+// noticed by accident.
+const filled = (v) => v !== "" && v != null && !(typeof v === "number" && isNaN(v)) && String(v).trim() !== "";
+const COVERAGE_FIELDS = [
+    { key: "oaa", label: "Team defense (OAA)", impact: 0.45,
+        blank: "every defense priced as league average",
+        source: "Baseball Savant \u2192 Fielding \u2192 Outs Above Average, team view",
+        has: (t) => filled(t.oaa) },
+    { key: "pen", label: "Bullpen xwOBA", impact: 0.28,
+        blank: "bullpen priced as league average for 3\u20134 innings a game",
+        source: "Savant \u2192 Expected Statistics, filtered to relievers",
+        has: (t) => filled(t.pen) },
+    { key: "xoff", label: "Team xwOBA (season)", impact: 0.26,
+        blank: "offense runs on outcome wOBA alone, luck still in it",
+        source: "Savant \u2192 Expected Statistics, or the FanGraphs leaderboard",
+        has: (t) => filled(t.xoff) },
+    { key: "off", label: "Team wOBA (season)", impact: 0.26,
+        blank: "offense falls back to league average entirely",
+        source: "FanGraphs or Savant season leaderboard",
+        has: (t) => filled(t.off) },
+    { key: "penContact", label: "Bullpen barrel% / hard-hit%", impact: 0.20,
+        blank: "bullpen quality judged on xwOBA alone",
+        source: "Savant \u2192 Statcast, relievers, grouped by team",
+        has: (t) => filled(t.penBarrel) || filled(t.penHardHit) },
+    { key: "rotation", label: "Starter xwOBA", impact: 0.18, perArm: true,
+        blank: "that starter can't be priced \u2014 the game is skipped, not guessed",
+        source: "Savant \u2192 Expected Statistics, pitchers",
+        arms: (t) => (t.rotation || []).length,
+        ok: (t) => (t.rotation || []).filter((r) => filled(r.xwoba)).length },
+    { key: "splits", label: "Platoon splits (vs LHP / RHP)", impact: 0.15,
+        blank: "no handedness nudge \u2014 lineups priced the same against either arm",
+        source: "FanGraphs \u2192 Splits Leaderboards, team level",
+        has: (t) => filled(t.offVsL) || filled(t.offVsR) },
+    { key: "hands", label: "Pitcher handedness", impact: 0.15, perArm: true,
+        blank: "platoon splits stay switched off for that arm",
+        source: "one tap \u2014 Auto-fill hands from MLB",
+        arms: (t) => (t.rotation || []).length,
+        ok: (t) => (t.rotation || []).filter((r) => r.hand === "L" || r.hand === "R").length },
+    { key: "framing", label: "Catcher framing", impact: 0.05,
+        blank: "borderline-strike edge ignored",
+        source: "Savant \u2192 Catcher Framing, team view",
+        has: (t) => filled(t.framing) },
+];
+const COVERAGE_NOTE = "Impact is the measured swing in a projected total when that input moves between realistic extremes, everything else held at league average. It is not a per-game guarantee \u2014 it's how much the model is flying blind when the field is empty.";
+// Roll the registry up across the database.
+function coverageReport(teams) {
+    const rows = COVERAGE_FIELDS.map((f) => {
+        if (f.perArm) {
+            let arms = 0, ok = 0;
+            const missingTeams = [];
+            for (const t of teams) {
+                const a = f.arms(t), o = f.ok(t);
+                arms += a;
+                ok += o;
+                if (a > o)
+                    missingTeams.push(`${t.name} (${a - o})`);
+            }
+            return { ...f, unit: "arms", total: arms, ok, missingTeams };
+        }
+        const missingTeams = teams.filter((t) => !f.has(t)).map((t) => t.name);
+        return { ...f, unit: "teams", total: teams.length, ok: teams.length - missingTeams.length, missingTeams };
+    });
+    // rank by what the gap actually costs: impact weighted by how much is missing
+    rows.forEach((r) => { r.gap = r.total ? (r.total - r.ok) / r.total : 0; r.cost = r.gap * r.impact; });
+    const ranked = [...rows].sort((a, b) => b.cost - a.cost);
+    const worst = ranked.find((r) => r.gap > 0) || null;
+    return { rows: ranked, worst };
+}
 function matchTeamDb(name, teams) {
     const n = normName(name);
     let best = null;
@@ -1900,6 +1973,16 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
 // what's actually deployed. Newest first.
 // ===========================================================================
 const CHANGELOG = [
+    { date: "2026-07-24k", items: [
+            "FIXED \u2014 over/under form had quietly left the route you actually take. It still existed, but only inside the full breakdown, and once the board's button started opening the Projection Terminal instead, that view stopped being part of the normal flow. It now appears on the projection screen too, from the same graded-results store.",
+            "It stays out of the projection on purpose. A team's recent O/U record is mostly a record of the LINES it faced, not of its run environment \u2014 and the things that would make it predictive (offense form, the arm, park, weather, bullpen) are already priced by the engine. Feeding it in would double-count those and add the market's noise on top. Shown as research, labelled as research.",
+            "New \u2014 team-level stat import, so the coverage panel is actually actionable. It was naming OAA, framing and bullpen contact as gaps while the importer had no columns for any of them: there was no way to fill what it was pointing at. One header-driven paste box now reads whichever columns it recognises and ignores the rest, so a Baseball Savant fielding export, a FanGraphs team page or a FantasyPros table all work as pasted, with full club names resolving to your database nicknames. Recognised: OAA, Framing, Barrel%, HardHit%, wOBA, xwOBA, Pen xwOBA. A team absent from the paste is never touched, and existing values are never blanked.",
+        ] },
+    { date: "2026-07-24j", items: [
+            "New \u2014 Data coverage panel (Database tab). Lists every input the engine uses, whether it's actually filled across your database, and what each gap costs, ranked by how much the model is flying blind rather than by raw importance. Tap a row for where to get that stat and exactly which teams are missing it.",
+            "The impact figures are measured, not asserted: each is the swing in a projected total when that input moves between realistic extremes with everything else held at league average. Team defence (OAA) came out the largest single lever at about \u00b10.45 runs \u2014 larger than the starter \u2014 and it's one of the easiest fields to leave blank, because nothing visibly breaks when you do. Bullpen xwOBA is next at 0.28, team xwOBA 0.26, starter xwOBA 0.18. Framing and starter innings measured at 0.05 and are honestly marginal.",
+            "The panel states plainly what a blank actually does \u2014 it falls back to league average, silently, which is why gaps are worth listing rather than leaving to be noticed by accident. It also carries the caveat that filling these makes a projection more accurate, not automatically more profitable: the books have all of it too.",
+        ] },
     { date: "2026-07-24i", items: [
             "FIXED \u2014 saving a lineup created a duplicate club. MLB's feed says 'Colorado Rockies'; the database stores 'Rockies'. The save matched on an exact string, missed, and pushed a SECOND record carrying only OBP/SLG lineup estimates \u2014 sitting alongside the real one with your imported stats. That's worse than untidy: a projection binds to whichever record it finds first, so the same game could price off real numbers or off estimates depending on ordering. Both the lineup save and the JSON paste import now resolve to the canonical club name before matching.",
             "Duplicates already in your database are merged automatically on load. The two records fold into one under the canonical nickname, rosters are unioned, and a REAL stat always beats a lineup estimate regardless of which record it came from \u2014 so the cleanup can't quietly downgrade a team. The pass is idempotent and only writes when it actually changed something.",
@@ -2465,12 +2548,15 @@ function Terminal({ onHome, pendingGame, onPendingConsumed }) {
                     handoff,
                     React.createElement("button", { onClick: () => setHandoff(""), "aria-label": "Dismiss" }, "\u00D7")),
                 result && React.createElement(BullpenBoard, { A: matchTeamDb(away.name, teams) || away, H: matchTeamDb(home.name, teams) || home, compact: true }),
+                result && React.createElement(OUFormPanel, { away: away.name, home: home.name }),
                 result && React.createElement(Readout, { r: result, onLog: logToLedger, logMsg: logMsg })))),
         tab === "database" && (React.createElement(React.Fragment, null,
             React.createElement("div", { className: "ing-db-import" },
                 React.createElement(SmartImport, { teams: teams, saveTeams: saveTeams, onGameLine: loadGameLine, statsFocus: true })),
             React.createElement("div", { className: "ing-db-import" },
                 React.createElement(PlatoonImport, { teams: teams, saveTeams: saveTeams })),
+            React.createElement("div", { className: "ing-db-import" },
+                React.createElement(CoveragePanel, { teams: teams })),
             React.createElement(Database, { teams: teams, saveTeams: saveTeams, loaded: loaded }))),
         tab === "lineups" && React.createElement(LineupFetcher, { teams: teams, saveTeams: saveTeams }),
         React.createElement("footer", { className: "ing-foot" }, "Research instrument. Projections are estimates from the inputs you provide \u2014 only as good as the data entered. Not betting advice.")));
@@ -3059,6 +3145,38 @@ function Field({ label, v, on }) {
 // (what the model prices) and each arm's recent workload (what decides who's
 // actually available tonight). Arms are ordered by how heavily they've been
 // used, so the ones most likely to be down are at the top.
+// v2.5 — over/under form, shown on the projection screen as well as the full
+// breakdown. It used to live only in the breakdown, which stopped being part of
+// the normal flow once the board's button started opening the Terminal — so a
+// research view quietly disappeared from the route people actually take.
+// Deliberately NOT a model input: a team's recent O/U record is mostly a record
+// of the LINES it faced, not of its run environment, and the causes that would
+// make it predictive (offense, arm, park, weather, pen) are already priced.
+function OUFormPanel({ away, home }) {
+    const [streaks, setStreaks] = useState(null);
+    useEffect(() => {
+        let alive = true;
+        (async () => {
+            if (!away || !home)
+                return;
+            const log = await store.get("ingenuity:results:log", {});
+            if (!alive || !Object.keys(log).length)
+                return;
+            setStreaks({ away: teamOUStreak(log, away), home: teamOUStreak(log, home) });
+        })();
+        return () => { alive = false; };
+    }, [away, home]);
+    if (!streaks || (streaks.away.n === 0 && streaks.home.n === 0))
+        return null;
+    return (React.createElement("div", { className: "gd-streak" },
+        React.createElement("div", { className: "gd-streak-head" }, "Recent over/under form \\u00b7 from your graded results"),
+        [{ t: away, s: streaks.away }, { t: home, s: streaks.home }].map(({ t, s }, i) => (React.createElement("div", { className: "gd-streak-row", key: i },
+            React.createElement("span", { className: "gd-streak-team" }, t),
+            s.n > 0 ? (React.createElement(React.Fragment, null,
+                React.createElement("span", { className: "gd-streak-tag " + (s.side === "O" ? "ov" : s.side === "U" ? "un" : "") }, s.streak >= 2 ? `${s.streak} straight ${s.side === "O" ? "OVER" : s.side === "U" ? "UNDER" : "PUSH"}` : `last: ${s.side === "O" ? "OVER" : s.side === "U" ? "UNDER" : "PUSH"}`),
+                React.createElement("span", { className: "gd-streak-seq" }, s.last.map((x) => x.ou).join(" ")))) : React.createElement("span", { className: "gd-streak-tag" }, "no graded games yet")))),
+        React.createElement("p", { className: "gd-streak-note" }, "A streak is a fact, not a lean. \"Hot unders keep going under\" and \"a series is due to flip\" are opposite reads of the same run \\u2014 both are stories told after the fact. Shown for research, deliberately NOT in the projection, and it grows only as your own graded results accumulate.")));
+}
 function BullpenBoard({ A, H, compact }) {
     const [open, setOpen] = useState(!compact);
     const sides = [{ t: A, label: "Away" }, { t: H, label: "Home" }].filter((s) => s.t);
@@ -4947,10 +5065,153 @@ If none of these: {"kind":"unknown"}` },
                         p.isNew ? React.createElement("i", { className: "new" }, "new") : null)))))))),
                 React.createElement("p", { className: "ing-receipt-note" }, "Tap a team in the list below to see its full stored roster anytime. If a name you pasted isn't here, its spelling didn't match \u2014 fix it and re-paste.")))))));
 }
+function CoveragePanel({ teams }) {
+    const [open, setOpen] = useState(false);
+    const [expanded, setExpanded] = useState(null);
+    const report = useMemo(() => coverageReport(teams), [teams]);
+    if (!teams.length)
+        return null;
+    const { rows, worst } = report;
+    const complete = rows.every((r) => r.gap === 0);
+    return (React.createElement("div", { className: "cov" },
+        React.createElement("button", { className: "cov-head", onClick: () => setOpen(!open), "aria-expanded": open },
+            React.createElement("span", null, "Data coverage"),
+            React.createElement("span", { className: "cov-head-r" },
+                complete ? "every input filled" : worst ? `biggest gap: ${worst.label}` : "",
+                " ",
+                open ? "\u25b2" : "\u25bc")),
+        open && (React.createElement("div", { className: "cov-body" },
+            React.createElement("p", { className: "ing-hint" }, "What the engine has to work with, ranked by what each gap actually costs. Nothing here breaks a projection \\u2014 a blank field quietly falls back to league average, which is the point: you can't see it happening unless it's listed."),
+            React.createElement("ul", { className: "cov-list" }, rows.map((r) => {
+                const pct = r.total ? Math.round((r.ok / r.total) * 100) : 100;
+                const tone = r.gap === 0 ? "full" : r.cost >= 0.15 ? "bad" : r.cost >= 0.05 ? "mid" : "low";
+                const isOpen = expanded === r.key;
+                return (React.createElement("li", { key: r.key, className: "cov-row " + tone },
+                    React.createElement("button", { className: "cov-row-top", onClick: () => setExpanded(isOpen ? null : r.key), "aria-expanded": isOpen },
+                        React.createElement("span", { className: "cov-name" }, r.label),
+                        React.createElement("span", { className: "cov-count" },
+                            r.ok,
+                            "/",
+                            r.total,
+                            " ",
+                            r.unit)),
+                    React.createElement("div", { className: "cov-bar" },
+                        React.createElement("i", { style: { width: pct + "%" } })),
+                    React.createElement("div", { className: "cov-meta" },
+                        React.createElement("span", { className: "cov-impact" },
+                            "\\u00b1",
+                            r.impact.toFixed(2),
+                            " runs when wrong"),
+                        r.gap > 0 && React.createElement("span", { className: "cov-blank" },
+                            "blank \\u2192 ",
+                            r.blank)),
+                    isOpen && (React.createElement("div", { className: "cov-detail" },
+                        React.createElement("p", null,
+                            React.createElement("strong", null, "Where to get it:"),
+                            " ",
+                            r.source),
+                        r.missingTeams.length > 0 ? (React.createElement("p", null,
+                            React.createElement("strong", null,
+                                "Missing (",
+                                r.missingTeams.length,
+                                "):"),
+                            " ",
+                            r.missingTeams.join(", "))) : React.createElement("p", null, "Complete across the database.")))));
+            })),
+            React.createElement("p", { className: "cov-note" }, COVERAGE_NOTE),
+            React.createElement("p", { className: "cov-note" },
+                "Worth saying plainly: filling these makes the projection more ",
+                React.createElement("em", null, "accurate"),
+                ", not automatically more ",
+                React.createElement("em", null, "profitable"),
+                ". The books have all of it too. Accuracy is what stops you betting a number that was wrong for a boring reason \\u2014 the edge still comes from line shopping and passing.")))));
+}
+// v2.5 — team-level stat import, header-driven so it works from any source.
+// The coverage panel points at OAA, framing and bullpen contact quality, but
+// those are TEAM totals — the player-row importer had nowhere to put them, so
+// the panel was naming gaps you had no way to fill. This reads whatever columns
+// are present and ignores the rest, which is what lets one parser cover
+// Baseball Savant, FanGraphs and FantasyPros without a per-site format.
+const TEAM_STAT_COLUMNS = [
+    { field: "oaa", labels: ["oaa", "outs above average", "outs_above_average", "outs above avg", "fielding run value", "frv"] },
+    { field: "framing", labels: ["framing", "framing runs", "framing_runs", "runs extra strikes", "catcher framing", "frm"] },
+    { field: "penBarrel", labels: ["barrel%", "barrel %", "brl%", "barrel_batted_rate", "brl_percent", "barrel pct", "barrels"] },
+    { field: "penHardHit", labels: ["hardhit%", "hard hit%", "hard-hit%", "hard_hit_percent", "hh%", "hardhit", "hard hit"] },
+    { field: "pen", labels: ["pen xwoba", "bullpen xwoba", "rp xwoba", "reliever xwoba"] },
+    { field: "xoff", labels: ["xwoba", "est_woba", "expected woba", "xwoba_season"] },
+    { field: "off", labels: ["woba", "woba_season"] },
+    { field: "oaaPlaceholder", labels: [] },
+];
+function parseTeamStats(text) {
+    const raw = normalizeFangraphsPaste(String(text || ""));
+    const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    if (lines.length < 2)
+        return { rows: [], headers: null };
+    const split = (l) => l.split(/\t|\s*\|\s*|\s*,\s*/).map((c) => c.trim()).filter((c) => c !== "");
+    let head = split(lines[0]).map((h) => h.toLowerCase());
+    if (head.length < 2)
+        head = lines[0].split(/\s{2,}|\t/).map((h) => h.trim().toLowerCase()).filter(Boolean);
+    // which column holds the club name
+    const nameIdx = head.findIndex((h) => ["team", "tm", "club", "name", "player"].includes(h));
+    if (nameIdx === -1)
+        return { rows: [], headers: head, err: "no Team column found" };
+    // map each remaining column to a known field, ignoring anything unrecognised
+    const colField = head.map((h, i) => {
+        if (i === nameIdx)
+            return null;
+        const hit = TEAM_STAT_COLUMNS.find((c) => c.labels.includes(h));
+        return hit ? hit.field : null;
+    });
+    if (!colField.some(Boolean))
+        return { rows: [], headers: head, err: "no recognised stat columns" };
+    const out = [];
+    for (let i = 1; i < lines.length; i++) {
+        const cells = split(lines[i]);
+        if (cells.length < 2)
+            continue;
+        const rawName = cells[nameIdx];
+        if (!rawName)
+            continue;
+        const team = resolveTeamName(rawName) || rawName;
+        const fields = {};
+        colField.forEach((f, ci) => {
+            if (!f || ci >= cells.length)
+                return;
+            const n = parseFloat(String(cells[ci]).replace(/[^0-9.\-]/g, ""));
+            if (!isNaN(n))
+                fields[f] = n;
+        });
+        if (Object.keys(fields).length)
+            out.push({ team, fields });
+    }
+    return { rows: out, headers: head };
+}
+// Write parsed team stats onto the database. Never blanks an existing value.
+function applyTeamStats(rows, teams) {
+    const next = teams.map((t) => ({ ...t }));
+    const idx = new Map(next.map((t, i) => [normName(t.name), i]));
+    let applied = 0, fieldsSet = 0;
+    const unmatched = [];
+    for (const r of rows) {
+        const at = idx.get(normName(r.team));
+        if (at == null) {
+            unmatched.push(r.team);
+            continue;
+        }
+        const t = next[at];
+        for (const [f, v] of Object.entries(r.fields)) {
+            t[f] = f === "off" || f === "xoff" || f === "pen" ? v.toFixed(3) : String(v);
+            fieldsSet++;
+        }
+        applied++;
+    }
+    return { next, applied, fieldsSet, unmatched: [...new Set(unmatched)] };
+}
 function PlatoonImport({ teams, saveTeams }) {
     const [open, setOpen] = useState(false);
     const [splitText, setSplitText] = useState("");
     const [handText, setHandText] = useState("");
+    const [statText, setStatText] = useState("");
     const [msg, setMsg] = useState("");
     const [busy, setBusy] = useState(false);
     // Pull MLB's own pitchHand for every player and stamp it onto the rotations
@@ -4989,6 +5250,18 @@ function PlatoonImport({ teams, saveTeams }) {
         const { next, applied, unmatched } = applyTeamSplits(parsed, teams);
         await saveTeams(next);
         setMsg(`Platoon splits saved for ${applied} team${applied === 1 ? "" : "s"}.${unmatched.length ? ` Unmatched: ${unmatched.slice(0, 6).join(", ")}${unmatched.length > 6 ? "…" : ""} — check team names against the Database.` : ""} These now nudge each lineup's projection by the opposing starter's hand.`);
+    };
+    const importTeamStats = async () => {
+        const { rows, err } = parseTeamStats(statText);
+        if (!rows.length) {
+            setMsg(err
+                ? `Couldn't read that \u2014 ${err}. Keep the header row; it needs a Team column plus at least one recognised stat (OAA, Framing, Barrel%, HardHit%, wOBA, xwOBA, Pen xwOBA).`
+                : "No team rows recognised. Paste the header row along with the data.");
+            return;
+        }
+        const { next, applied, fieldsSet, unmatched } = applyTeamStats(rows, teams);
+        await saveTeams(next);
+        setMsg(`Set ${fieldsSet} value${fieldsSet === 1 ? "" : "s"} across ${applied} team${applied === 1 ? "" : "s"}.${unmatched.length ? ` Unmatched: ${unmatched.slice(0, 6).join(", ")}${unmatched.length > 6 ? "\u2026" : ""}.` : ""} Check the coverage panel to see what's still open.`);
     };
     const importHands = async () => {
         const parsed = parsePitcherHands(handText);
@@ -5032,6 +5305,15 @@ function PlatoonImport({ teams, saveTeams }) {
                     React.createElement("code", null, "Team | wOBA vs L | PA vs L | wOBA vs R | PA vs R")),
                 React.createElement("textarea", { rows: 5, value: splitText, onChange: (e) => setSplitText(e.target.value), placeholder: "Dodgers | 0.345 | 420 | 0.330 | 1100\nYankees | 0.360 | 380 | 0.322 | 1050\nRed Sox, 0.310, 400, 0.340, 1000" })),
             React.createElement("button", { className: "ing-run small", onClick: importSplits }, "Import team splits"),
+            React.createElement("div", { className: "ing-platoon-div" }),
+            React.createElement("label", { className: "ing-f wide" },
+                React.createElement("span", null,
+                    "Team-level stats \\u2014 any table with a ",
+                    React.createElement("code", null, "Team"),
+                    " column"),
+                React.createElement("textarea", { rows: 4, value: statText, onChange: (e) => setStatText(e.target.value), placeholder: "Team\tOAA\tFraming\tBarrel%\tHardHit%\nGuardians\t18\t7\t7.1\t38.4\nRockies\t-12\t-3\t9.8\t42.1" })),
+            React.createElement("p", { className: "ing-hint", style: { marginTop: 6 } }, "Reads the columns it recognises and ignores the rest, so a Savant fielding export, a FanGraphs team page or a FantasyPros table all work as pasted. Recognised: OAA, Framing, Barrel%, HardHit%, wOBA, xwOBA, Pen xwOBA. Existing values are never blanked."),
+            React.createElement("button", { className: "ing-run small", onClick: importTeamStats }, "Import team stats"),
             React.createElement("div", { className: "ing-platoon-div" }),
             React.createElement("div", { className: "ing-platoon-auto" },
                 React.createElement("strong", null, "Fastest path \u2014 no typing:"),
@@ -7435,6 +7717,35 @@ const CSS = `
 .slate-more { width: 100%; margin-top: 12px; background: transparent; border: 1px dashed var(--line); color: var(--ink-dim); border-radius: 10px; padding: 12px; cursor: pointer; font-family: 'Archivo'; font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; transition: color 0.15s, border-color 0.15s; }
 .slate-more:hover { color: var(--ink); border-color: var(--ink-dim); }
 .slate-more em { display: block; font-style: normal; font-family: 'Space Grotesk'; font-size: 11px; letter-spacing: 0.01em; text-transform: none; opacity: 0.75; margin-top: 4px; }
+
+/* ---- data coverage panel (v2.4) ---- */
+.cov { border: 1px solid var(--line); border-radius: 12px; background: var(--field2); overflow: hidden; }
+.cov-head { width: 100%; display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 14px 16px; background: transparent; border: none; color: var(--ink); cursor: pointer; font-family: 'Space Grotesk'; font-size: 14px; font-weight: 600; text-align: left; }
+.cov-head-r { font-family: 'Archivo'; font-size: 10.5px; letter-spacing: 0.04em; color: var(--ink-dim); text-align: right; }
+.cov-body { padding: 4px 16px 18px; border-top: 1px solid var(--line); }
+.cov-list { list-style: none; margin: 14px 0 0; padding: 0; }
+.cov-row { padding: 11px 0; border-bottom: 1px solid rgba(28,51,41,0.5); }
+.cov-row:last-child { border-bottom: none; }
+.cov-row-top { width: 100%; display: flex; justify-content: space-between; align-items: baseline; gap: 12px; background: transparent; border: none; padding: 0; color: var(--ink); cursor: pointer; text-align: left; font-family: 'Space Grotesk'; }
+.cov-name { font-size: 13.5px; font-weight: 500; }
+.cov-count { font-family: 'Archivo'; font-size: 11px; color: var(--ink-dim); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.cov-bar { height: 4px; border-radius: 2px; background: rgba(255,255,255,0.06); margin: 8px 0 7px; overflow: hidden; }
+.cov-bar i { display: block; height: 100%; border-radius: 2px; transition: width 0.4s ease; }
+.cov-row.full .cov-bar i { background: var(--phos); }
+.cov-row.low .cov-bar i { background: var(--phos-dim); }
+.cov-row.mid .cov-bar i { background: var(--amber); }
+.cov-row.bad .cov-bar i { background: var(--rust); }
+.cov-meta { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 10.5px; color: var(--ink-dim); }
+.cov-impact { font-variant-numeric: tabular-nums; }
+.cov-row.bad .cov-impact { color: var(--rust); }
+.cov-row.mid .cov-impact { color: var(--amber); }
+.cov-blank { opacity: 0.85; }
+.cov-detail { margin-top: 9px; padding: 10px 12px; border-radius: 8px; background: rgba(95,217,232,0.06); border-left: 2px solid var(--cyan); font-size: 11.5px; line-height: 1.6; color: var(--ink-dim); }
+.cov-detail p { margin: 0 0 5px; }
+.cov-detail p:last-child { margin-bottom: 0; }
+.cov-detail strong { color: var(--ink); font-weight: 600; }
+.cov-note { font-size: 11px; color: var(--ink-dim); line-height: 1.6; margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
+.cov-note em { font-style: italic; color: var(--ink); }
 
 /* ---- bullpen board (v1.7) ---- */
 .pen { border: 1px solid var(--line); border-radius: 12px; background: var(--field2); overflow: hidden; margin-bottom: 16px; }
