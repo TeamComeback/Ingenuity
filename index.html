@@ -2069,6 +2069,11 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
 // what's actually deployed. Newest first.
 // ===========================================================================
 const CHANGELOG = [
+    { date: "2026-07-25", items: [
+            "New \u2014 log an actual bet from the projection screen. The old 'Log to ledger' button wrote a RESEARCH record (what the model said, no stake), which was a reasonable thing to misread from the name; it's now labelled 'Log as research', and a separate '+ Log a bet' opens a real ticket. It prefills side, line and price from the projection, but every field is editable, because the number you actually got is rarely the number on screen.",
+            "The ticket computes modelCall from what the MODEL said, not from what you picked \u2014 bet with a confirmed lean and it logs MODEL LEAN, bet against it or on a game the model passed and it logs AGAINST. It tells you which label it will use before you save. That distinction is the entire reason the ledger can say honestly which losses the model owns and which it never endorsed, and it would be worthless if the app let the label follow the bet.",
+            "There's a closing-line field on the ticket, optional and fillable later in the Ledger. Entering it computes CLV for that bet \u2014 whether you beat the number the market settled on. Over a large sample that's the only measure that distinguishes beating the market from winning bets, which are not the same thing.",
+        ] },
     { date: "2026-07-24m", items: [
             "Simulation count checked, and deliberately left alone. Measured across 25 independent runs at 20,000 sims: the run-to-run spread is 0.028 runs on the projected total and 0.36 points on the over probability. Realistic input error is 3\u201311x larger \u2014 a bullpen off by .020 moves the total 0.217 runs, an unknown OAA about 0.31. Raising to 100k would cut simulation noise to 0.012 runs while those input gaps stay exactly where they are: it would be polishing a rounding error and spending phone battery to do it. 20,000 is the right number; the accuracy that's actually missing lives in the coverage panel, not the sim count.",
             "Homepage condensed. The change journal now shows one day at a time \u2014 latest by default, any other day from a dropdown \u2014 and collapses entirely; it had grown into most of the scroll. Backup collapsed too: important, but not something you read daily. The board is closer to the top as a result.",
@@ -2675,7 +2680,7 @@ function Terminal({ onHome, pendingGame, onPendingConsumed }) {
                     React.createElement("button", { onClick: () => setHandoff(""), "aria-label": "Dismiss" }, "\u00D7")),
                 result && React.createElement(BullpenBoard, { A: matchTeamDb(away.name, teams) || away, H: matchTeamDb(home.name, teams) || home, compact: true }),
                 result && React.createElement(OUFormPanel, { away: away.name, home: home.name }),
-                result && React.createElement(Readout, { r: result, onLog: logToLedger, logMsg: logMsg })))),
+                result && React.createElement(Readout, { r: result, onLog: logToLedger, logMsg: logMsg, overPrice: overPrice, underPrice: underPrice })))),
         tab === "database" && (React.createElement(React.Fragment, null,
             React.createElement("div", { className: "ing-db-import" },
                 React.createElement(SmartImport, { teams: teams, saveTeams: saveTeams, onGameLine: loadGameLine, statsFocus: true })),
@@ -3535,7 +3540,117 @@ function RunCurve({ r }) {
                 "% of sims)")),
         React.createElement("p", { className: "rc-note" }, "The curve is where the 20,000 simulated finals landed. Taller means that total came up more often. The two shaded halves are split at the book's number, so the bigger half is the side the model favours \u2014 and the thin ends are the blowout and pitcher's-duel games that decide first-five bets.")));
 }
-function Readout({ r, onLog, logMsg }) {
+// v2.8 — log an actual bet from the projection screen. "Log to ledger" writes a
+// RESEARCH record (what the model said, decision PASS/WATCH, no stake) — useful,
+// but not a bet, which is a reasonable thing to have expected from the name.
+// This is the bet ticket: it prefills from the projection but every field is
+// editable, because the number you actually got is rarely the number on screen.
+// modelCall is computed from what the model ACTUALLY said, not from what you
+// chose — that field is the whole reason the ledger stays honest about which
+// losses the model owns and which it never endorsed.
+function BetTicket({ r, overPrice, underPrice, onDone }) {
+    const pW = r.pOver / (r.pOver + r.pUnder);
+    const edge = pW - 0.5;
+    const strength = Math.abs(edge);
+    const modelSide = edge > 0 ? "Over" : "Under";
+    const modelPassed = strength < 0.07; // matches the Terminal's own verdict threshold
+    const [side, setSide] = useState(modelPassed ? "Over" : modelSide);
+    const [line, setLine] = useState(String(r.line ?? ""));
+    const [price, setPrice] = useState(String((edge > 0 ? overPrice : underPrice) || ""));
+    const [stake, setStake] = useState("");
+    const [closing, setClosing] = useState("");
+    const [notes, setNotes] = useState("");
+    const [saved, setSaved] = useState("");
+    // keep the price in step with the side unless the user has typed their own
+    const [priceTouched, setPriceTouched] = useState(false);
+    const pickSide = (s) => {
+        setSide(s);
+        if (!priceTouched)
+            setPrice(String((s === "Over" ? overPrice : underPrice) || ""));
+    };
+    const modelCall = modelPassed
+        ? "AGAINST (pass)"
+        : side === modelSide ? "MODEL LEAN" : "AGAINST";
+    const save = async () => {
+        const st = parseFloat(stake);
+        if (!st || st <= 0) {
+            setSaved("Enter a stake first \u2014 a bet without one can't be scored.");
+            return;
+        }
+        const desc = `${r.awayName} @ ${r.homeName} ${side} ${line}`;
+        const d = amToDec(price);
+        const bets = await store.get("ingenuity:ledger:bets", SEED_BETS);
+        const bet = {
+            date: etDayKey(),
+            loggedAt: Date.now(),
+            src: "terminal",
+            desc,
+            type: "straight",
+            market: "total",
+            legs: null,
+            odds: price === "" ? null : parseFloat(price),
+            dec: d,
+            clv: (amToDec(closing) != null && d != null)
+                ? Math.round((d / amToDec(closing) - 1) * 1000) / 10
+                : null,
+            stake: st,
+            modelCall,
+            result: "P", // pending until you grade it in the ledger
+            net: 0,
+            notes: [
+                `model ${(pW * 100).toFixed(1)}% ${modelSide.toLowerCase()} \u00b7 projected ${r.mean.toFixed(2)} vs book ${r.line}`,
+                notes.trim(),
+            ].filter(Boolean).join(" \u2014 "),
+        };
+        const ok = await store.set("ingenuity:ledger:bets", [...bets, bet]);
+        if (!ok) {
+            setSaved(`Couldn't save \u2014 ${store.lastError || "storage refused the write"}.`);
+            return;
+        }
+        setSaved(`Logged: ${desc} at ${price || "no price"}, $${st}. Marked ${modelCall}. Grade it in the Ledger once the game finishes.`);
+        if (onDone)
+            onDone();
+    };
+    return (React.createElement("div", { className: "bt" },
+        React.createElement("div", { className: "bt-head" }, "Log a bet on this game"),
+        React.createElement("div", { className: "bt-sides" }, ["Over", "Under"].map((s) => (React.createElement("button", { key: s, className: "bt-side " + (side === s ? "on " : "") + s.toLowerCase(), onClick: () => pickSide(s) },
+            s,
+            " ",
+            React.createElement("em", null,
+                ((s === "Over" ? r.pOver : r.pUnder) * 100).toFixed(1),
+                "% model"))))),
+        React.createElement("div", { className: "bt-grid" },
+            React.createElement("label", null,
+                React.createElement("span", null, "Line you took"),
+                React.createElement("input", { value: line, onChange: (e) => setLine(e.target.value), inputMode: "decimal", placeholder: String(r.line ?? "") })),
+            React.createElement("label", null,
+                React.createElement("span", null, "Price you got"),
+                React.createElement("input", { value: price, onChange: (e) => { setPrice(e.target.value); setPriceTouched(true); }, inputMode: "text", placeholder: "-110" })),
+            React.createElement("label", null,
+                React.createElement("span", null, "Stake"),
+                React.createElement("input", { value: stake, onChange: (e) => setStake(e.target.value), inputMode: "decimal", placeholder: "50" })),
+            React.createElement("label", null,
+                React.createElement("span", null,
+                    "Closing line ",
+                    React.createElement("em", null, "optional")),
+                React.createElement("input", { value: closing, onChange: (e) => setClosing(e.target.value), inputMode: "text", placeholder: "-105" }))),
+        React.createElement("label", { className: "bt-notes" },
+            React.createElement("span", null, "Note"),
+            React.createElement("input", { value: notes, onChange: (e) => setNotes(e.target.value), placeholder: "why you took it, where you got the number" })),
+        React.createElement("div", { className: "bt-call " + (modelCall === "MODEL LEAN" ? "ok" : "warn") },
+            "This will be logged as ",
+            React.createElement("strong", null, modelCall),
+            modelCall === "MODEL LEAN"
+                ? " \u2014 the model leaned this way at full depth."
+                : modelPassed
+                    ? " \u2014 the model called this a pass, so the ledger will record it as a bet it never endorsed. That distinction is the point of the record; it isn't a judgement on the bet."
+                    : " \u2014 you're taking the opposite side to the model's lean."),
+        React.createElement("button", { className: "ing-run small", onClick: save }, "Save bet to ledger"),
+        saved && React.createElement("p", { className: "bt-saved" }, saved),
+        React.createElement("p", { className: "bt-note" }, "Prices default to the board's, but the number you actually got is what matters \\u2014 edit anything. Closing line is optional and can be added in the Ledger later; it's what turns this into CLV, the only measure that says whether you're beating the market rather than just winning bets.")));
+}
+function Readout({ r, onLog, logMsg, overPrice, underPrice }) {
+    const [ticketOpen, setTicketOpen] = useState(false);
     // win probability conditional on no push — the right basis for pricing a bet
     const pPush = r.pPush || 0;
     const pWinOver = r.pOver / (r.pOver + r.pUnder);
@@ -3678,8 +3793,10 @@ function Readout({ r, onLog, logMsg }) {
                 " pts on the over")),
             React.createElement("p", { className: "ing-ev-note" }, "The no-vig line is the book's true opinion with its margin stripped out \u2014 that's the number to beat, not the posted price. Positive EV is a lead to verify, not a green light."))),
         React.createElement("div", { className: "ing-logrow" },
-            onLog && React.createElement("button", { className: "ing-ghost", onClick: () => onLog(r), disabled: !!logMsg }, "Log to ledger"),
+            onLog && React.createElement("button", { className: "ing-ghost", onClick: () => onLog(r), disabled: !!logMsg, title: "Saves what the model said about this game \\u2014 no stake, no bet" }, "Log as research"),
+            React.createElement("button", { className: "ing-ghost", onClick: () => setTicketOpen(!ticketOpen) }, ticketOpen ? "Hide bet ticket" : "\u002b Log a bet"),
             logMsg && React.createElement("span", { className: "ing-importmsg" }, logMsg)),
+        ticketOpen && React.createElement(BetTicket, { r: r, overPrice: overPrice, underPrice: underPrice }),
         React.createElement("div", { className: "ing-probs" },
             React.createElement("div", { className: "ing-prob" },
                 React.createElement("span", { className: "ing-prob-label" },
@@ -7929,6 +8046,28 @@ const CSS = `
 .jr-pick { margin-top: 10px; width: 100%; background: var(--field); border: 1px solid var(--line); color: var(--ink); padding: 9px 11px; border-radius: 8px; font-family: 'Space Grotesk'; font-size: 13px; }
 .jr-pick:focus { outline: none; border-color: var(--phos); box-shadow: 0 0 0 3px rgba(52,230,168,0.12); }
 .jr-head { display: flex; flex-direction: column; align-items: stretch; gap: 0; }
+
+/* ---- bet ticket (v2.8) ---- */
+.bt { background: var(--field2); border: 1px solid var(--line); border-radius: 14px; padding: 18px; margin-top: 4px; }
+.bt-head { font-family: 'Archivo'; font-size: 10px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--ink-dim); margin-bottom: 13px; }
+.bt-sides { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }
+.bt-side { background: var(--field); border: 1px solid var(--line); border-radius: 10px; padding: 12px; color: var(--ink-dim); cursor: pointer; font-family: 'Space Grotesk'; font-size: 15px; font-weight: 600; text-align: center; transition: border-color 0.15s, color 0.15s; }
+.bt-side em { display: block; font-style: normal; font-size: 10.5px; font-weight: 400; margin-top: 3px; opacity: 0.85; }
+.bt-side.on.over { border-color: var(--phos); color: var(--phos); background: rgba(52,230,168,0.08); }
+.bt-side.on.under { border-color: var(--cyan); color: var(--cyan); background: rgba(95,217,232,0.08); }
+.bt-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 11px; }
+.bt-grid label, .bt-notes { display: flex; flex-direction: column; gap: 5px; }
+.bt-notes { margin-top: 11px; }
+.bt-grid span, .bt-notes span { font-family: 'Archivo'; font-size: 9px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-dim); }
+.bt-grid span em, .bt-notes span em { font-style: normal; opacity: 0.6; letter-spacing: 0.04em; }
+.bt-grid input, .bt-notes input { background: var(--field); border: 1px solid var(--line); color: var(--ink); padding: 10px 12px; border-radius: 8px; font-family: 'Space Grotesk'; font-size: 15px; font-variant-numeric: tabular-nums; }
+.bt-grid input:focus, .bt-notes input:focus { outline: none; border-color: var(--phos); box-shadow: 0 0 0 3px rgba(52,230,168,0.12); }
+.bt-call { margin: 14px 0 12px; padding: 11px 13px; border-radius: 9px; font-size: 12.5px; line-height: 1.55; }
+.bt-call.ok { background: rgba(52,230,168,0.07); border-left: 3px solid var(--phos); color: var(--ink); }
+.bt-call.warn { background: rgba(245,196,81,0.07); border-left: 3px solid var(--amber); color: var(--ink); }
+.bt-call strong { font-family: 'Archivo'; letter-spacing: 0.04em; }
+.bt-saved { margin-top: 11px; font-size: 12.5px; line-height: 1.55; color: var(--phos); background: rgba(52,230,168,0.06); border-left: 2px solid var(--phos); padding: 9px 12px; border-radius: 6px; }
+.bt-note { font-size: 11px; color: var(--ink-dim); line-height: 1.6; margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
 
 /* ---- bullpen board (v1.7) ---- */
 .pen { border: 1px solid var(--line); border-radius: 12px; background: var(--field2); overflow: hidden; margin-bottom: 16px; }
