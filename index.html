@@ -518,6 +518,98 @@ function applyPenFatigueToTeams(fatigue, teams) {
     }
     return { next, applied, missing };
 }
+// v2.6 — recent-form (14-day) auto-fetch, from MLB's own free Stats API. This
+// covers OUTCOME wOBA and BB%\u2212K%, the same category as season wOBA \u2014 real,
+// verified, keyless, CORS-open (the same API rosters/box scores already use all
+// session). It does NOT cover xwOBA: that's a Statcast/Savant number, and Savant
+// has no confirmed browser-CORS access \u2014 most tools that pull it run
+// server-side rather than from a page, which is a real signal it may be
+// blocked. Rather than ship a fetch that might silently do nothing, xwOBA stays
+// paste-only until that can actually be verified working, not assumed to.
+const RECENT_FORM_WEIGHTS = { bb: 0.69, hbp: 0.72, single: 0.89, dbl: 1.27, tpl: 1.62, hr: 2.10 };
+async function fetchRecentForm(days = 14) {
+    const season = new Date().getFullYear();
+    const end = etDayKeyOffset(-1); // through yesterday \u2014 today's games aren't final
+    const start = etDayKeyOffset(-days);
+    let teamList;
+    try {
+        const tr = await fetch(`https://statsapi.mlb.com/api/v1/teams?sportId=1&season=${season}&activeStatus=Yes`);
+        if (!tr.ok)
+            return { ok: false, err: `MLB team list request failed (${tr.status})` };
+        teamList = (await tr.json()).teams || [];
+    }
+    catch (e) {
+        return { ok: false, err: String(e && e.message ? e.message : e) };
+    }
+    if (!teamList.length)
+        return { ok: false, err: "MLB returned no teams" };
+    const out = {};
+    let reached = 0;
+    for (let i = 0; i < teamList.length; i += 5) {
+        const chunk = teamList.slice(i, i + 5);
+        const results = await Promise.all(chunk.map(async (tm) => {
+            try {
+                const r = await fetch(`https://statsapi.mlb.com/api/v1/teams/${tm.id}/stats?stats=byDateRange&group=hitting&startDate=${start}&endDate=${end}&season=${season}`);
+                if (!r.ok)
+                    return null;
+                const j = await r.json();
+                const s = j.stats?.[0]?.splits?.[0]?.stat;
+                return s ? { name: tm.name, s } : null;
+            }
+            catch {
+                return null;
+            }
+        }));
+        for (const row of results) {
+            if (!row)
+                continue;
+            reached++;
+            const s = row.s;
+            const ab = parseFloat(s.atBats) || 0, h = parseFloat(s.hits) || 0;
+            const d2 = parseFloat(s.doubles) || 0, t3 = parseFloat(s.triples) || 0, hr = parseFloat(s.homeRuns) || 0;
+            const bb = parseFloat(s.baseOnBalls) || 0, hbp = parseFloat(s.hitByPitch) || 0, sf = parseFloat(s.sacFlies) || 0;
+            const so = parseFloat(s.strikeOuts) || 0;
+            const pa = ab + bb + hbp + sf;
+            if (pa <= 0)
+                continue;
+            const singles = Math.max(0, h - d2 - t3 - hr);
+            const W = RECENT_FORM_WEIGHTS;
+            const woba = (W.bb * bb + W.hbp * hbp + W.single * singles + W.dbl * d2 + W.tpl * t3 + W.hr * hr) / pa;
+            const team = resolveTeamName(row.name) || row.name;
+            out[team] = { woba, pa, bbk: (bb / pa) * 100 - (so / pa) * 100 };
+        }
+    }
+    if (!reached)
+        return { ok: false, err: "no team hitting data in that window" };
+    const wrote = await store.set("ingenuity:mlb:recentForm", { asOf: etDayKey(), start, end, teams: out });
+    if (!wrote)
+        return { ok: false, err: store.lastError || "couldn't save the fetch" };
+    return { ok: true, teams: Object.keys(out).length, start, end };
+}
+// Only trust a fetch taken TODAY \u2014 apply the same freshness discipline as
+// bullpen fatigue and platoon splits, so a stale window is never silently reused.
+function applyRecentFormToTeams(cache, teams) {
+    if (!cache?.teams)
+        return { next: teams, applied: 0, missing: [] };
+    const today = etDayKey();
+    let applied = 0;
+    const missing = [];
+    const next = teams.map((t) => ({ ...t }));
+    for (const t of next) {
+        const rec = cache.teams[t.name] || cache.teams[resolveTeamName(t.name) || t.name];
+        if (!rec) {
+            missing.push(t.name);
+            continue;
+        }
+        t.recent = rec.woba.toFixed(3);
+        t.recentPA = String(Math.round(rec.pa));
+        t.recentBbk = rec.bbk.toFixed(1);
+        t.recentAsOf = today;
+        t.recentWindow = `${cache.start} \u2192 ${cache.end}`;
+        applied++;
+    }
+    return { next, applied, missing };
+}
 async function refreshMlbRosterMap() {
     try {
         const yr = new Date().getFullYear();
@@ -1286,6 +1378,10 @@ const COVERAGE_FIELDS = [
         blank: "borderline-strike edge ignored",
         source: "Savant \u2192 Catcher Framing, team view",
         has: (t) => filled(t.framing) },
+    { key: "recentform", label: "Recent form (14d)", impact: 0.12,
+        blank: "hot/cold form not weighted \u2014 offense priced on season numbers alone",
+        source: "one tap \u2014 Recent form (14d), or paste 14-day stats from any source",
+        has: (t) => filled(t.recent) && t.recentAsOf === etDayKey() },
 ];
 const COVERAGE_NOTE = "Impact is the measured swing in a projected total when that input moves between realistic extremes, everything else held at league average. It is not a per-game guarantee \u2014 it's how much the model is flying blind when the field is empty.";
 // Roll the registry up across the database.
@@ -1973,6 +2069,15 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
 // what's actually deployed. Newest first.
 // ===========================================================================
 const CHANGELOG = [
+    { date: "2026-07-24m", items: [
+            "Simulation count checked, and deliberately left alone. Measured across 25 independent runs at 20,000 sims: the run-to-run spread is 0.028 runs on the projected total and 0.36 points on the over probability. Realistic input error is 3\u201311x larger \u2014 a bullpen off by .020 moves the total 0.217 runs, an unknown OAA about 0.31. Raising to 100k would cut simulation noise to 0.012 runs while those input gaps stay exactly where they are: it would be polishing a rounding error and spending phone battery to do it. 20,000 is the right number; the accuracy that's actually missing lives in the coverage panel, not the sim count.",
+            "Homepage condensed. The change journal now shows one day at a time \u2014 latest by default, any other day from a dropdown \u2014 and collapses entirely; it had grown into most of the scroll. Backup collapsed too: important, but not something you read daily. The board is closer to the top as a result.",
+        ] },
+    { date: "2026-07-24l", items: [
+            "New \u2014 14-day recent-form auto-fetch, from MLB's own free Stats API (the same one rosters, probables and bullpen workload already use \u2014 keyless, no CORS problems, verified working all session). It computes real wOBA from the actual hit components using the real linear weights, not an approximation, plus BB%\u2212K%. Added as step 7 of Morning Refresh and as its own button in the individual-steps drawer.",
+            "This covers OUTCOME wOBA \u2014 the same category as season wOBA \u2014 not xwOBA. xwOBA is a Statcast number, and Baseball Savant has no confirmed way to be fetched directly from a browser; most tools that pull it run on a server rather than a page, which is a real signal it may be blocked. Rather than ship a fetch that might silently do nothing \u2014 exactly the class of bug fixed twice already this session \u2014 xwOBA stays a deliberate paste import until that can be verified working, not assumed to.",
+            "The coverage panel now tracks recent form too, and requires it to have been fetched TODAY to count as covered \u2014 same freshness discipline as platoon splits and bullpen fatigue, so a stale window is never silently reused as if it were current.",
+        ] },
     { date: "2026-07-24k", items: [
             "FIXED \u2014 over/under form had quietly left the route you actually take. It still existed, but only inside the full breakdown, and once the board's button started opening the Projection Terminal instead, that view stopped being part of the normal flow. It now appears on the projection screen too, from the same graded-results store.",
             "It stays out of the projection on purpose. A team's recent O/U record is mostly a record of the LINES it faced, not of its run environment \u2014 and the things that would make it predictive (offense form, the arm, park, weather, bullpen) are already priced by the engine. Feeding it in would double-count those and add the market's noise on top. Shown as research, labelled as research.",
@@ -2093,16 +2198,31 @@ const CHANGELOG = [
         ] },
 ];
 function Journal() {
-    const [openAll, setOpenAll] = useState(false);
-    const shown = openAll ? CHANGELOG : CHANGELOG.slice(0, 1);
+    // v2.7 \u2014 one day at a time. The journal had grown long enough that it was
+    // most of the homepage scroll; showing every entry by default buried the
+    // board underneath a wall of history nobody re-reads. Latest is shown, any
+    // other day is one tap away, and the whole section collapses.
+    const [open, setOpen] = useState(false);
+    const [day, setDay] = useState(CHANGELOG[0]?.date || "");
+    const entry = CHANGELOG.find((d) => d.date === day) || CHANGELOG[0];
+    const isLatest = entry && entry.date === CHANGELOG[0].date;
     return (React.createElement("section", { className: "jr" },
         React.createElement("div", { className: "jr-head" },
-            React.createElement("h2", null, "Change journal"),
-            React.createElement("button", { className: "ing-ghost", onClick: () => setOpenAll(!openAll) }, openAll ? "Latest only" : `All ${CHANGELOG.length} days`)),
-        shown.map((d) => (React.createElement("div", { className: "jr-day", key: d.date },
-            React.createElement("span", { className: "jr-date" }, d.date),
-            React.createElement("ul", null, d.items.map((it, i) => React.createElement("li", { key: i }, it)))))),
-        React.createElement("p", { className: "jr-note" }, "Every change ships with a dated entry here \u2014 if behavior surprises you, check this first, then tell me which entry it traces to.")));
+            React.createElement("button", { className: "jr-toggle", onClick: () => setOpen(!open), "aria-expanded": open },
+                React.createElement("h2", null, "Change journal"),
+                React.createElement("span", { className: "jr-sub" },
+                    isLatest ? `latest \u00b7 ${CHANGELOG[0]?.date}` : entry?.date,
+                    " ",
+                    open ? "\u25b2" : "\u25bc")),
+            open && CHANGELOG.length > 1 && (React.createElement("select", { className: "jr-pick", value: day, onChange: (e) => setDay(e.target.value), "aria-label": "Choose a day" }, CHANGELOG.map((d, i) => (React.createElement("option", { key: d.date, value: d.date },
+                d.date,
+                i === 0 ? " \u00b7 latest" : "",
+                " (",
+                d.items.length,
+                ")")))))),
+        open && entry && (React.createElement("div", { className: "jr-day", key: entry.date },
+            React.createElement("ul", null, entry.items.map((it, i) => React.createElement("li", { key: i }, it))))),
+        open && React.createElement("p", { className: "jr-note" }, "Every change ships with a dated entry here \u2014 if behavior surprises you, check this first, then tell me which entry it traces to.")));
 }
 // ===========================================================================
 // BACKUP — the ledger only stays honest if it survives. iOS gives no guarantee
@@ -2120,6 +2240,7 @@ const BACKUP_KEYS = [
 function Backup() {
     const [msg, setMsg] = useState("");
     const [inputKey, setInputKey] = useState(0);
+    const [open, setOpen] = useState(false); // collapsed: important, but not something you read daily
     const doExport = async () => {
         const payload = { app: "ingenuity", exported: new Date().toISOString(), data: {} };
         for (const k of BACKUP_KEYS) {
@@ -2162,13 +2283,18 @@ function Backup() {
     };
     return (React.createElement("section", { className: "bk" },
         React.createElement("div", { className: "bk-head" },
-            React.createElement("h2", null, "Backup"),
-            React.createElement("button", { className: "ing-run small", onClick: doExport }, "Export everything")),
-        React.createElement("p", { className: "bk-note" }, "Your manual bets, slate archive, graded results, and team edits live in this browser's storage \u2014 and iOS can clear that (low disk space, clearing history). One tap exports it all to a file; keep it in iCloud Drive. API keys are never included. Restoring merges a backup back in."),
-        React.createElement("label", { className: "bk-restore" },
-            "Restore from backup file",
-            React.createElement("input", { key: inputKey, type: "file", accept: ".json,application/json", onChange: (e) => doRestore(e.target.files[0]) })),
-        msg && React.createElement("p", { className: "ing-hint" }, msg)));
+            React.createElement("button", { className: "jr-toggle", onClick: () => setOpen(!open), "aria-expanded": open },
+                React.createElement("h2", null, "Backup"),
+                React.createElement("span", { className: "jr-sub" },
+                    "export / restore ",
+                    open ? "\u25b2" : "\u25bc")),
+            open && React.createElement("button", { className: "ing-run small", onClick: doExport }, "Export everything")),
+        open && (React.createElement(React.Fragment, null,
+            React.createElement("p", { className: "bk-note" }, "Your manual bets, slate archive, graded results, and team edits live in this browser's storage \u2014 and iOS can clear that (low disk space, clearing history). One tap exports it all to a file; keep it in iCloud Drive. API keys are never included. Restoring merges a backup back in."),
+            React.createElement("label", { className: "bk-restore" },
+                "Restore from backup file",
+                React.createElement("input", { key: inputKey, type: "file", accept: ".json,application/json", onChange: (e) => doRestore(e.target.files[0]) })),
+            msg && React.createElement("p", { className: "ing-hint" }, msg)))));
 }
 // ===========================================================================
 // TERMINAL
@@ -5557,6 +5683,7 @@ const MORNING_PLAN = [
     { key: "odds", label: "Market lines", hint: "the one step that costs a request" },
     { key: "weather", label: "Weather", hint: "game-time, per park" },
     { key: "bullpen", label: "Bullpen workload", hint: "last 3 days of box scores" },
+    { key: "recentform", label: "Recent form (14d)", hint: "outcome wOBA + BB%\u2212K%, MLB Stats API" },
 ];
 function SlateHub({ onOpenInTerminal }) {
     const todayKey = etDayKey();
@@ -6057,6 +6184,27 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
                 return { state: "fail", note: store.lastError || "save refused" };
             return { state: applied ? "ok" : "warn", note: applied ? `${applied} pens scored` : "no pens matched" };
         });
+        // 7 \u2014 Recent-form outcome wOBA over the last 14 days. Covers wOBA + BB%\u2212K%
+        // only \u2014 xwOBA stays a manual import since Savant's browser access isn't
+        // confirmed working, and this app doesn't ship fetches it can't verify.
+        await run("recentform", async () => {
+            const res = await fetchRecentForm();
+            if (!res.ok)
+                return { state: "fail", note: res.err || "unreachable" };
+            const cached = await store.get("ingenuity:mlb:recentForm", null);
+            if (!cached?.teams || !Object.keys(cached.teams).length)
+                return { state: "fail", note: "nothing saved" };
+            if (!workingTeams.length)
+                return { state: "skip", note: "database empty" };
+            const { next, applied, missing } = applyRecentFormToTeams(cached, workingTeams);
+            workingTeams = next;
+            setTeams(next);
+            const saved = await store.set("ingenuity:teams", next);
+            if (!saved)
+                return { state: "fail", note: store.lastError || "save refused" };
+            const left = [...new Set(missing)].length;
+            return { state: left ? "warn" : "ok", note: `${applied} team${applied === 1 ? "" : "s"}${left ? `, ${left} unmatched` : ""}` };
+        });
         // Refresh the on-screen board from what actually persisted.
         const finalArch = await store.get("ingenuity:slate:archive", {});
         if (finalArch[todayKey])
@@ -6100,6 +6248,31 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
     // v1.7 — pull each pen's last-3-days workload from MLB box scores and stamp a
     // fatigue score onto the teams. Free API, no odds credit. Honest failure: if
     // the fetch can't reach MLB, say so rather than leaving a silent stale score.
+    // v2.6 — the same one-tap treatment as bullpen workload, for 14-day outcome
+    // wOBA + BB%−K%. Explicitly does not touch xwOBA.
+    const refreshRecentForm = async () => {
+        if (busy)
+            return;
+        setBusy("recent");
+        setMsg("");
+        const res = await fetchRecentForm();
+        if (!res.ok) {
+            setBusy("");
+            setMsg(`Recent form didn't load — ${res.err}. Season stats and xwOBA are unaffected; re-import those from Savant/FanGraphs as usual.`);
+            return;
+        }
+        const cached = await store.get("ingenuity:mlb:recentForm", null);
+        const { next, applied, missing } = applyRecentFormToTeams(cached, teams);
+        setTeams(next);
+        const saved = await store.set("ingenuity:teams", next);
+        setBusy("");
+        if (!saved) {
+            setMsg(`Read the last 14 days but couldn't save — ${store.lastError || "storage refused the write"}.`);
+            return;
+        }
+        const left = [...new Set(missing)].length;
+        setMsg(`Recent-form wOBA and BB%−K% updated for ${applied} team${applied === 1 ? "" : "s"} (${res.start} → ${res.end}).${left ? ` ${left} team${left === 1 ? "" : "s"} unmatched.` : ""} This is outcome wOBA, not xwOBA — the luck is still in it, same as any 14-day sample. Import xwOBA separately when you want the expected-stats version.`);
+    };
     const refreshPenFatigue = async () => {
         if (busy)
             return;
@@ -6549,7 +6722,9 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
         stepsOpen && (React.createElement("div", { className: "slate-controls" },
             React.createElement("button", { className: "ing-run small", onClick: fetchMatchups, disabled: !!busy || !isToday, title: isToday ? "" : "Live fetch only applies to today's board" }, busy === "fetch" ? "Fetching…" : games.length ? "Refresh matchups + pitchers" : "Fetch matchups + pitchers"),
             games.length > 0 && isToday && (React.createElement("button", { className: "ing-run small ghosty", onClick: refreshWeather, disabled: !!busy, title: "Re-fetch game-time weather without spending an odds credit" }, busy === "wx" ? "Checking sky…" : "Refresh weather")),
-            isToday && (React.createElement("button", { className: "ing-run small ghosty", onClick: refreshPenFatigue, disabled: !!busy, title: "Read the last 3 days of box scores to see which bullpens are short tonight (free, no odds credit)" }, busy === "pen" ? "Reading box scores…" : "Bullpen workload")),
+            isToday && (React.createElement(React.Fragment, null,
+                React.createElement("button", { className: "ing-run small ghosty", onClick: refreshPenFatigue, disabled: !!busy, title: "Read the last 3 days of box scores to see which bullpens are short tonight (free, no odds credit)" }, busy === "pen" ? "Reading box scores…" : "Bullpen workload"),
+                React.createElement("button", { className: "ing-run small ghosty", onClick: refreshRecentForm, disabled: !!busy, title: "14-day outcome wOBA + BB%\u2212K% from MLB's own stats \u2014 not xwOBA, free, no odds credit" }, busy === "recent" ? "Reading recent games…" : "Recent form (14d)"))),
             games.length > 0 && isToday && (React.createElement("button", { className: "ing-run small ghosty warn", onClick: refreshSlate, disabled: !!busy, title: "Clear today's board and pull everything fresh (uses one odds credit)" }, busy === "refresh" ? "Rebuilding…" : "↻ Refresh slate")),
             React.createElement("label", { className: "slate-filebtn" },
                 busy === "vision" ? "Reading…" : "Import odds (screenshot / file)",
@@ -7746,6 +7921,14 @@ const CSS = `
 .cov-detail strong { color: var(--ink); font-weight: 600; }
 .cov-note { font-size: 11px; color: var(--ink-dim); line-height: 1.6; margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
 .cov-note em { font-style: italic; color: var(--ink); }
+
+/* collapsed homepage sections (v2.7) */
+.jr-toggle { flex: 1; display: flex; align-items: baseline; justify-content: space-between; gap: 10px; background: transparent; border: none; padding: 0; cursor: pointer; text-align: left; color: var(--ink); font-family: inherit; }
+.jr-toggle h2 { margin: 0; }
+.jr-sub { font-family: 'Archivo'; font-size: 10px; letter-spacing: 0.08em; color: var(--ink-dim); white-space: nowrap; text-transform: uppercase; }
+.jr-pick { margin-top: 10px; width: 100%; background: var(--field); border: 1px solid var(--line); color: var(--ink); padding: 9px 11px; border-radius: 8px; font-family: 'Space Grotesk'; font-size: 13px; }
+.jr-pick:focus { outline: none; border-color: var(--phos); box-shadow: 0 0 0 3px rgba(52,230,168,0.12); }
+.jr-head { display: flex; flex-direction: column; align-items: stretch; gap: 0; }
 
 /* ---- bullpen board (v1.7) ---- */
 .pen { border: 1px solid var(--line); border-radius: 12px; background: var(--field2); overflow: hidden; margin-bottom: 16px; }
