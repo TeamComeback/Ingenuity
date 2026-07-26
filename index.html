@@ -2069,6 +2069,11 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
 // what's actually deployed. Newest first.
 // ===========================================================================
 const CHANGELOG = [
+    { date: "2026-07-26", items: [
+            "Lineups screen: a Today button, and the date now defaults to today rather than yesterday \u2014 today's slate is the one you're working, so it shouldn't take two taps to reach.",
+            "New \u2014 'Save all available lineups'. One press reads every game on the slate and saves whatever is actually posted right now. Teams with a confirmed batting order get it; teams with only a probable starter get the arm recorded on its own, since that's the projection's largest single input; teams with nothing posted are reported rather than guessed at. Orders appear team by team as first pitch nears, so it's built to be run again later \u2014 already-saved teams simply refresh. The merge accumulates across all 30 teams before a single save, so real imported stats survive and nothing gets duplicated or overwritten by an earlier pass.",
+            "New \u2014 league-wide bullpen fatigue board in the Projection Terminal, most-worked at the top. Shows reliever pitches on each of the last three days, arms working back-to-back, and a plain state from heavily used to rested. It's ranked by the exact weighted score the engine already uses, so the list and the projection can never disagree. It reads workload only \u2014 it can't see injuries, options, or a manager's plan \u2014 so the top of the list means 'likely short', not 'confirmed unavailable', and it says so. Stale data is labelled with its date rather than shown as if it were current.",
+        ] },
     { date: "2026-07-25c", items: [
             "Baseball Savant PLAYER CARDS now paste. Copying an individual player's Savant page gives a different shape from a leaderboard \u2014 the name, then alternating label/value lines all the way down ('xERA', '5.61', 'K %', '23.8'). Every parser expected a table, so it read the whole thing as a one-cell header called 'Kohl Drake' and imported nothing. It now has a real parser: stats the model uses (wOBA, xwOBA, ERA, xERA, BB%, K%, Barrel%, Hard-Hit%, PA, BF) are read, and ones it doesn't (xBA, Fastball Velo, Chase%, Whiff%) are skipped rather than mistaken for a new player \u2014 which is what previously split one card into several phantom entries. Multiple cards pasted together each parse separately, and normal tables still route to their existing parsers untouched.",
         ] },
@@ -2682,6 +2687,7 @@ function Terminal({ onHome, pendingGame, onPendingConsumed }) {
                     React.createElement("p", { className: "ing-empty-mark" }, "\u25C6"),
                     React.createElement("p", null, "Set the matchup and run a projection."),
                     React.createElement("p", { className: "ing-empty-sub" }, "Load teams from your database or enter numbers directly. Blank fields fall back to league average."))),
+                React.createElement(BullpenLeaderboard, null),
                 handoff && React.createElement("div", { className: "term-handoff" },
                     handoff,
                     React.createElement("button", { onClick: () => setHandoff(""), "aria-label": "Dismiss" }, "\u00D7")),
@@ -2896,7 +2902,7 @@ function estWoba(obp, slg) {
     return ((1.7 * o + s) / 3).toFixed(3);
 }
 function LineupFetcher({ teams, saveTeams }) {
-    const [date, setDate] = useState(yesterdayISO());
+    const [date, setDate] = useState(etDayKey()); // today by default \u2014 that's the slate you're working
     const [games, setGames] = useState(null);
     const [busy, setBusy] = useState(false);
     const [error, setError] = useState(null);
@@ -2978,8 +2984,10 @@ function LineupFetcher({ teams, saveTeams }) {
     // those estimates, which moved team offense by ~.05 wOBA on data quality alone
     // and made the same game project two different ways. Now: keep every real stat,
     // keep the full roster, and only estimate for players we've never seen.
-    const importTeam = (t) => {
-        const next = [...teams];
+    // Pure merge, so a bulk save can fold many teams into one accumulating array
+    // instead of calling saveTeams in a loop against stale state.
+    const mergeLineup = (t, into) => {
+        const next = [...into];
         // MLB's feed says "Colorado Rockies"; the database stores "Rockies". An
         // exact string compare misses, which used to push a SECOND team with only
         // lineup estimates on it — sitting alongside the real one with your
@@ -3029,15 +3037,103 @@ function LineupFetcher({ teams, saveTeams }) {
             next[i] = merged;
         else
             next.push(merged);
-        saveTeams(next);
         const spNote = t.probable
             ? (base.rotation || []).some((r) => normName(r.name) === normName(t.probable))
                 ? `, ${t.probable} already in the rotation with his stats`
-                : `, ${t.probable} added to the rotation with no stats yet — import him from Savant or the projection will refuse to price this game`
+                : `, ${t.probable} added to the rotation with no stats yet \u2014 import him from Savant or the projection will refuse to price this game`
             : "";
-        setImportMsg(`Saved ${t.name}'s batting order (${lineup.length}).` +
+        return { next, kept, estimated, added, lineupLen: lineup.length, spNote };
+    };
+    // v3.0 \u2014 save every lineup that's actually posted, in one pass. Batting orders
+    // appear team by team as first pitch approaches, so this is explicitly a
+    // "take what exists now" operation, safe to run repeatedly through the
+    // afternoon: teams already saved simply get refreshed, and anything not yet
+    // posted is reported rather than guessed at.
+    const saveAllAvailable = async () => {
+        if (!games || !games.length || busy)
+            return;
+        setBusy(true);
+        setError(null);
+        setImportMsg("Reading box scores\u2026");
+        let working = teams;
+        const savedTeams = [], probableOnly = [], notPosted = [];
+        let anyFetchFailed = false;
+        for (let i = 0; i < games.length; i += 4) {
+            const chunk = games.slice(i, i + 4);
+            const results = await Promise.all(chunk.map(async (g) => {
+                try {
+                    const r = await fetch(`https://statsapi.mlb.com/api/v1/game/${g.gamePk}/boxscore`);
+                    if (!r.ok)
+                        return { g, err: true };
+                    return { g, j: await r.json() };
+                }
+                catch {
+                    return { g, err: true };
+                }
+            }));
+            for (const { g, j, err } of results) {
+                if (err || !j?.teams) {
+                    anyFetchFailed = true;
+                    continue;
+                }
+                for (const [slot, teamName, probable] of [["away", g.away, g.awaySP], ["home", g.home, g.homeSP]]) {
+                    const players = Object.values(j.teams[slot]?.players || {})
+                        .filter((p) => p.battingOrder)
+                        .sort((a, b) => parseInt(a.battingOrder) - parseInt(b.battingOrder))
+                        .slice(0, 10)
+                        .map((p) => {
+                        const b = p.seasonStats?.batting || {};
+                        return {
+                            name: p.person?.fullName || "?",
+                            order: Math.round(parseInt(p.battingOrder) / 100),
+                            obp: b.obp || "", slg: b.slg || "",
+                            woba: estWoba(b.obp, b.slg),
+                            pa: b.plateAppearances ?? "",
+                        };
+                    });
+                    if (players.length) {
+                        const res = mergeLineup({ name: teamName, players, probable }, working);
+                        working = res.next;
+                        savedTeams.push(teamName);
+                    }
+                    else if (probable) {
+                        // no order yet, but the starter is known \u2014 worth recording on its own,
+                        // since the arm is the projection's largest single input
+                        const res = mergeLineup({ name: teamName, players: [], probable }, working);
+                        working = res.next;
+                        probableOnly.push(teamName);
+                    }
+                    else {
+                        notPosted.push(teamName);
+                    }
+                }
+            }
+        }
+        const ok = await saveTeamsChecked(working);
+        setBusy(false);
+        if (!ok) {
+            setImportMsg(`Read everything but couldn't save \u2014 ${store.lastError || "storage refused the write"}. Nothing was changed.`);
+            return;
+        }
+        setImportMsg(`${savedTeams.length} batting order${savedTeams.length === 1 ? "" : "s"} saved` +
+            (probableOnly.length ? ` \u00b7 ${probableOnly.length} starter${probableOnly.length === 1 ? "" : "s"} recorded without an order yet` : "") +
+            (notPosted.length ? ` \u00b7 ${notPosted.length} nothing posted yet` : "") +
+            (anyFetchFailed ? " \u00b7 some games couldn't be read" : "") +
+            ". Orders post team by team as first pitch nears \u2014 run this again later to pick up the rest.");
+    };
+    // saveTeams may or may not report success depending on caller; wrap it so a
+    // refused write is never reported as a successful bulk save.
+    const saveTeamsChecked = async (next) => {
+        await saveTeams(next);
+        return await store.set("ingenuity:teams", next);
+    };
+    // Single-team save from a game card: merge, persist, report.
+    const importTeam = (t) => {
+        const { next, kept, estimated, added, lineupLen, spNote } = mergeLineup(t, teams);
+        saveTeams(next);
+        setImportMsg(`Saved ${t.name}'s batting order (${lineupLen}).` +
             (kept ? ` ${kept} kept their imported stats.` : "") +
-            (estimated ? ` ${estimated} ${estimated === 1 ? "is an OBP/SLG estimate" : "are OBP/SLG estimates"}${added ? ` (${added} new to your database)` : ""} — import real numbers and the projection sharpens.` : "") +
+            (estimated ? ` ${estimated} ${estimated === 1 ? "is an OBP/SLG estimate" : "are OBP/SLG estimates"}${added ? ` (${added} new to your database)` : ""} \u2014 import real numbers and the projection sharpens.` : "") +
             (kept === 0 && estimated > 0 ? " No imported stats for this team yet, so team offense is an estimate." : "") +
             spNote);
     };
@@ -3081,7 +3177,17 @@ function LineupFetcher({ teams, saveTeams }) {
             React.createElement("div", { className: "ing-fetchbar" },
                 React.createElement("input", { type: "date", value: date, onChange: (e) => setDate(e.target.value) }),
                 React.createElement("button", { className: "ing-run small", onClick: fetchSchedule, disabled: busy }, busy ? "Fetching…" : "Fetch slate"),
+                React.createElement("button", { className: "ing-ghost", onClick: () => { setDate(etDayKey()); } }, "Today"),
                 React.createElement("button", { className: "ing-ghost", onClick: () => { setDate(yesterdayISO()); } }, "Yesterday")),
+            games && games.length > 0 && (React.createElement(React.Fragment, null,
+                React.createElement("button", { className: "mr-cta", onClick: saveAllAvailable, disabled: busy, style: { marginTop: 12 } }, busy ? "Reading box scores\u2026" : (React.createElement("span", null,
+                    "Save all available lineups",
+                    React.createElement("small", null,
+                        games.length,
+                        " game",
+                        games.length === 1 ? "" : "s",
+                        " \\u00b7 takes whatever is posted right now")))),
+                React.createElement("p", { className: "ing-hint", style: { marginTop: 8 } }, "Orders post team by team as first pitch nears, so this is safe to run again later \\u2014 already-saved teams just refresh, and anything not yet posted is reported rather than guessed."))),
             error === "fetch-failed" && (React.createElement("div", { className: "ing-fetcherr" },
                 React.createElement("h3", null, "Couldn't reach the MLB Stats API from here"),
                 React.createElement("p", null, "This environment may block the request. Two ways to keep the database fed without screenshots:"),
@@ -3314,6 +3420,83 @@ function OUFormPanel({ away, home }) {
                 React.createElement("span", { className: "gd-streak-tag " + (s.side === "O" ? "ov" : s.side === "U" ? "un" : "") }, s.streak >= 2 ? `${s.streak} straight ${s.side === "O" ? "OVER" : s.side === "U" ? "UNDER" : "PUSH"}` : `last: ${s.side === "O" ? "OVER" : s.side === "U" ? "UNDER" : "PUSH"}`),
                 React.createElement("span", { className: "gd-streak-seq" }, s.last.map((x) => x.ou).join(" ")))) : React.createElement("span", { className: "gd-streak-tag" }, "no graded games yet")))),
         React.createElement("p", { className: "gd-streak-note" }, "A streak is a fact, not a lean. \"Hot unders keep going under\" and \"a series is due to flip\" are opposite reads of the same run \\u2014 both are stories told after the fact. Shown for research, deliberately NOT in the projection, and it grows only as your own graded results accumulate.")));
+}
+// v3.0 \u2014 league-wide bullpen fatigue board. The per-game panel shows the two
+// pens in front of you; this ranks all 30 so you can see where tonight's slate
+// sits relative to everyone else. Most-worked at the top. Reads the same stored
+// workload the engine uses, so the ordering can't disagree with the projection.
+function BullpenLeaderboard() {
+    const [open, setOpen] = useState(false);
+    const [data, setData] = useState(null);
+    useEffect(() => {
+        let alive = true;
+        (async () => {
+            const cache = await store.get("ingenuity:mlb:penFatigue", null);
+            if (!alive)
+                return;
+            if (!cache?.teams) {
+                setData({ stale: false, rows: [] });
+                return;
+            }
+            const rows = Object.entries(cache.teams).map(([team, rec]) => {
+                const score = penFatigueScore(rec);
+                return {
+                    team,
+                    score: score == null ? 0 : score,
+                    d1: Math.round(rec.d1 || 0), d2: Math.round(rec.d2 || 0), d3: Math.round(rec.d3 || 0),
+                    b2b: rec.backToBack || 0,
+                    arms: Array.isArray(rec.arms) ? rec.arms.length : 0,
+                };
+            }).sort((a, b) => b.score - a.score);
+            setData({ asOf: cache.asOf, stale: cache.asOf !== etDayKey(), rows });
+        })();
+        return () => { alive = false; };
+    }, []);
+    if (!data)
+        return null;
+    const word = (s) => s >= 0.55 ? { k: "down", t: "heavily used" }
+        : s >= 0.2 ? { k: "watch", t: "worked" }
+            : s <= -0.5 ? { k: "ready", t: "rested" }
+                : { k: "ok", t: "normal" };
+    return (React.createElement("div", { className: "plb" },
+        React.createElement("button", { className: "plb-head", onClick: () => setOpen(!open), "aria-expanded": open },
+            React.createElement("span", null, "Bullpen fatigue \\u2014 all 30"),
+            React.createElement("span", { className: "plb-head-r" },
+                data.rows.length ? (data.stale ? `from ${data.asOf}` : "most worked first") : "no workload data yet",
+                " ",
+                open ? "\u25b2" : "\u25bc")),
+        open && (React.createElement("div", { className: "plb-body" }, !data.rows.length ? (React.createElement("p", { className: "ing-hint" },
+            "Nothing loaded yet. Run ",
+            React.createElement("strong", null, "Bullpen workload"),
+            " (or the Morning Refresh) and this fills in from the last three days of box scores.")) : (React.createElement(React.Fragment, null,
+            data.stale && (React.createElement("p", { className: "plb-stale" },
+                "This is ",
+                data.asOf,
+                "'s workload, not today's. Re-run Bullpen workload before leaning on it \\u2014 a single off day resets a pen.")),
+            React.createElement("div", { className: "plb-legend" },
+                React.createElement("span", null, "Team"),
+                React.createElement("span", { className: "plb-days" }, "3d \\u00b7 2d \\u00b7 1d"),
+                React.createElement("span", null, "State")),
+            React.createElement("ol", { className: "plb-list" }, data.rows.map((r, i) => {
+                const w = word(r.score);
+                return (React.createElement("li", { key: r.team, className: "plb-row " + w.k },
+                    React.createElement("span", { className: "plb-rank" }, i + 1),
+                    React.createElement("span", { className: "plb-team" },
+                        r.team,
+                        r.b2b > 0 && React.createElement("em", null,
+                            " ",
+                            r.b2b,
+                            " b2b")),
+                    React.createElement("span", { className: "plb-days" },
+                        React.createElement("i", { className: r.d3 ? "on" : "" }, r.d3 || "\u2013"),
+                        React.createElement("i", { className: r.d2 ? "on" : "" }, r.d2 || "\u2013"),
+                        React.createElement("i", { className: r.d1 ? "hot" : "" }, r.d1 || "\u2013")),
+                    React.createElement("span", { className: "plb-state " + w.k }, w.t)));
+            })),
+            React.createElement("p", { className: "plb-note" },
+                "Pitches thrown by relievers on each of the last three days, yesterday on the right; ",
+                React.createElement("strong", null, "b2b"),
+                " counts arms that worked consecutive days. Ranked by the same weighted score the engine uses, so this and the projection can't disagree. It reads workload only \\u2014 it can't see injuries, options, or a manager's plan, so treat the top of this list as \"likely short\", not \"confirmed unavailable\".")))))));
 }
 function BullpenBoard({ A, H, compact }) {
     const [open, setOpen] = useState(!compact);
@@ -8179,6 +8362,36 @@ const CSS = `
 .bt-call strong { font-family: 'Archivo'; letter-spacing: 0.04em; }
 .bt-saved { margin-top: 11px; font-size: 12.5px; line-height: 1.55; color: var(--phos); background: rgba(52,230,168,0.06); border-left: 2px solid var(--phos); padding: 9px 12px; border-radius: 6px; }
 .bt-note { font-size: 11px; color: var(--ink-dim); line-height: 1.6; margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
+
+/* ---- bullpen leaderboard (v3.0) ---- */
+.plb { border: 1px solid var(--line); border-radius: 12px; background: var(--field2); overflow: hidden; margin-bottom: 16px; }
+.plb-head { width: 100%; display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 13px 15px; background: transparent; border: none; color: var(--ink); cursor: pointer; font-family: 'Archivo'; font-size: 11px; letter-spacing: 0.13em; text-transform: uppercase; text-align: left; }
+.plb-head-r { color: var(--ink-dim); font-size: 10px; letter-spacing: 0.05em; text-transform: none; white-space: nowrap; }
+.plb-body { padding: 4px 15px 16px; border-top: 1px solid var(--line); }
+.plb-stale { font-size: 11.5px; color: var(--amber); background: rgba(245,196,81,0.08); border-left: 2px solid var(--amber); padding: 9px 11px; border-radius: 6px; margin: 12px 0; line-height: 1.55; }
+.plb-legend { display: grid; grid-template-columns: 22px 1fr 96px auto; gap: 9px; font-family: 'Archivo'; font-size: 8.5px; letter-spacing: 0.11em; text-transform: uppercase; color: var(--ink-dim); padding: 12px 0 6px; border-bottom: 1px solid var(--line); }
+.plb-legend span:first-child { grid-column: 2; }
+.plb-legend .plb-days { text-align: center; }
+.plb-list { list-style: none; margin: 0; padding: 0; counter-reset: none; }
+.plb-row { display: grid; grid-template-columns: 22px 1fr 96px auto; gap: 9px; align-items: center; padding: 8px 0; border-bottom: 1px solid rgba(28,51,41,0.5); font-size: 13px; }
+.plb-row:last-child { border-bottom: none; }
+.plb-rank { font-family: 'Archivo'; font-size: 10px; color: var(--ink-dim); text-align: right; font-variant-numeric: tabular-nums; }
+.plb-team { font-weight: 500; min-width: 0; }
+.plb-team em { font-style: normal; font-family: 'Archivo'; font-size: 9px; letter-spacing: 0.05em; color: var(--rust); margin-left: 5px; }
+.plb-days { display: flex; justify-content: center; gap: 4px; }
+.plb-days i { font-style: normal; font-family: 'Archivo'; font-size: 10px; min-width: 26px; text-align: center; padding: 2px 0; border-radius: 4px; background: rgba(255,255,255,0.03); color: var(--ink-dim); font-variant-numeric: tabular-nums; }
+.plb-days i.on { color: var(--ink); background: rgba(255,255,255,0.06); }
+.plb-days i.hot { color: var(--field); background: var(--amber); font-weight: 700; }
+.plb-state { font-family: 'Archivo'; font-size: 9px; letter-spacing: 0.06em; text-transform: uppercase; white-space: nowrap; }
+.plb-state.down { color: var(--rust); }
+.plb-state.watch { color: var(--amber); }
+.plb-state.ready { color: var(--phos); }
+.plb-state.ok { color: var(--ink-dim); }
+.plb-note { font-size: 10.5px; color: var(--ink-dim); line-height: 1.6; margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
+@media (max-width: 560px) {
+  .plb-legend, .plb-row { grid-template-columns: 20px 1fr 88px; }
+  .plb-legend span:last-child, .plb-state { display: none; }
+}
 
 /* ---- bullpen board (v1.7) ---- */
 .pen { border: 1px solid var(--line); border-radius: 12px; background: var(--field2); overflow: hidden; margin-bottom: 16px; }
