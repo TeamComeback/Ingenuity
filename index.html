@@ -2069,6 +2069,9 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
 // what's actually deployed. Newest first.
 // ===========================================================================
 const CHANGELOG = [
+    { date: "2026-07-25c", items: [
+            "Baseball Savant PLAYER CARDS now paste. Copying an individual player's Savant page gives a different shape from a leaderboard \u2014 the name, then alternating label/value lines all the way down ('xERA', '5.61', 'K %', '23.8'). Every parser expected a table, so it read the whole thing as a one-cell header called 'Kohl Drake' and imported nothing. It now has a real parser: stats the model uses (wOBA, xwOBA, ERA, xERA, BB%, K%, Barrel%, Hard-Hit%, PA, BF) are read, and ones it doesn't (xBA, Fastball Velo, Chase%, Whiff%) are skipped rather than mistaken for a new player \u2014 which is what previously split one card into several phantom entries. Multiple cards pasted together each parse separately, and normal tables still route to their existing parsers untouched.",
+        ] },
     { date: "2026-07-25b", items: [
             "FIXED \u2014 the odds-API key had no home inside the app itself. The 'live feed?' panel showed a message meant for the Claude artifact sandbox ('can't be pulled from inside this app') on the hosted build too, and pointed everyone toward a separate companion file, pull-slate.html, to fetch odds and copy them back in. That file saves its key under 'ingenuity:oddsApiKey'; the app reads 'ingenuity:oddsapi:key' \u2014 two different names, same site, so a key entered in one was invisible to the other no matter how many times it was retyped.",
             "On the hosted build there's now a real key field right in the app, wired to the exact fetch Morning Refresh's Market lines step already uses \u2014 paste it once and both the automated step and the manual 'Pull live slate now' button use it going forward. Any key already saved via pull-slate.html is picked up automatically the first time the app loads, under its real name, so nothing needs retyping. The artifact build keeps its honest sandbox message, since that restriction is real there.",
@@ -4817,7 +4820,87 @@ function normalizeFangraphsPaste(text) {
     }
     return out.length > 1 ? out.join("\n") : raw;
 }
+// v2.9 — Baseball Savant PLAYER CARD paste. Copying an individual player's page
+// (rather than a leaderboard) gives a completely different shape: the name, then
+// alternating LABEL / VALUE lines all the way down \u2014 "xERA", "5.61", "K %",
+// "23.8". Every existing parser expects a table (headers, then rows), so this
+// landed as a one-cell header called "Kohl Drake" and produced nothing. It's a
+// legitimate way to copy one player, so it gets a real parser rather than a
+// better error message.
+const CARD_LABELS = {
+    "woba": "woba", "xwoba": "xwoba", "est_woba": "xwoba", "est woba": "xwoba", "expected woba": "xwoba",
+    "era": "era", "xera": "xera",
+    "k%": "k", "so%": "k", "bb%": "bb",
+    "barrel%": "barrel", "brl%": "barrel",
+    "hard-hit%": "hardHit", "hardhit%": "hardHit", "hard hit%": "hardHit",
+    "pa": "pa", "bf": "bf", "batters faced": "bf", "tbf": "bf",
+};
+// normalise "Hard-Hit %" / "K %" / "est_woba" to a single lookup form
+const cardKey = (s) => String(s || "").toLowerCase().replace(/\s*%\s*$/, "%").replace(/\s+/g, " ").trim();
+const cardIsNum = (s) => /^[-+]?\.?\d/.test(String(s || "").trim());
+function parsePlayerCards(text) {
+    const lines = String(text || "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    if (lines.length < 3)
+        return [];
+    const out = [];
+    let cur = null;
+    let matched = 0;
+    for (let i = 0; i < lines.length; i++) {
+        const isNum = cardIsNum(lines[i]);
+        const nextNum = i + 1 < lines.length && cardIsNum(lines[i + 1]);
+        if (isNum)
+            continue; // a stray value; its label already consumed it
+        // A label is any non-numeric line FOLLOWED BY a number. That covers stats
+        // the model doesn't use (xBA, Fastball Velo, Chase%) — they're skipped
+        // rather than mistaken for a new player, which is what previously split one
+        // card into several phantom players.
+        if (nextNum) {
+            const field = CARD_LABELS[cardKey(lines[i])];
+            if (field && cur) {
+                const n = parseFloat(String(lines[i + 1]).replace(/[^0-9.\-]/g, ""));
+                if (!isNaN(n)) {
+                    cur.fields[field] = n;
+                    matched++;
+                }
+            }
+            i++; // consume the value line either way
+            continue;
+        }
+        // non-numeric, and NOT followed by a number — that's a player name
+        if (cur && Object.keys(cur.fields).length)
+            out.push(cur);
+        cur = { name: lines[i], fields: {} };
+    }
+    if (cur && Object.keys(cur.fields).length)
+        out.push(cur);
+    // require real signal before claiming this shape \u2014 two label/value hits and
+    // a name, otherwise let the normal table parsers have it
+    if (!out.length || matched < 2)
+        return [];
+    return out.map((p) => ({
+        name: p.name,
+        team: null,
+        pa: p.fields.pa ?? null,
+        woba: p.fields.woba ?? null,
+        xwoba: p.fields.xwoba ?? null,
+        era: p.fields.era ?? null,
+        xera: p.fields.xera ?? null,
+        bb: p.fields.bb ?? null,
+        k: p.fields.k ?? null,
+        barrel: p.fields.barrel ?? null,
+        hardHit: p.fields.hardHit ?? null,
+        bf: p.fields.bf ?? null,
+        ip: null,
+        wobaFrom: null,
+    }));
+}
 function savantCsvToRows(csv) {
+    // A single-player Savant card has an unmistakable shape (alternating stat
+    // label / value), so try it before the table parsers — it returns [] unless
+    // it genuinely matches, which keeps normal tables on their existing path.
+    const cards = parsePlayerCards(csv);
+    if (cards.length)
+        return { rows: cards, headers: ["player card"] };
     csv = normalizeFangraphsPaste(csv);
     // FanGraphs paste shape: the header is transposed — each column label sits on
     // its OWN line (#, Name, Team, G, PA, ... wOBA, xwOBA, ... WAR), and the data
