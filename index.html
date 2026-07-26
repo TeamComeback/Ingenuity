@@ -2069,6 +2069,10 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
 // what's actually deployed. Newest first.
 // ===========================================================================
 const CHANGELOG = [
+    { date: "2026-07-25b", items: [
+            "FIXED \u2014 the odds-API key had no home inside the app itself. The 'live feed?' panel showed a message meant for the Claude artifact sandbox ('can't be pulled from inside this app') on the hosted build too, and pointed everyone toward a separate companion file, pull-slate.html, to fetch odds and copy them back in. That file saves its key under 'ingenuity:oddsApiKey'; the app reads 'ingenuity:oddsapi:key' \u2014 two different names, same site, so a key entered in one was invisible to the other no matter how many times it was retyped.",
+            "On the hosted build there's now a real key field right in the app, wired to the exact fetch Morning Refresh's Market lines step already uses \u2014 paste it once and both the automated step and the manual 'Pull live slate now' button use it going forward. Any key already saved via pull-slate.html is picked up automatically the first time the app loads, under its real name, so nothing needs retyping. The artifact build keeps its honest sandbox message, since that restriction is real there.",
+        ] },
     { date: "2026-07-25", items: [
             "New \u2014 log an actual bet from the projection screen. The old 'Log to ledger' button wrote a RESEARCH record (what the model said, no stake), which was a reasonable thing to misread from the name; it's now labelled 'Log as research', and a separate '+ Log a bet' opens a real ticket. It prefills side, line and price from the projection, but every field is editable, because the number you actually got is rarely the number on screen.",
             "The ticket computes modelCall from what the MODEL said, not from what you picked \u2014 bet with a confirmed lean and it logs MODEL LEAN, bet against it or on a game the model passed and it logs AGAINST. It tells you which label it will use before you save. That distinction is the entire reason the ledger can say honestly which losses the model owns and which it never endorsed, and it would be worthless if the app let the label follow the bet.",
@@ -5803,6 +5807,7 @@ const MORNING_PLAN = [
     { key: "recentform", label: "Recent form (14d)", hint: "outcome wOBA + BB%\u2212K%, MLB Stats API" },
 ];
 function SlateHub({ onOpenInTerminal }) {
+    const hosted = typeof STANDALONE !== "undefined" && STANDALONE;
     const todayKey = etDayKey();
     const [slate, setSlate] = useState(null); // { date, games: [{away, home, awayP, homeP, line, over, under, openLine.., proj?}] }
     const [viewDate, setViewDate] = useState(todayKey); // the day the whole board is focused on
@@ -5847,7 +5852,22 @@ function SlateHub({ onOpenInTerminal }) {
             if (changed || dd.merged)
                 await store.set("ingenuity:teams", dd.teams);
             setTeams(dd.teams);
-            setApiKey(await store.get("ingenuity:oddsapi:key", ""));
+            {
+                const own = await store.get("ingenuity:oddsapi:key", "");
+                if (own) {
+                    setApiKey(own);
+                }
+                else {
+                    // one-time pickup of a key saved by the separate pull-slate.html
+                    // helper document, so switching to the in-app puller doesn't mean
+                    // retyping a key that already exists on this same site.
+                    const legacy = await store.get("ingenuity:oddsApiKey", "");
+                    if (legacy) {
+                        setApiKey(legacy);
+                        await store.set("ingenuity:oddsapi:key", legacy);
+                    }
+                }
+            }
             const arch = await store.get("ingenuity:slate:archive", {});
             const day = await store.get("ingenuity:slate:day", null);
             // rescue any pre-archive board still sitting in the old single-slot key
@@ -6853,14 +6873,22 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
             React.createElement("span", { className: "ing-staged-name" }, staged.name),
             React.createElement("button", { className: "ing-run small", onClick: importStaged, disabled: !!busy }, "Import this"),
             React.createElement("button", { className: "ing-ghost", onClick: removeStaged, disabled: !!busy }, "\u2715 Remove"))),
-        liveOpen && (React.createElement("div", { className: "slate-live" },
+        liveOpen && (React.createElement("div", { className: "slate-live" }, hosted ? (React.createElement(React.Fragment, null,
             React.createElement("p", { className: "ing-hint", style: { margin: 0 } },
-                "Live multi-book odds can't be pulled from inside this app \u2014 its sandbox blocks outside servers, and no subscription changes that. Use the companion ",
+                "Free key at ",
+                React.createElement("strong", null, "the-odds-api.com"),
+                " \u2014 paste it once below. Morning Refresh's Market lines step, and Pull Live Slate here, will both use it automatically; no more copying between apps."),
+            React.createElement("label", { className: "ing-f", style: { marginTop: 10 } },
+                React.createElement("span", null, "Odds API key"),
+                React.createElement("input", { value: apiKey, onChange: (e) => setApiKey(e.target.value), onBlur: () => store.set("ingenuity:oddsapi:key", apiKey.trim()), placeholder: "paste your key", autoComplete: "off" })),
+            React.createElement("button", { className: "ing-run small", onClick: pullLive, disabled: !!busy, style: { marginTop: 10 } }, busy === "live" ? "Pulling\u2026" : "Pull live slate now"))) : (React.createElement(React.Fragment, null,
+            React.createElement("p", { className: "ing-hint", style: { margin: 0 } },
+                "Live multi-book odds can't be pulled from inside the Claude artifact \u2014 its sandbox blocks outside servers. This works on the hosted build. Use the companion ",
                 React.createElement("strong", null, "pull-slate.html"),
                 " file (runs in your browser, reaches the odds servers fine): pull the slate there, copy the lines, paste them below. Free key at ",
                 React.createElement("strong", null, "the-odds-api.com"),
                 "; one pull covers the whole board."),
-            React.createElement("button", { className: "ing-run small", onClick: () => { setLiveOpen(false); setPasteOpen(true); } }, "Open the paste box"))),
+            React.createElement("button", { className: "ing-run small", onClick: () => { setLiveOpen(false); setPasteOpen(true); } }, "Open the paste box"))))),
         pasteOpen && (React.createElement("div", { className: "slate-paste" },
             React.createElement("textarea", { rows: 5, value: pasteText, onChange: (e) => setPasteText(e.target.value), placeholder: "Paste a whole board from Covers/ESPN/DraftKings — teams, pitchers, totals & prices get read from the mess.\n\nShorthand also works: skenes wheeler 8.5 -104 -122\nOr clean lines: Phillies (Zack Wheeler) @ Tigers (Tarik Skubal) | 7.5 | +102 | -122" }),
             React.createElement("button", { className: "ing-run small", onClick: applyPaste }, "Merge into slate"))),
