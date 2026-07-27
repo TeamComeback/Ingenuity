@@ -2069,6 +2069,10 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
 // what's actually deployed. Newest first.
 // ===========================================================================
 const CHANGELOG = [
+    { date: "2026-07-26c", items: [
+            "FIXED — Savant player-card import only worked for a plain card, not the full percentile-rankings page. Copying the richer page (the one with Value/Pitching Run Value bars, a percentile scale, and a movement-profile chart) mixes in section headers, scale captions, and \"NOT QUALIFIED\" text that isn't a number. The old rule treated any non-numeric line not immediately followed by a number as the start of a new player — so the real name got silently discarded the moment the first section header appeared, and every real stat that followed ended up misattributed to whatever chrome text happened to be last. A second, separate bug compounded it: the number check matched anything merely starting with a digit, so a line like \"2017 MLB Percentile Rankings\" was read as a number and swallowed the player's name outright.",
+            "Both are fixed. The number check now requires the whole line to be numeric, and a new player only starts on a line that actually looks like a name — two to five Capitalized words, no digits — with run-value section headers and percentile/ranking chrome recognised structurally rather than chased with an ever-growing list of exact phrases. Verified against the exact reported paste: parses to one player, every stat lands correctly, and two full percentile pages pasted back to back stay separate with nothing bleeding between them.",
+        ] },
     { date: "2026-07-26b", items: [
             "FIXED — literal escape codes were rendering as text. Headings showed 'BULLPEN FATIGUE \\u2014 ALL 30' and 'RECENT OVER/UNDER FORM \\u00b7 FROM YOUR GRADED RESULTS' instead of an em dash and a middot. Inside a JavaScript string an escape like that decodes fine, but in JSX body text it is just characters — and several recent components were written with escapes in body text. All 141 display escapes across both builds are now real characters, which works correctly in both places. The one genuine regex escape (the combining-diacritical range used for accented names) was deliberately left alone.",
             "Bullpens moved to its own tab in the Terminal, alongside Project / Database / Lineups. It was buried under the projection screen, which meant scrolling past a single matchup to reach a slate-wide view. The tab is self-sufficient: workload can be loaded or refreshed from there directly, it re-reads after refreshing rather than showing what it had a moment ago, and stale data is labelled with its date instead of being presented as current. The per-matchup bullpen panel stays on the projection screen where it belongs.",
@@ -5076,7 +5080,40 @@ const CARD_LABELS = {
 };
 // normalise "Hard-Hit %" / "K %" / "est_woba" to a single lookup form
 const cardKey = (s) => String(s || "").toLowerCase().replace(/\s*%\s*$/, "%").replace(/\s+/g, " ").trim();
-const cardIsNum = (s) => /^[-+]?\.?\d/.test(String(s || "").trim());
+// A whole-string match, not "starts with a digit" — the old version matched
+// "2017 MLB Percentile Rankings" as a number (it starts with 2017), which
+// silently ate the player's actual name on the very next line.
+const cardIsNum = (s) => /^[-+]?\d*\.?\d+%?$/.test(String(s || "").trim());
+// A player-percentile page (as opposed to a plain card) copies a lot more than
+// name + stats: section headers ("Pitching", "Value"), scale captions ("POOR",
+// "AVERAGE", "GREAT"), and special-case text ("NOT QUALIFIED" where a rate stat
+// has too small a sample to rank). None of that is a number, so the old rule
+// ("non-numeric and not followed by a number = a new player") treated every one
+// of those lines as a new player — silently discarding the real name (it had
+// zero fields collected yet) and reattaching every real stat that followed to
+// whatever chart-chrome line happened to be last. Instead of chasing every
+// wording Savant might use, require a line to actually LOOK like a person's
+// name before it can start a new player: two to five Capitalized words, no
+// digits, not one of the phrases this exact page is known to use as chrome.
+const CARD_CHROME = new Set([
+    "value", "pitching", "hitting", "batting", "baserunning", "fielding", "poor", "average", "great",
+    "not qualified", "visual report", "3d pitches", "player similarity", "swing take profile",
+    "moves toward", "more rise", "mlb avg", "movement profile", "induced break", "savant",
+]);
+// The "Value" section headings ("Pitching Run Value", "Batting Run Value", ...)
+// are Title Case and 3 words, so they pass the shape test below on their own —
+// they need their own rule rather than a denylist that has to name every one.
+const CARD_CHROME_SUFFIX = /\brun value$/i;
+const CARD_CHROME_SUBSTR = /percentile|ranking|movement profile/i;
+const cardLooksLikeName = (s) => {
+    const t = String(s || "").trim();
+    if (!t || t.length > 40 || /\d/.test(t))
+        return false;
+    const low = t.toLowerCase();
+    if (CARD_CHROME.has(low) || CARD_CHROME_SUFFIX.test(low) || CARD_CHROME_SUBSTR.test(low))
+        return false;
+    return /^[A-Z][a-zA-Z.'-]*(\s+[A-Z][a-zA-Z.'-]*){1,4}$/.test(t);
+};
 function parsePlayerCards(text) {
     const lines = String(text || "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
     if (lines.length < 3)
@@ -5105,10 +5142,16 @@ function parsePlayerCards(text) {
             i++; // consume the value line either way
             continue;
         }
-        // non-numeric, and NOT followed by a number — that's a player name
-        if (cur && Object.keys(cur.fields).length)
-            out.push(cur);
-        cur = { name: lines[i], fields: {} };
+        // non-numeric, and NOT followed by a number — a real player name starts
+        // a new player. Anything else (section headers, scale captions, "NOT
+        // QUALIFIED", stray chrome text) is skipped and leaves the current player
+        // untouched, instead of silently stealing the tracking pointer away from
+        // him and orphaning every stat that follows.
+        if (cardLooksLikeName(lines[i])) {
+            if (cur && Object.keys(cur.fields).length)
+                out.push(cur);
+            cur = { name: lines[i], fields: {} };
+        }
     }
     if (cur && Object.keys(cur.fields).length)
         out.push(cur);
