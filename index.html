@@ -390,7 +390,7 @@ async function fetchBullpenFatigue() {
     let games = 0, boxes = 0;
     try {
         for (let di = 0; di < days.length; di++) {
-            const sr = await fetch(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${days[di]}`);
+            const sr = await mlbFetch(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${days[di]}`);
             if (!sr.ok)
                 continue;
             const sj = await sr.json();
@@ -407,7 +407,7 @@ async function fetchBullpenFatigue() {
                 const chunk = pks.slice(i, i + 5);
                 const results = await Promise.all(chunk.map(async (pk) => {
                     try {
-                        const br = await fetch(`https://statsapi.mlb.com/api/v1/game/${pk}/boxscore`);
+                        const br = await mlbFetch(`https://statsapi.mlb.com/api/v1/game/${pk}/boxscore`);
                         return br.ok ? await br.json() : null;
                     }
                     catch {
@@ -533,7 +533,7 @@ async function fetchRecentForm(days = 14) {
     const start = etDayKeyOffset(-days);
     let teamList;
     try {
-        const tr = await fetch(`https://statsapi.mlb.com/api/v1/teams?sportId=1&season=${season}&activeStatus=Yes`);
+        const tr = await mlbFetch(`https://statsapi.mlb.com/api/v1/teams?sportId=1&season=${season}&activeStatus=Yes`);
         if (!tr.ok)
             return { ok: false, err: `MLB team list request failed (${tr.status})` };
         teamList = (await tr.json()).teams || [];
@@ -549,7 +549,7 @@ async function fetchRecentForm(days = 14) {
         const chunk = teamList.slice(i, i + 5);
         const results = await Promise.all(chunk.map(async (tm) => {
             try {
-                const r = await fetch(`https://statsapi.mlb.com/api/v1/teams/${tm.id}/stats?stats=byDateRange&group=hitting&startDate=${start}&endDate=${end}&season=${season}`);
+                const r = await mlbFetch(`https://statsapi.mlb.com/api/v1/teams/${tm.id}/stats?stats=byDateRange&group=hitting&startDate=${start}&endDate=${end}&season=${season}`);
                 if (!r.ok)
                     return null;
                 const j = await r.json();
@@ -613,7 +613,7 @@ function applyRecentFormToTeams(cache, teams) {
 async function refreshMlbRosterMap() {
     try {
         const yr = new Date().getFullYear();
-        const r = await fetch(`https://statsapi.mlb.com/api/v1/sports/1/players?season=${yr}`);
+        const r = await mlbFetch(`https://statsapi.mlb.com/api/v1/sports/1/players?season=${yr}`);
         if (!r.ok)
             return { ok: false, n: 0 };
         const j = await r.json();
@@ -2937,7 +2937,7 @@ function LineupFetcher({ teams, saveTeams }) {
         setDetail(null);
         setImportMsg("");
         try {
-            const r = await fetch(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${date}&hydrate=probablePitcher`);
+            const r = await mlbFetch(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${date}&hydrate=probablePitcher`);
             if (!r.ok)
                 throw new Error(`HTTP ${r.status}`);
             const j = await r.json();
@@ -2963,7 +2963,7 @@ function LineupFetcher({ teams, saveTeams }) {
         setError(null);
         setImportMsg("");
         try {
-            const r = await fetch(`https://statsapi.mlb.com/api/v1/game/${g.gamePk}/boxscore`);
+            const r = await mlbFetch(`https://statsapi.mlb.com/api/v1/game/${g.gamePk}/boxscore`);
             if (!r.ok)
                 throw new Error(`HTTP ${r.status}`);
             const j = await r.json();
@@ -3079,7 +3079,7 @@ function LineupFetcher({ teams, saveTeams }) {
             const chunk = games.slice(i, i + 4);
             const results = await Promise.all(chunk.map(async (g) => {
                 try {
-                    const r = await fetch(`https://statsapi.mlb.com/api/v1/game/${g.gamePk}/boxscore`);
+                    const r = await mlbFetch(`https://statsapi.mlb.com/api/v1/game/${g.gamePk}/boxscore`);
                     if (!r.ok)
                         return { g, err: true };
                     return { g, j: await r.json() };
@@ -5184,6 +5184,126 @@ function parsePlayerCards(text) {
         wobaFrom: null,
     }));
 }
+// ---------------------------------------------------------------------------
+// MLB API CACHE (v3.1)
+// Every statsapi call went to the network on every mount. Switching to the
+// Lineups tab, going back, and returning re-fetched the same schedule and the
+// same box scores — slow on a phone, and needless load on a free public API.
+//
+// Two tiers, deliberately:
+//   * memory — every response, for the life of the tab. This is what kills the
+//     re-mount refetch, which is the actual complaint.
+//   * localStorage — only responses under 64 KB. Box scores are hundreds of KB
+//     each and a full slate would blow the quota; this app has already been bitten
+//     by storage filling up, so large bodies stay in memory and die with the tab.
+//
+// TTLs are keyed off what can still change. A box score for a game that hasn't
+// started is worthless in ten minutes; a finished day never changes again.
+// ---------------------------------------------------------------------------
+const MLB_CACHE_KEY = "ingenuity:mlb:apiCache";
+const MLB_CACHE_MAX_ENTRY = 64 * 1024;
+const _mlbMem = new Map();
+let _mlbDisk = null;
+function mlbTtl(url) {
+    if (/\/sports\/1\/players|\/api\/v1\/teams\?/.test(url))
+        return 24 * 60 * 60 * 1000; // rosters and the team list barely move
+    const m = url.match(/date=(\d{4}-\d{2}-\d{2})/);
+    if (m && m[1] < etDayKey())
+        return 7 * 24 * 60 * 60 * 1000; // a past day is final
+    return 10 * 60 * 1000; // today: lineups post through the afternoon
+}
+async function _mlbDiskLoad() {
+    if (_mlbDisk)
+        return _mlbDisk;
+    _mlbDisk = (await store.get(MLB_CACHE_KEY, null)) || {};
+    const now = Date.now();
+    let pruned = false;
+    for (const [k, v] of Object.entries(_mlbDisk)) {
+        if (!v || now - v.at > mlbTtl(k)) {
+            delete _mlbDisk[k];
+            pruned = true;
+        }
+    }
+    if (pruned)
+        await store.set(MLB_CACHE_KEY, _mlbDisk);
+    return _mlbDisk;
+}
+// Drop-in for fetch() against statsapi. Returns a Response-shaped object so no
+// call site has to change beyond the function name. `force` bypasses the cache.
+async function mlbFetch(url, force = false) {
+    const now = Date.now();
+    const ttl = mlbTtl(url);
+    if (!force) {
+        const hitMem = _mlbMem.get(url);
+        if (hitMem && now - hitMem.at < ttl)
+            return { ok: true, status: 200, cached: "memory", json: async () => hitMem.data };
+        const disk = await _mlbDiskLoad();
+        const hitDisk = disk[url];
+        if (hitDisk && now - hitDisk.at < ttl) {
+            _mlbMem.set(url, hitDisk);
+            return { ok: true, status: 200, cached: "stored", json: async () => hitDisk.data };
+        }
+    }
+    const r = await fetch(url);
+    if (!r.ok)
+        return r; // let the caller handle it exactly as before
+    const data = await r.json();
+    const entry = { at: now, data };
+    _mlbMem.set(url, entry);
+    try {
+        const size = JSON.stringify(data).length;
+        if (size <= MLB_CACHE_MAX_ENTRY) {
+            const disk = await _mlbDiskLoad();
+            disk[url] = entry;
+            await store.set(MLB_CACHE_KEY, disk); // returns false on quota; memory tier still holds
+        }
+    }
+    catch { /* oversized or unserializable — memory tier is enough */ }
+    return { ok: true, status: 200, cached: false, json: async () => data };
+}
+function mlbCacheClear() {
+    _mlbMem.clear();
+    _mlbDisk = {};
+    return store.set(MLB_CACHE_KEY, {});
+}
+// ---------------------------------------------------------------------------
+// HEADER RECOGNITION (v3.1)
+// Savant, FanGraphs, FantasyPros and a hand-typed table all spell the same
+// stat differently. Normalizing collapses punctuation, case and the percent
+// sign so one alias list covers every source. "%" becomes " pct " rather than
+// being dropped, so "K%" (a rate) never collapses onto "K" (a count).
+// ---------------------------------------------------------------------------
+const normHead = (h) => String(h || "")
+    .toLowerCase()
+    .replace(/%/g, " pct ")
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+const HEADER_ALIASES = {
+    "est_woba": ["est woba", "estimated woba", "expected woba", "xwoba", "x woba", "xwoba con", "xwobacon", "est woba using speedangle"],
+    "woba": ["woba", "woba value", "wobacon", "w oba"],
+    "hard_hit_percent": ["hard hit pct", "hardhit pct", "hard hit percent", "hardhit percent", "hard hit", "hardhit", "hh pct", "hh", "ev95 pct", "ev95percent", "hard contact pct"],
+    "barrel_batted_rate": ["barrel batted rate", "barrel pct", "barrel percent", "brl pct", "brl percent", "barrels per pa", "brl pa", "barrel", "brl", "barrel rate", "barrels pct"],
+    "k_percent": ["k pct", "k percent", "strikeout pct", "strikeout percent", "so pct", "kpct"],
+    "bb_percent": ["bb pct", "bb percent", "walk pct", "walk percent", "bbpct"],
+    "era": ["era", "earned run avg", "earned run average"],
+    "xera": ["xera", "x era", "est era", "expected era"],
+    "pa": ["pa", "plate appearances", "pa count"],
+    "ip": ["ip", "innings", "innings pitched"],
+    "obp": ["obp", "on base pct", "on base percent"],
+    "slg": ["slg", "slugging", "slugging pct"],
+    "team": ["team", "team name", "tm", "club", "player team", "team abbrev", "parent org", "team id"],
+};
+// canonical normalized head -> Set of every accepted normalized spelling
+const HEADER_ALIAS_GROUPS = (() => {
+    const out = {};
+    for (const [canon, list] of Object.entries(HEADER_ALIASES)) {
+        const set = new Set([normHead(canon), ...list.map(normHead)]);
+        for (const member of set)
+            out[member] = set;
+    }
+    return out;
+})();
 function savantCsvToRows(csv) {
     // A single-player Savant card has an unmistakable shape (alternating stat
     // label / value), so try it before the table parsers — it returns [] unless
@@ -5266,11 +5386,33 @@ function savantCsvToRows(csv) {
                 head = [...prefix, ...head];
         }
     }
-    const find = (cands) => { for (const c of cands) {
-        const i = head.indexOf(c);
-        if (i !== -1)
-            return i;
-    } return -1; };
+    // v3.1 — header matching was exact-string only, so a spelling that wasn't in
+    // the candidate list was missed silently and the whole paste could bail with
+    // "no usable columns". Headers are now normalized ("Hard Hit%", "hard_hit_percent",
+    // "HardHit %" all collapse to "hard hit pct") and checked against an alias table
+    // as a FALLBACK. Exact matches are still tried first, so nothing that parsed
+    // before parses differently now.
+    const find = (cands) => {
+        for (const c of cands) {
+            const i = head.indexOf(c);
+            if (i !== -1)
+                return i;
+        }
+        const normed = head.map(normHead);
+        for (const c of cands) {
+            const i = normed.indexOf(normHead(c));
+            if (i !== -1)
+                return i;
+        }
+        const group = HEADER_ALIAS_GROUPS[normHead(cands[0])];
+        if (group) {
+            for (let i = 0; i < normed.length; i++) {
+                if (group.has(normed[i]))
+                    return i;
+            }
+        }
+        return -1;
+    };
     const iName = (() => { const i = find(["last_name, first_name", "last_name,first_name", "player_name", "player", "name", "\u540d"]); return i !== -1 ? i : 0; })();
     const iPa = find(["pa", "pa_count", "plate_appearances"]);
     const iW = find(["woba", "woba_value"]);
@@ -6393,7 +6535,7 @@ function SlateHub({ onOpenInTerminal }) {
         try {
             let r;
             try {
-                r = await fetch(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${todayKey}&hydrate=probablePitcher`);
+                r = await mlbFetch(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${todayKey}&hydrate=probablePitcher`);
             }
             catch (netErr) {
                 setMsg("BLOCKED: this app can't reach the MLB stats API from here right now — the sandbox decides which domains are allowed and it can change. The paste box below is the reliable path: shorthand, game lines, or a whole copied board all work.");
@@ -6408,7 +6550,7 @@ function SlateHub({ onOpenInTerminal }) {
                 for (let k = 1; k <= 10 && !nextDate; k++) {
                     const d = etDayKey(new Date(Date.now() + k * 86400000));
                     try {
-                        const rr = await fetch(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${d}`);
+                        const rr = await mlbFetch(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${d}`);
                         const jj = await rr.json();
                         const g = jj.dates?.[0]?.games || [];
                         if (g.length) {
@@ -6532,7 +6674,7 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
             if (!arch[d])
                 continue;
             try {
-                const r = await fetch(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${d}&hydrate=probablePitcher`);
+                const r = await mlbFetch(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${d}&hydrate=probablePitcher`);
                 if (!r.ok)
                     continue;
                 const j = await r.json();
@@ -7101,7 +7243,7 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
         let got = 0, reached = false;
         for (const d of need) {
             try {
-                const r = await fetch(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${d}`);
+                const r = await mlbFetch(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${d}`);
                 if (!r.ok)
                     continue;
                 const j = await r.json();
