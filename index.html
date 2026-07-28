@@ -2069,6 +2069,10 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
 // what's actually deployed. Newest first.
 // ===========================================================================
 const CHANGELOG = [
+    { date: "2026-07-27b", items: [
+            "The team-level export now works from EITHER import box. Yesterday's fix was correct but landed in the \"Team-level stats\" box further down the page, while the obvious place to drop a Savant CSV is the big player-stats box at the top \u2014 two boxes that look nearly identical, with no way to tell which one wanted your file. That was a design problem, not a user error. Both the paste field and Choose File in the player box now detect a team-level export (OAA, framing, bullpen contact) and import it directly, saying plainly that it recognised team data rather than player data. Player exports are unaffected and still take the normal path.",
+            "The remaining failure message now describes both shapes instead of only the player one \u2014 so if something genuinely doesn't parse, it tells you what each kind actually needs.",
+        ] },
     { date: "2026-07-27", items: [
             "FIXED \u2014 Savant's real OAA CSV export (Fielding \u2192 Outs Above Average, team view) silently failed in the team-level stats box. Two separate bugs, both real: the export quotes every field, and the header/value matching never stripped those quotes, so \"team_name\" never matched anything and the box reported \"no Team column found\" even though the column was right there. Worse, a second bug meant that even once quotes were stripped, an empty field elsewhere in the row (Savant leaves position blank for team-level rows) got filtered out as if it were junk whitespace \u2014 silently shifting every column after it left by one, so OAA would have come from the wrong column entirely with no error at all. Verified against the exact uploaded file: all 30 teams now parse, and every value matches the raw CSV exactly (Angels \u201322, Cubs +47, checked against the source file directly, not just the parser's own output).",
             "The team-level stats box can now take the file directly \u2014 Choose File accepts the CSV as downloaded from Savant, no need to open it and copy the text back in.",
@@ -5503,8 +5507,20 @@ If none of these: {"kind":"unknown"}` },
                 const { rows, headers } = savantCsvToRows(content);
                 if (rows)
                     await applyRows(rows, `${file.name} (${rows.length} rows)`);
-                else
-                    setMsg(`${file.name}: no stat columns recognized. Headers found: ${headers.slice(0, 6).join(", ") || "none"}. Expected woba / est_woba / era / xera.`);
+                else {
+                    // Same fallback as the paste path: a team-level export (OAA, framing,
+                    // bullpen contact) is a perfectly reasonable thing to drop here.
+                    const ts = parseTeamStats(content);
+                    if (ts.rows && ts.rows.length) {
+                        const { next, applied, fieldsSet, unmatched } = applyTeamStats(ts.rows, teams);
+                        await saveTeams(next);
+                        setMsg(`${file.name} is a team-level export \u2014 imported it. Set ${fieldsSet} value${fieldsSet === 1 ? "" : "s"} across ${applied} team${applied === 1 ? "" : "s"}.${unmatched.length ? ` Unmatched: ${unmatched.slice(0, 5).join(", ")}.` : ""}`);
+                        logInterp("csv-file", true, `team-level ${applied} teams`);
+                    }
+                    else {
+                        setMsg(`${file.name}: no stat columns recognized. Headers found: ${headers.slice(0, 6).join(", ") || "none"}. Player stats need woba / est_woba / era / xera; team stats need a Team column plus OAA / Framing / Barrel% / HardHit%.`);
+                    }
+                }
             }
             removeStaged();
         }
@@ -5542,8 +5558,23 @@ If none of these: {"kind":"unknown"}` },
                     logInterp("csv-paste", false, "game line in stats box");
                 }
                 else {
-                    setMsg(`No stat columns found. Paste a Savant export (or table) that includes a header row with wOBA / est_woba, ERA / xERA, BB%, K%, and ideally a Team column. Headers seen: ${headers.slice(0, 6).join(", ") || "none"}.`);
-                    logInterp("csv-paste", false, "stat header, no columns");
+                    // Before failing: this may be a TEAM-level export (OAA, framing,
+                    // bullpen contact) rather than a player one. Those have their own box
+                    // further down the page, but the two look nearly identical and there
+                    // is no good reason to make someone find the right one — if the data
+                    // parses as team stats, just apply it here and say what happened.
+                    const ts = parseTeamStats(text);
+                    if (ts.rows && ts.rows.length) {
+                        const { next, applied, fieldsSet, unmatched } = applyTeamStats(ts.rows, teams);
+                        await saveTeams(next);
+                        setText("");
+                        setMsg(`That was a team-level export, not player stats \u2014 imported it anyway. Set ${fieldsSet} value${fieldsSet === 1 ? "" : "s"} across ${applied} team${applied === 1 ? "" : "s"}.${unmatched.length ? ` Unmatched: ${unmatched.slice(0, 5).join(", ")}.` : ""} Check the coverage panel to see what's still open.`);
+                        logInterp("csv-paste", true, `team-level ${applied} teams`);
+                    }
+                    else {
+                        setMsg(`No stat columns found. Paste a Savant export (or table) with a header row \u2014 player stats need wOBA / est_woba, ERA / xERA, BB%, K%; team stats need a Team column plus OAA / Framing / Barrel% / HardHit%. Headers seen: ${headers.slice(0, 6).join(", ") || "none"}.`);
+                        logInterp("csv-paste", false, "stat header, no columns");
+                    }
                 }
                 setBusy(false);
                 return;
