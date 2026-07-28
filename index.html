@@ -4338,7 +4338,10 @@ function Ledger({ onHome }) {
                         React.createElement("button", { onClick: () => settleBet(i, "L") }, "L"),
                         React.createElement("button", { onClick: () => settleBet(i, "P") }, "P"))) : (React.createElement("span", { className: `lg-bet-result ${b.result === "W" ? "win" : b.result === "P" ? "push" : "loss"}` }, b.result === "W" ? `WIN +$${b.net}` : b.result === "P" ? "PUSH" : "LOSS")))))))),
         tab === "archive" && (React.createElement("main", { className: "lg-main" },
-            React.createElement("div", { className: "lg-cards" }, games.map((g) => React.createElement(GameCard, { g: g, key: g.id }))))),
+            React.createElement("div", { className: "lg-cards" }, games.map((g) => React.createElement(GameCard, {
+                g: g, key: g.id,
+                onGrade: (id, patch) => saveGames(games.map((x) => (x.id === id ? { ...x, ...patch } : x))),
+            }))))),
         tab === "history" && React.createElement(HistoryView, null),
         tab === "addgame" && (React.createElement("main", { className: "lg-main narrow" },
             React.createElement("h2", { className: "lg-formtitle" }, "Log a new game"),
@@ -4436,11 +4439,40 @@ function F({ l, v, on, ph }) {
         React.createElement("span", null, l),
         React.createElement("input", { value: v ?? "", onChange: (e) => on(e.target.value), placeholder: ph || "—" })));
 }
-function GameCard({ g }) {
+// v3.1 — a game logged from the Terminal ("Log as research") had no path back
+// to a final score: GameCard only ever displayed g.final/g.outcome, and the
+// only form that could set them was "Add game", which creates a SECOND record
+// rather than completing this one. Every research-logged game therefore sat at
+// "Pending" forever and was invisible to the Brain's calibration stats, which
+// filter on g.final != null. This adds an inline Grade control that updates
+// the SAME record in place via onGrade, so logging and grading are the same
+// row, and the Brain sees it the moment it's graded.
+function GameCard({ g, onGrade }) {
     const missed = g.model != null && g.final != null ? (g.final - g.model) : null;
     const decisionClass = g.decision.includes("against") ? "warn" :
         g.decision.includes("independent") ? "warn" :
             g.decision.includes("BET") ? "ok" : "quiet";
+    const [open, setOpen] = useState(false);
+    const [final, setFinal] = useState(g.final != null ? String(g.final) : "");
+    const [outcome, setOutcome] = useState(g.outcome && g.outcome !== "Pending" ? g.outcome : "");
+    const isPending = g.final == null;
+    const save = () => {
+        const f = parseFloat(final);
+        if (final.trim() !== "" && isNaN(f))
+            return;
+        const finalVal = final.trim() === "" ? null : f;
+        // Auto-suggest an outcome from the model's lean vs the actual line, but
+        // never overwrite something the person typed themselves.
+        let out = outcome.trim();
+        if (!out && finalVal != null && g.line != null) {
+            const went = finalVal > g.line ? "over" : finalVal < g.line ? "under" : "push";
+            out = g.leanSide && g.leanSide !== "none"
+                ? (went === g.leanSide ? "Model lean hit" : went === "push" ? "Push" : "Model lean missed")
+                : (g.decision.startsWith("PASS") ? `Pass — went ${went}` : `Went ${went}`);
+        }
+        onGrade(g.id, { final: finalVal, outcome: out || (finalVal == null ? "Pending" : out) });
+        setOpen(false);
+    };
     return (React.createElement("div", { className: "lg-card" },
         React.createElement("div", { className: "lg-card-top" },
             React.createElement("div", null,
@@ -4466,7 +4498,19 @@ function GameCard({ g }) {
         React.createElement("div", { className: "lg-card-lean" }, g.lean),
         g.betDetail && React.createElement("div", { className: "lg-card-bet" }, g.betDetail),
         React.createElement("div", { className: "lg-card-outcome" }, g.outcome),
-        React.createElement("p", { className: "lg-card-note" }, g.note)));
+        React.createElement("p", { className: "lg-card-note" }, g.note),
+        !open && onGrade && (React.createElement("button", { className: "lg-grade-btn", onClick: () => setOpen(true) },
+            isPending ? "Grade this game" : "Edit final / outcome")),
+        open && (React.createElement("div", { className: "lg-grade" },
+            React.createElement("label", { className: "lg-f" },
+                React.createElement("span", null, "Final total runs"),
+                React.createElement("input", { value: final, onChange: (e) => setFinal(e.target.value), inputMode: "decimal", placeholder: "e.g. 9", autoFocus: true })),
+            React.createElement("label", { className: "lg-f" },
+                React.createElement("span", null, "Outcome ", React.createElement("em", null, "auto-filled if left blank")),
+                React.createElement("input", { value: outcome, onChange: (e) => setOutcome(e.target.value), placeholder: "Model lean hit / missed" })),
+            React.createElement("div", { className: "lg-grade-actions" },
+                React.createElement("button", { className: "ing-run small", onClick: save }, "Save"),
+                React.createElement("button", { className: "ing-ghost", onClick: () => setOpen(false) }, "Cancel"))))));
 }
 // ===========================================================================
 // SMART IMPORT — paste Savant CSVs or drop screenshots (lineups, stats, odds).
@@ -9146,6 +9190,11 @@ const CSS = `
 .lg-card-bet { font-size: 12px; color: var(--amber); margin-bottom: 7px; font-weight: 500; }
 .lg-card-outcome { font-size: 13px; font-weight: 600; margin-bottom: 8px; }
 .lg-card-note { font-size: 12px; color: var(--ink-dim); line-height: 1.55; }
+.lg-grade-btn { margin-top: 10px; background: transparent; border: 1px dashed var(--line); color: var(--cyan); font-size: 11.5px; letter-spacing: 0.04em; padding: 7px 12px; border-radius: 7px; cursor: pointer; width: 100%; }
+.lg-grade-btn:hover { border-color: var(--cyan); background: rgba(95,217,232,0.06); }
+.lg-grade { margin-top: 12px; padding: 12px; background: var(--field); border: 1px solid var(--line); border-radius: 9px; display: flex; flex-direction: column; gap: 10px; }
+.lg-grade .lg-f span em { font-style: normal; opacity: 0.65; font-size: 10px; }
+.lg-grade-actions { display: flex; gap: 8px; }
 .lg-hint { font-size: 12.5px; color: var(--ink-dim); margin-bottom: 16px; line-height: 1.55; }
 .lg-form { display: grid; grid-template-columns: 1fr 1fr; gap: 11px; }
 @media (max-width: 600px) { .lg-form { grid-template-columns: 1fr; } }
