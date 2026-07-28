@@ -2069,6 +2069,10 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
 // what's actually deployed. Newest first.
 // ===========================================================================
 const CHANGELOG = [
+    { date: "2026-07-27", items: [
+            "FIXED \u2014 Savant's real OAA CSV export (Fielding \u2192 Outs Above Average, team view) silently failed in the team-level stats box. Two separate bugs, both real: the export quotes every field, and the header/value matching never stripped those quotes, so \"team_name\" never matched anything and the box reported \"no Team column found\" even though the column was right there. Worse, a second bug meant that even once quotes were stripped, an empty field elsewhere in the row (Savant leaves position blank for team-level rows) got filtered out as if it were junk whitespace \u2014 silently shifting every column after it left by one, so OAA would have come from the wrong column entirely with no error at all. Verified against the exact uploaded file: all 30 teams now parse, and every value matches the raw CSV exactly (Angels \u201322, Cubs +47, checked against the source file directly, not just the parser's own output).",
+            "The team-level stats box can now take the file directly \u2014 Choose File accepts the CSV as downloaded from Savant, no need to open it and copy the text back in.",
+        ] },
     { date: "2026-07-26c", items: [
             "FIXED — Savant player-card import only worked for a plain card, not the full percentile-rankings page. Copying the richer page (the one with Value/Pitching Run Value bars, a percentile scale, and a movement-profile chart) mixes in section headers, scale captions, and \"NOT QUALIFIED\" text that isn't a number. The old rule treated any non-numeric line not immediately followed by a number as the start of a new player — so the real name got silently discarded the moment the first section header appeared, and every real stat that followed ended up misattributed to whatever chrome text happened to be last. A second, separate bug compounded it: the number check matched anything merely starting with a digit, so a line like \"2017 MLB Percentile Rankings\" was read as a number and swallowed the player's name outright.",
             "Both are fixed. The number check now requires the whole line to be numeric, and a new player only starts on a line that actually looks like a name — two to five Capitalized words, no digits — with run-value section headers and percentile/ranking chrome recognised structurally rather than chased with an ever-growing list of exact phrases. Verified against the exact reported paste: parses to one player, every stat lands correctly, and two full percentile pages pasted back to back stay separate with nothing bleeding between them.",
@@ -5754,17 +5758,35 @@ const TEAM_STAT_COLUMNS = [
     { field: "off", labels: ["woba", "woba_season"] },
     { field: "oaaPlaceholder", labels: [] },
 ];
+// A real Savant CSV export quotes every field — "Angels","108","2026",... —
+// which a plain comma-split leaves wrapped in literal quote marks. That
+// silently breaks every header match (e.g. "team_name" never equals
+// team_name), producing the confusing "no Team column found" even though the
+// column is right there. Strip one layer of surrounding quotes per cell.
+const stripQuotes = (s) => {
+    const t = String(s).trim();
+    return t.length >= 2 && t[0] === '"' && t[t.length - 1] === '"' ? t.slice(1, -1).trim() : t;
+};
 function parseTeamStats(text) {
     const raw = normalizeFangraphsPaste(String(text || ""));
     const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
     if (lines.length < 2)
         return { rows: [], headers: null };
-    const split = (l) => l.split(/\t|\s*\|\s*|\s*,\s*/).map((c) => c.trim()).filter((c) => c !== "");
+    // A genuinely empty CSV field ("") is meaningful column position, not junk —
+    // filtering it out (as the space/pipe-tolerant split below does for ragged
+    // human-typed text) silently shifts every later column left by one. Detect
+    // real CSV by its quoted cells and use a delimiter-only split with blanks
+    // PRESERVED; only fall back to the noisier tolerant split for pasted tables
+    // that were never quoted CSV to begin with.
+    const looksQuoted = /^\s*"/.test(lines[0]) || (lines[1] && /^\s*"/.test(lines[1]));
+    const split = looksQuoted
+        ? (l) => l.split(",").map((c) => stripQuotes(c))
+        : (l) => l.split(/\t|\s*\|\s*|\s*,\s*/).map((c) => stripQuotes(c)).filter((c) => c !== "");
     let head = split(lines[0]).map((h) => h.toLowerCase());
     if (head.length < 2)
-        head = lines[0].split(/\s{2,}|\t/).map((h) => h.trim().toLowerCase()).filter(Boolean);
-    // which column holds the club name
-    const nameIdx = head.findIndex((h) => ["team", "tm", "club", "name", "player"].includes(h));
+        head = lines[0].split(/\s{2,}|\t/).map((h) => stripQuotes(h).toLowerCase()).filter(Boolean);
+    // which column holds the club name — "team_name" is Savant's own export header
+    const nameIdx = head.findIndex((h) => ["team", "tm", "club", "name", "player", "team_name", "team name"].includes(h));
     if (nameIdx === -1)
         return { rows: [], headers: head, err: "no Team column found" };
     // map each remaining column to a known field, ignoring anything unrecognised
@@ -5824,6 +5846,14 @@ function PlatoonImport({ teams, saveTeams }) {
     const [splitText, setSplitText] = useState("");
     const [handText, setHandText] = useState("");
     const [statText, setStatText] = useState("");
+    const [statFileKey, setStatFileKey] = useState(0);
+    const loadTeamStatsFile = (file) => {
+        if (!file)
+            return;
+        const reader = new FileReader();
+        reader.onload = () => { setStatText(String(reader.result || "")); setStatFileKey((k) => k + 1); };
+        reader.readAsText(file);
+    };
     const [msg, setMsg] = useState("");
     const [busy, setBusy] = useState(false);
     // Pull MLB's own pitchHand for every player and stamp it onto the rotations
@@ -5922,9 +5952,10 @@ function PlatoonImport({ teams, saveTeams }) {
                 React.createElement("span", null,
                     "Team-level stats \u2014 any table with a ",
                     React.createElement("code", null, "Team"),
-                    " column"),
+                    " column, pasted or uploaded"),
                 React.createElement("textarea", { rows: 4, value: statText, onChange: (e) => setStatText(e.target.value), placeholder: "Team\tOAA\tFraming\tBarrel%\tHardHit%\nGuardians\t18\t7\t7.1\t38.4\nRockies\t-12\t-3\t9.8\t42.1" })),
-            React.createElement("p", { className: "ing-hint", style: { marginTop: 6 } }, "Reads the columns it recognises and ignores the rest, so a Savant fielding export, a FanGraphs team page or a FantasyPros table all work as pasted. Recognised: OAA, Framing, Barrel%, HardHit%, wOBA, xwOBA, Pen xwOBA. Existing values are never blanked."),
+            React.createElement("input", { key: statFileKey, type: "file", accept: ".csv,.txt,.tsv", onChange: (e) => loadTeamStatsFile(e.target.files[0]), style: { marginTop: 8 } }),
+            React.createElement("p", { className: "ing-hint", style: { marginTop: 6 } }, "Reads the columns it recognises and ignores the rest, so a Savant fielding export (a real quoted CSV works directly \u2014 no need to open and re-copy it), a FanGraphs team page, or a FantasyPros table all work. Recognised: OAA, Framing, Barrel%, HardHit%, wOBA, xwOBA, Pen xwOBA. Existing values are never blanked."),
             React.createElement("button", { className: "ing-run small", onClick: importTeamStats }, "Import team stats"),
             React.createElement("div", { className: "ing-platoon-div" }),
             React.createElement("div", { className: "ing-platoon-auto" },
