@@ -4133,6 +4133,80 @@ function Ledger({ onHome }) {
     }, []);
     const saveGames = useCallback(async (next) => { setGames(next); await store.set("ingenuity:ledger:games", next); }, []);
     const saveBets = useCallback(async (next) => { setBets(next); await store.set("ingenuity:ledger:bets", next); }, []);
+    // v3.1 — SlateHub already auto-fetches finals for its own scanned boards
+    // (gradeArchive, further up this file) by pulling the day's schedule and
+    // matching team names. The Research Ledger never had that: every game
+    // logged with "Log as research" sat on manual entry alone, which is the
+    // gap this closes — same matching approach, same statsapi source, applied
+    // to ingenuity:ledger:games instead of the slate archive. Only ever fills
+    // a blank; a final you already entered (by hand or by a prior fetch) is
+    // never touched.
+    const [fetchingResults, setFetchingResults] = useState(false);
+    const [resultsMsg, setResultsMsg] = useState("");
+    const fetchResults = useCallback(async (silent) => {
+        const current = await store.get("ingenuity:ledger:games", games);
+        const pending = current.filter((g) => g.final == null && g.matchup && g.matchup.includes(" @ ") && g.date);
+        if (!pending.length) {
+            if (!silent)
+                setResultsMsg("Nothing pending — every logged game already has a final.");
+            return;
+        }
+        if (!silent) {
+            setFetchingResults(true);
+            setResultsMsg("");
+        }
+        const byDate = {};
+        for (const g of pending)
+            (byDate[g.date] = byDate[g.date] || []).push(g);
+        const patches = new Map();
+        let checked = 0, unreachable = false;
+        for (const date of Object.keys(byDate)) {
+            try {
+                const r = await mlbFetch(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${date}`);
+                if (!r.ok)
+                    continue;
+                const j = await r.json();
+                const finals = (j.dates?.[0]?.games || [])
+                    .filter((gm) => gm.status?.abstractGameState === "Final")
+                    .map((gm) => ({
+                    away: gm.teams.away.team.name, home: gm.teams.home.team.name,
+                    total: (gm.teams.away.score ?? 0) + (gm.teams.home.score ?? 0),
+                }));
+                checked += byDate[date].length;
+                for (const g of byDate[date]) {
+                    const [rawAway, rawHome] = g.matchup.split(" @ ").map((s) => s.trim());
+                    const ga = normName(rawAway), gh = normName(rawHome);
+                    // Same fuzzy substring match gradeArchive uses for the slate
+                    // archive — a logged matchup may hold a nickname ("Rockies")
+                    // against statsapi's full name ("Colorado Rockies").
+                    const f = finals.find((x) => {
+                        const a = normName(x.away), h = normName(x.home);
+                        return (a.includes(ga) || ga.includes(a)) && (h.includes(gh) || gh.includes(h));
+                    });
+                    if (f)
+                        patches.set(g.id, { final: f.total, outcome: deriveGameOutcome(g, f.total, "") });
+                }
+            }
+            catch {
+                unreachable = true;
+            }
+        }
+        if (patches.size) {
+            const latest = await store.get("ingenuity:ledger:games", current);
+            await saveGames(latest.map((g) => (patches.has(g.id) ? { ...g, ...patches.get(g.id) } : g)));
+        }
+        if (!silent) {
+            setFetchingResults(false);
+            setResultsMsg(patches.size
+                ? `Filled in ${patches.size} of ${checked} pending game${checked === 1 ? "" : "s"}.`
+                : unreachable
+                    ? "Couldn't reach the MLB schedule API — try again shortly."
+                    : `Checked ${checked} pending game${checked === 1 ? "" : "s"} — none are Final yet.`);
+        }
+    }, [games, saveGames]);
+    // Quiet catch-up the moment the ledger opens, same pattern as SlateHub —
+    // silent so it doesn't compete with anything you're actively doing.
+    useEffect(() => { if (loaded) fetchResults(true); }, [loaded]);
     const addGame = () => {
         if (!form.matchup.trim())
             return;
@@ -4338,6 +4412,14 @@ function Ledger({ onHome }) {
                         React.createElement("button", { onClick: () => settleBet(i, "L") }, "L"),
                         React.createElement("button", { onClick: () => settleBet(i, "P") }, "P"))) : (React.createElement("span", { className: `lg-bet-result ${b.result === "W" ? "win" : b.result === "P" ? "push" : "loss"}` }, b.result === "W" ? `WIN +$${b.net}` : b.result === "P" ? "PUSH" : "LOSS")))))))),
         tab === "archive" && (React.createElement("main", { className: "lg-main" },
+            React.createElement("div", { className: "lg-archive-head" },
+                React.createElement("p", { className: "lg-hint" },
+                    games.filter((g) => g.final == null).length > 0
+                        ? `${games.filter((g) => g.final == null).length} pending \u2014 checked automatically when this tab opens.`
+                        : "Every logged game has a final."),
+                React.createElement("button", { className: "ing-ghost", onClick: () => fetchResults(false), disabled: fetchingResults },
+                    fetchingResults ? "Checking\u2026" : "Refresh results")),
+            resultsMsg && React.createElement("p", { className: "lg-hint" }, resultsMsg),
             React.createElement("div", { className: "lg-cards" }, games.map((g) => React.createElement(GameCard, {
                 g: g, key: g.id,
                 onGrade: (id, patch) => saveGames(games.map((x) => (x.id === id ? { ...x, ...patch } : x))),
@@ -4447,6 +4529,19 @@ function F({ l, v, on, ph }) {
 // filter on g.final != null. This adds an inline Grade control that updates
 // the SAME record in place via onGrade, so logging and grading are the same
 // row, and the Brain sees it the moment it's graded.
+// Shared by the manual Grade control and the auto-fetch below, so a game
+// graded by hand and a game graded from the schedule API produce identically-
+// worded outcomes. Never overrides an outcome the person typed themselves.
+function deriveGameOutcome(g, finalVal, typedOutcome) {
+    let out = (typedOutcome || "").trim();
+    if (!out && finalVal != null && g.line != null) {
+        const went = finalVal > g.line ? "over" : finalVal < g.line ? "under" : "push";
+        out = g.leanSide && g.leanSide !== "none"
+            ? (went === g.leanSide ? "Model lean hit" : went === "push" ? "Push" : "Model lean missed")
+            : (g.decision.startsWith("PASS") ? `Pass — went ${went}` : `Went ${went}`);
+    }
+    return out || (finalVal == null ? "Pending" : out);
+}
 function GameCard({ g, onGrade }) {
     const missed = g.model != null && g.final != null ? (g.final - g.model) : null;
     const decisionClass = g.decision.includes("against") ? "warn" :
@@ -4461,16 +4556,7 @@ function GameCard({ g, onGrade }) {
         if (final.trim() !== "" && isNaN(f))
             return;
         const finalVal = final.trim() === "" ? null : f;
-        // Auto-suggest an outcome from the model's lean vs the actual line, but
-        // never overwrite something the person typed themselves.
-        let out = outcome.trim();
-        if (!out && finalVal != null && g.line != null) {
-            const went = finalVal > g.line ? "over" : finalVal < g.line ? "under" : "push";
-            out = g.leanSide && g.leanSide !== "none"
-                ? (went === g.leanSide ? "Model lean hit" : went === "push" ? "Push" : "Model lean missed")
-                : (g.decision.startsWith("PASS") ? `Pass — went ${went}` : `Went ${went}`);
-        }
-        onGrade(g.id, { final: finalVal, outcome: out || (finalVal == null ? "Pending" : out) });
+        onGrade(g.id, { final: finalVal, outcome: deriveGameOutcome(g, finalVal, outcome) });
         setOpen(false);
     };
     return (React.createElement("div", { className: "lg-card" },
@@ -9190,6 +9276,8 @@ const CSS = `
 .lg-card-bet { font-size: 12px; color: var(--amber); margin-bottom: 7px; font-weight: 500; }
 .lg-card-outcome { font-size: 13px; font-weight: 600; margin-bottom: 8px; }
 .lg-card-note { font-size: 12px; color: var(--ink-dim); line-height: 1.55; }
+.lg-archive-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 8px; flex-wrap: wrap; }
+.lg-archive-head .lg-hint { margin: 0; }
 .lg-grade-btn { margin-top: 10px; background: transparent; border: 1px dashed var(--line); color: var(--cyan); font-size: 11.5px; letter-spacing: 0.04em; padding: 7px 12px; border-radius: 7px; cursor: pointer; width: 100%; }
 .lg-grade-btn:hover { border-color: var(--cyan); background: rgba(95,217,232,0.06); }
 .lg-grade { margin-top: 12px; padding: 12px; background: var(--field); border: 1px solid var(--line); border-radius: 9px; display: flex; flex-direction: column; gap: 10px; }
