@@ -6573,6 +6573,71 @@ const MORNING_PLAN = [
     { key: "bullpen", label: "Bullpen workload", hint: "last 3 days of box scores" },
     { key: "recentform", label: "Recent form (14d)", hint: "outcome wOBA + BB%\u2212K%, MLB Stats API" },
 ];
+// ---- Grading coverage & significance ----------------------------------------
+// Why a game never got a projection. Stored on the board at scan time so the
+// selection bias in the graded sample is visible instead of assumed away.
+const SKIP_LABELS = {
+    no_line: ["No total posted", "Book hadn't hung a number when you scanned. Re-scan later."],
+    no_team: ["Team not matched in database", "A name the DB doesn't recognise — fixable in Lineups."],
+    started: ["First pitch already passed", "Scanned too late. This one is on the clock, not the data."],
+    no_sp_posted: ["Probable starter not announced", "Nothing to fix — scan again once the arm posts."],
+    no_sp_db: ["Starter missing from database", "The real coverage gap. Import the arm and this game grades."],
+};
+// Standard error of the mean error, and the 95% band around it. A bias is only
+// worth acting on when the band clears zero — at 55 games and a 3.5-run typical
+// miss, anything under ~1.2 runs is indistinguishable from noise.
+function biasSignal(n, bias, mae) {
+    if (!n || bias == null || mae == null)
+        return { n: n || 0, se: null, ci: null, real: false };
+    const sd = 1.2533 * mae; // E|X| -> sigma for a roughly normal error
+    const se = sd / Math.sqrt(n);
+    const ci = 1.96 * se;
+    return { n, se, ci, real: n >= 30 && Math.abs(bias) > ci, needed: Math.ceil(Math.pow(1.96 * sd / Math.max(Math.abs(bias), 0.01), 2)) };
+}
+// How much of each board actually reached the grader, and what ate the rest.
+function computeCoverage(arch) {
+    let total = 0, projected = 0, unrecorded = 0;
+    const reasons = {};
+    for (const d of Object.keys(arch || {})) {
+        for (const g of (arch[d].games || [])) {
+            total++;
+            if (g.proj) { projected++; continue; }
+            if (g.skip && SKIP_LABELS[g.skip]) reasons[g.skip] = (reasons[g.skip] || 0) + 1;
+            else unrecorded++;
+        }
+    }
+    return { total, projected, unrecorded, reasons };
+}
+// What share of the archive actually reached the grader, and what ate the rest.
+// The graded sample is conditional on these filters, so a bias measured on it
+// only transfers to games that would have passed them.
+function GradeCoveragePanel({ cov }) {
+    const dropped = cov.total - cov.projected;
+    const pct = cov.total ? Math.round((cov.projected / cov.total) * 100) : 0;
+    const rows = Object.entries(cov.reasons).sort((a, b) => b[1] - a[1]);
+    return React.createElement("div", { className: "cvg" },
+        React.createElement("div", { className: "cvg-head" },
+            React.createElement("span", { className: "bc-title" }, "Grading coverage \u00B7 what reached the grader"),
+            React.createElement("span", { className: "cvg-pct" }, pct + "%")),
+        React.createElement("div", { className: "cvg-bar" },
+            React.createElement("i", { style: { width: pct + "%" } })),
+        React.createElement("p", { className: "cvg-sum" },
+            React.createElement("strong", null, cov.projected),
+            " of ",
+            cov.total,
+            " archived games carried a projection into grading. ",
+            dropped > 0 ? `${dropped} never got one — the accuracy panel above cannot see them.` : "Nothing was dropped."),
+        rows.length > 0 && React.createElement("div", { className: "cvg-rows" }, rows.map(([k, n]) => React.createElement("div", { key: k, className: "cvg-row" + (k === "no_sp_db" ? " flag" : "") },
+            React.createElement("span", { className: "cvg-n" }, n),
+            React.createElement("span", { className: "cvg-lbl" },
+                React.createElement("b", null, SKIP_LABELS[k][0]),
+                React.createElement("em", null, SKIP_LABELS[k][1]))))),
+        cov.reasons.no_sp_db > 0 && React.createElement("p", { className: "cvg-warn" },
+            React.createElement("b", null, "Selection bias: "),
+            `${cov.reasons.no_sp_db} game${cov.reasons.no_sp_db === 1 ? "" : "s"} dropped for a missing starter. Those are disproportionately call-ups and spot starts \u2014 the high-variance arms. Grading only the games where your database was already complete flatters the model, and the bias you measure will not transfer to the games where your data is thinnest.`),
+        cov.unrecorded > 0 && React.createElement("p", { className: "cvg-note" },
+            `${cov.unrecorded} ungraded game${cov.unrecorded === 1 ? " has" : "s have"} no reason on file \u2014 those boards were scanned before reasons were tracked. Reasons record from this build forward; the count above is honest, the breakdown is only complete for new boards.`));
+}
 function SlateHub({ onOpenInTerminal }) {
     const hosted = typeof STANDALONE !== "undefined" && STANDALONE;
     const todayKey = etDayKey();
@@ -6591,6 +6656,7 @@ function SlateHub({ onOpenInTerminal }) {
     const [rows, setRows] = useState(null);
     const [lean, setLean] = useState(null);
     const [acc, setAcc] = useState(null);
+    const [cov, setCov] = useState(null);
     const [detailGame, setDetailGame] = useState(null);
     const [morning, setMorning] = useState(null); // one-tap refresh: per-step progress
     const [stepsOpen, setStepsOpen] = useState(false); // individual-step drawer
@@ -6658,6 +6724,7 @@ function SlateHub({ onOpenInTerminal }) {
             if (scan && scan.date === todayKey && scan.lean)
                 setLean({ call: null, saved: scan });
             setAcc(computeAccuracy(arch, await store.get("ingenuity:results:log", {})));
+            setCov(computeCoverage(arch));
             gradeArchive(true); // settle up quietly on open — the closest thing to "always working"
         })();
     }, []);
@@ -7335,22 +7402,22 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
         for (const g of slate.games) {
             const line = parseFloat(g.line);
             if (isNaN(line)) {
-                out.push({ ...g, status: "skip", err: "no total set" });
+                out.push({ ...g, status: "skip", code: "no_line", err: "no total set" });
                 continue;
             }
             const A = matchTeamDb(g.away, teams), H = matchTeamDb(g.home, teams);
             if (!A || !H) {
-                out.push({ ...g, status: "skip", err: `no DB match for ${!A ? g.away : g.home}` });
+                out.push({ ...g, status: "skip", code: "no_team", err: `no DB match for ${!A ? g.away : g.home}` });
                 continue;
             }
             if (g.inPlay || (g.start && new Date(g.start).getTime() <= Date.now())) {
-                out.push({ ...g, status: "skip", err: "first pitch has passed — this model prices 9 innings, not a game in progress" });
+                out.push({ ...g, status: "skip", code: "started", err: "first pitch has passed — this model prices 9 innings, not a game in progress" });
                 continue;
             }
             const a = buildSide(A, g.awayP), h = buildSide(H, g.homeP);
             if (!a.resolved || !h.resolved) {
                 const why = (!g.awayP || !g.homeP) ? "probable starter not posted" : "starter not in your database";
-                out.push({ ...g, status: "skip", err: why + " — the arm is the biggest input; won't guess it" });
+                out.push({ ...g, status: "skip", code: (!g.awayP || !g.homeP) ? "no_sp_posted" : "no_sp_db", err: why + " — the arm is the biggest input; won't guess it" });
                 continue;
             }
             const over = parseFloat(g.over) || -110, under = parseFloat(g.under) || -110;
@@ -7381,8 +7448,15 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
         // Without this you can never honestly grade a past day.
         const stamp = new Date().toISOString().slice(11, 16);
         await saveSlate({ ...slate, games: slate.games.map((g) => {
-                const r = out.find((x) => x.away === g.away && x.home === g.home && x.status === "ok");
-                return r ? { ...g, proj: { model: +r.model.toFixed(2), edge: +r.edge.toFixed(1), pOver: +r.pW.toFixed(3), atLine: r.line, ts: stamp } } : g;
+                const r = out.find((x) => x.away === g.away && x.home === g.home);
+                if (r && r.status === "ok")
+                    return { ...g, skip: undefined, proj: { model: +r.model.toFixed(2), edge: +r.edge.toFixed(1), pOver: +r.pW.toFixed(3), atLine: r.line, ts: stamp } };
+                // A skip must never erase a projection frozen earlier — a post-first-pitch
+                // rescan skips everything, and that number is the honest pregame record.
+                // Only games that never got projected carry a skip reason.
+                if (r && r.status === "skip" && !g.proj)
+                    return { ...g, skip: r.code };
+                return g;
             }) });
         // A scan of a past board is research — it must not overwrite today's read.
         if (viewDate === todayKey) {
@@ -7469,8 +7543,10 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
         await recordFinals(arch); // distill graded games into the permanent, never-expiring log
         const a = computeAccuracy(arch, await store.get("ingenuity:results:log", {}));
         setAcc(a);
+        const cv = computeCoverage(arch);
+        setCov(cv);
         if (a.n)
-            await store.set("ingenuity:brain:slateAccuracy", { n: a.n, bias: +a.bias.toFixed(3), mae: +a.mae.toFixed(3), big: a.big, ts: new Date().toISOString().slice(0, 16).replace("T", " ") });
+            await store.set("ingenuity:brain:slateAccuracy", { n: a.n, bias: +a.bias.toFixed(3), mae: +a.mae.toFixed(3), big: a.big, coverage: cv, errs: a.rows.map((r) => [r.date, +r.err.toFixed(2)]), ts: new Date().toISOString().slice(0, 16).replace("T", " ") });
         // refresh the viewed board so any new finals show immediately
         if (got && arch[viewDate])
             setSlate(arch[viewDate]);
@@ -7565,13 +7641,21 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
                     React.createElement("div", null,
                         React.createElement("em", null, "Big misses"),
                         React.createElement("strong", { className: acc.big ? "neg" : "" }, acc.big))),
-                React.createElement("p", { className: "grade-note" }, acc.n < 30
-                    ? `Only ${acc.n} graded game${acc.n === 1 ? "" : "s"} — far too few to mean anything. At this sample a mean error of ${acc.bias > 0 ? "+" : ""}${acc.bias.toFixed(2)} is noise, not bias. Keep collecting before changing a single parameter.`
-                    : acc.bias > 0.4
-                        ? `The model is running ${acc.bias.toFixed(2)} runs LOW across ${acc.n} games — the same under-projection your ledger caught on hot slates. Worth a calibration look now that the sample supports it.`
-                        : acc.bias < -0.4
-                            ? `The model is running ${Math.abs(acc.bias).toFixed(2)} runs HIGH across ${acc.n} games. Worth a calibration look.`
-                            : `Mean error is ${acc.bias.toFixed(2)} runs across ${acc.n} games — no systematic bias worth chasing. The typical miss is still ${acc.mae.toFixed(2)} runs, which is the honest width of this model's uncertainty.`))) : (React.createElement("p", { className: "grade-note" }, "Nothing graded yet. Each scan freezes its projection onto that day's board; once the games finish, this settles up against the real final scores and tracks how wrong the model actually was. It needs boards on file first \u2014 from Thursday, that starts accumulating on its own.")),
+                React.createElement("p", { className: "grade-note" }, (() => {
+                    // A flat threshold lies at small samples. Compare the bias to its own
+                    // standard error instead: with a 3.5-run typical miss, a 0.4-run mean
+                    // error is inside the noise until the sample is several hundred games.
+                    const sig = biasSignal(acc.n, acc.bias, acc.mae);
+                    const band = sig.ci != null ? sig.ci.toFixed(2) : "—";
+                    const dir = acc.bias > 0 ? "LOW" : "HIGH";
+                    const mag = Math.abs(acc.bias).toFixed(2);
+                    if (acc.n < 30)
+                        return `Only ${acc.n} graded game${acc.n === 1 ? "" : "s"} — far too few to mean anything. At this sample a mean error of ${acc.bias > 0 ? "+" : ""}${acc.bias.toFixed(2)} is noise, not bias. Keep collecting before changing a single parameter.`;
+                    if (sig.real)
+                        return `The model is running ${mag} runs ${dir} across ${acc.n} games, and that clears the ±${band} noise band — a real bias, not a sample artifact. Worth a calibration look. Check the Brain first: only games projected since your last parameter change should count.`;
+                    return `Mean error is ${acc.bias > 0 ? "+" : ""}${acc.bias.toFixed(2)} runs across ${acc.n} games, inside the ±${band} noise band at this sample — it reads directional but is not distinguishable from chance. Confirming a bias this size takes about ${sig.needed} games. The typical miss is ${acc.mae.toFixed(2)} runs, which is the honest width of this model's uncertainty. Change nothing yet.`;
+                })()),
+                cov && cov.total > 0 && React.createElement(GradeCoveragePanel, { cov: cov }))) : (React.createElement("p", { className: "grade-note" }, "Nothing graded yet. Each scan freezes its projection onto that day's board; once the games finish, this settles up against the real final scores and tracks how wrong the model actually was. It needs boards on file first \u2014 from Thursday, that starts accumulating on its own.")),
             gradeMsg && React.createElement("p", { className: "ing-hint" }, gradeMsg)),
         games.length > 0 && (rows || games.some((g) => g.proj)) && (React.createElement(BoardChart, { games: games, rows: rows, onOpen: (g) => (onOpenInTerminal ? onOpenInTerminal(g) : setDetailGame(g)) })),
         detailGame && (React.createElement(GameDetail, { g: detailGame, teams: teams, dateKey: viewDate, isToday: isToday, onClose: () => setDetailGame(null) })),
@@ -8159,6 +8243,7 @@ function Brain({ onHome }) {
     const [staleRecent, setStaleRecent] = useState(0);
     const [seasonAge, setSeasonAge] = useState(null);
     const [slateScan, setSlateScan] = useState(null);
+    const [slateAcc, setSlateAcc] = useState(null);
     const [interpLog, setInterpLog] = useState([]);
     const [aiBusy, setAiBusy] = useState(false);
     const [aiOut, setAiOut] = useState(null);
@@ -8194,6 +8279,7 @@ function Brain({ onHome }) {
             const ages = teams.map((t) => daysOld(t.statsAsOf)).filter((d) => d != null);
             setSeasonAge(ages.length ? Math.min(...ages) : null);
             setSlateScan(await store.get("ingenuity:brain:slateScan", null));
+            setSlateAcc(await store.get("ingenuity:brain:slateAccuracy", null));
             setInterpLog(await store.get("ingenuity:brain:interpLog", []));
             // persist the imported history + profile for recollection by any module
             await store.set("ingenuity:brain:bettorProfile", BETTOR_PROFILE);
@@ -8231,6 +8317,35 @@ function Brain({ onHome }) {
     const leans = games.filter((g) => g.leanSide && g.leanSide !== "none" && g.final != null && g.line != null);
     const leanHits = leans.filter((g) => (g.leanSide === "over" ? g.final > g.line : g.final < g.line)).length;
     const bigMisses = graded.filter((g) => Math.abs(g.final - g.model) > 3.5).length;
+    // ---- board-wide sample: what the automated grader actually scored --------
+    // The ledger above is hand-logged and tiny. The Slate grader scores EVERY
+    // archived game that carried a frozen pregame projection, which is the only
+    // sample large enough to calibrate against. Calibration reads this one.
+    const boardN = slateAcc ? slateAcc.n : 0;
+    const boardBias = slateAcc ? slateAcc.bias : null;
+    const boardMae = slateAcc ? slateAcc.mae : null;
+    const boardSig = biasSignal(boardN, boardBias, boardMae);
+    // A bias pooled across parameter changes is measuring several different
+    // models at once. Only games projected since the last change are homogeneous.
+    const paramDate = log.length && log[0].ts ? String(log[0].ts).slice(0, 10) : null;
+    const allErrs = (slateAcc && slateAcc.errs) || [];
+    const cleanErrs = paramDate ? allErrs.filter((e) => e[0] >= paramDate) : allErrs;
+    const cleanN = cleanErrs.length;
+    const cleanBias = cleanN ? cleanErrs.reduce((t, e) => t + e[1], 0) / cleanN : null;
+    const cleanMae = cleanN ? cleanErrs.reduce((t, e) => t + Math.abs(e[1]), 0) / cleanN : null;
+    const cleanSig = biasSignal(cleanN, cleanBias, cleanMae);
+    // Judge on the homogeneous sample whenever we can identify one — even if it
+    // turns out to be small. A pooled sample that straddles a parameter change is
+    // not a bigger sample, it is a mixture of different models, so falling back to
+    // it would be the comfortable answer rather than the true one. Only when there
+    // are no per-game errors on file (a payload from before this build) do we judge
+    // the pooled number, and the read says so.
+    const haveErrs = allErrs.length > 0;
+    const useClean = haveErrs && paramDate != null && cleanN < boardN;
+    const judgeN = useClean ? cleanN : boardN;
+    const judgeBias = useClean ? cleanBias : boardBias;
+    const judgeSig = useClean ? cleanSig : boardSig;
+    const boardCov = slateAcc && slateAcc.coverage ? slateAcc.coverage : null;
     // ---- AI recalibration (Claude API — available inside this app) ----
     const askAI = async () => {
         setAiBusy(true);
@@ -8238,7 +8353,17 @@ function Brain({ onHome }) {
         setAiOut(null);
         try {
             const health = {
-                gradedGames: graded.length, meanBiasRuns: bias, meanAbsErrorRuns: mae,
+                // primary sample: the automated board grader
+                boardGradedGames: boardN, boardMeanBiasRuns: boardBias, boardMeanAbsErrorRuns: boardMae,
+                boardNoiseBand95: boardSig.ci != null ? +boardSig.ci.toFixed(2) : null,
+                boardBiasIsSignificant: boardSig.real,
+                gamesNeededToConfirmThisBias: boardSig.needed || null,
+                lastParameterChange: paramDate,
+                gradedSinceLastParameterChange: cleanN,
+                biasSinceLastParameterChange: cleanBias != null ? +cleanBias.toFixed(2) : null,
+                gradingCoverage: boardCov,
+                // secondary: the small hand-logged ledger (carries lean outcomes)
+                ledgerGradedGames: graded.length, ledgerMeanBiasRuns: bias, ledgerMeanAbsErrorRuns: mae,
                 leanRecord: `${leanHits}/${leans.length}`, bigMisses,
                 recentGames: graded.slice(0, 15).map((g) => ({ matchup: g.matchup, park: g.park, model: g.model, line: g.line, final: g.final, lean: g.lean })),
             };
@@ -8248,6 +8373,8 @@ function Brain({ onHome }) {
             const bettor = { lifetime: BETTOR_PROFILE.total, clvBeatPct: BETTOR_PROFILE.clvBeatPct, liveROI: BETTOR_PROFILE.live.roi, parlayROI: BETTOR_PROFILE.parlays.roi, bestShape: "standard-odds straights " + BETTOR_PROFILE.standardOdds.roi + "%" };
             const prompt = `You are the calibration brain for an MLB totals Monte Carlo model. BETTOR CONTEXT (the human this model serves; their history, for context on discipline — do NOT suggest bets): ${JSON.stringify(bettor)}.
 You are the calibration brain for an MLB totals Monte Carlo model (gamma-Poisson run generation, correlated team totals). Analyze the model's ledger health and current tunable parameters, then suggest changes ONLY where the evidence supports them. Be conservative: few or zero changes is a valid answer, and with under ~30 graded games most signals are noise.
+
+HARD RULES. (1) Judge bias against boardNoiseBand95, not against any fixed threshold: if the absolute bias is inside that band, it is NOT evidence and you must not propose an offset for it. (2) Prefer biasSinceLastParameterChange — a bias pooled across parameter changes is measuring several different models at once. (3) If gradingCoverage shows games dropped for a missing starter, treat a measured bias as possibly a data-coverage artifact and say so rather than tuning it away. (4) An MAE below 4.1 is not skill; flag it as luck or a look-ahead leak. (5) Proposing zero changes is the expected answer at small samples — say plainly that the honest move is to keep collecting.
 
 HEALTH: ${JSON.stringify(health)}
 BETTOR PROFILE (the human's multi-year pattern — context for what behaviors the record shows): ${JSON.stringify({ roi: BETTOR_PROFILE.total.roi, clvAvg: BETTOR_PROFILE.avgBookEvPct, clvBeatPct: BETTOR_PROFILE.clvBeatPct, liveRoi: BETTOR_PROFILE.live.roi, parlayRoi: BETTOR_PROFILE.parlays.roi, bestShapeRoi: BETTOR_PROFILE.standardOdds.roi })}
@@ -8281,11 +8408,15 @@ Respond ONLY with JSON, no markdown fences, exactly this shape:
     const agents = [
         {
             id: "calibrator", glyph: "\u25CE", name: "Calibrator", role: "Tunes engine parameters",
-            ...(bias == null || graded.length < 8
-                ? { tone: "idle", status: "waiting", read: `Needs ~8 graded projections to trust a bias signal (${graded.length} so far). Until then it holds the engine at ${tunedCount ? tunedCount + " tuned param" + (tunedCount === 1 ? "" : "s") : "defaults"}.` }
-                : Math.abs(bias) > 0.75
-                    ? { tone: "alert", status: "signal", read: `Model bias is ${bias > 0 ? "+" : ""}${bias.toFixed(2)} runs over ${graded.length} games — beyond the plus-or-minus 0.75 threshold. Recommends nudging CALIBRATION_OFFSET ${bias > 0 ? "up" : "down"}. Run AI recalibration to draft the exact value.` }
-                    : { tone: "ok", status: "calibrated", read: `Bias ${bias > 0 ? "+" : ""}${bias.toFixed(2)} runs, inside tolerance. No change warranted — MAE ${mae ? mae.toFixed(2) : "—"} is near the 4.1 floor.` }),
+            // Reads the board grader, not the hand-logged ledger, and gates on the
+            // bias's own standard error rather than a flat threshold.
+            ...(boardN === 0
+                ? { tone: "idle", status: "no feed", read: `The board grader hasn't reported yet. Open Today's Slate and tap "Grade past boards" — it scores every archived game that carried a frozen pregame projection. Until that feed exists this agent is blind, and the ${graded.length}-game hand-logged ledger is far too small to calibrate on. Holding the engine at ${tunedCount ? tunedCount + " tuned param" + (tunedCount === 1 ? "" : "s") : "defaults"}.` }
+                : (judgeN < 30 || judgeBias == null)
+                    ? { tone: "idle", status: "waiting", read: `${judgeN} graded game${judgeN === 1 ? "" : "s"}${useClean ? ` since your last parameter change on ${paramDate} (${boardN} total on file, but a bias pooled across changes measures several different models at once)` : ""} — under the 30 needed before a bias signal means anything. Holding at ${tunedCount ? tunedCount + " tuned param" + (tunedCount === 1 ? "" : "s") : "defaults"}.` }
+                    : judgeSig.real
+                        ? { tone: "alert", status: "signal", read: `Bias is ${Math.abs(judgeBias).toFixed(2)} runs ${judgeBias > 0 ? "LOW" : "HIGH"} over ${judgeN} games${useClean ? ` since the ${paramDate} parameter change` : ""}, clearing the ±${judgeSig.ci.toFixed(2)} noise band. That is a real signal. Recommends nudging CALIBRATION_OFFSET ${judgeBias > 0 ? "up" : "down"}${boardCov && boardCov.reasons && boardCov.reasons.no_sp_db ? `, but check coverage first — ${boardCov.reasons.no_sp_db} game${boardCov.reasons.no_sp_db === 1 ? "" : "s"} never graded for a missing starter, so this bias may be a data gap wearing a parameter's clothes` : ""}. Run AI recalibration to draft the exact value.` }
+                        : { tone: "ok", status: "calibrated", read: `Bias ${judgeBias > 0 ? "+" : ""}${judgeBias.toFixed(2)} runs over ${judgeN} games${useClean ? ` since the ${paramDate} change` : ""} — inside the ±${judgeSig.ci.toFixed(2)} noise band, so it reads directional but is not distinguishable from chance. Confirming a bias this size needs about ${judgeSig.needed} games. No change warranted. MAE ${boardMae ? boardMae.toFixed(2) : "—"} against a 4.1 floor; anything below that floor is luck or a leak, not skill.` }),
         },
         {
             id: "scout", glyph: "\u25C8", name: "Data Scout", role: "Watches roster & stat freshness",
@@ -8345,17 +8476,17 @@ Respond ONLY with JSON, no markdown fences, exactly this shape:
         React.createElement("main", { className: "lg-main" },
             React.createElement("section", { className: "lg-stats" },
                 React.createElement("div", { className: "lg-stat" },
-                    React.createElement("span", { className: "lg-stat-val" }, graded.length),
-                    React.createElement("span", { className: "lg-stat-label" }, "graded projections")),
+                    React.createElement("span", { className: "lg-stat-val" }, boardN || "—"),
+                    React.createElement("span", { className: "lg-stat-label" }, "board-graded games")),
                 React.createElement("div", { className: "lg-stat" },
-                    React.createElement("span", { className: "lg-stat-val " + (bias != null && Math.abs(bias) > 1 ? "amber" : "") }, bias != null ? (bias > 0 ? "+" : "") + bias.toFixed(2) : "—"),
-                    React.createElement("span", { className: "lg-stat-label" }, "bias (final \u2212 model)")),
+                    React.createElement("span", { className: "lg-stat-val " + (boardSig.real ? "amber" : "") }, boardBias != null ? (boardBias > 0 ? "+" : "") + boardBias.toFixed(2) : "—"),
+                    React.createElement("span", { className: "lg-stat-label" }, boardSig.ci != null ? `board bias \u00B7 \u00B1${boardSig.ci.toFixed(2)} noise` : "board bias (final \u2212 model)")),
                 React.createElement("div", { className: "lg-stat" },
-                    React.createElement("span", { className: "lg-stat-val" }, mae != null ? mae.toFixed(2) : "—"),
-                    React.createElement("span", { className: "lg-stat-label" }, "mean abs error")),
+                    React.createElement("span", { className: "lg-stat-val" }, cleanN ? (cleanBias > 0 ? "+" : "") + cleanBias.toFixed(2) : "—"),
+                    React.createElement("span", { className: "lg-stat-label" }, cleanN && paramDate ? `bias \u00B7 ${cleanN} games since ${paramDate}` : "bias since last change")),
                 React.createElement("div", { className: "lg-stat" },
                     React.createElement("span", { className: "lg-stat-val" }, leans.length ? `${leanHits}–${leans.length - leanHits}` : "—"),
-                    React.createElement("span", { className: "lg-stat-label" }, "lean record"))),
+                    React.createElement("span", { className: "lg-stat-label" }, "ledger lean record"))),
             React.createElement("section", { className: "br-council" },
                 React.createElement("div", { className: "br-council-head" },
                     React.createElement("h2", { className: "lg-formtitle" }, "Agent council"),
@@ -8495,7 +8626,9 @@ Respond ONLY with JSON, no markdown fences, exactly this shape:
                 React.createElement("div", { className: "br-ai-head" },
                     React.createElement("h2", { className: "lg-formtitle" }, "AI recalibration"),
                     React.createElement("button", { className: "ing-run small", onClick: askAI, disabled: aiBusy || graded.length < 5 }, aiBusy ? "Analyzing ledger…" : "Analyze model health")),
-                graded.length < 5 && React.createElement("p", { className: "ing-hint" }, "Needs at least 5 graded projections in the ledger \u2014 log games from the terminal and fill in finals."),
+                boardN < 30 && React.createElement("p", { className: "ing-hint" }, boardN === 0
+                    ? "No board-graded games on file. Open Today's Slate and tap \u201CGrade past boards\u201D first \u2014 that is the sample calibration reads."
+                    : `Only ${boardN} board-graded game${boardN === 1 ? "" : "s"}. It will run, but expect it to recommend nothing: under ~30 games there is no signal to find.`),
                 hosted && (React.createElement("div", { className: "br-key" },
                     React.createElement("button", { className: "br-key-toggle", onClick: () => setKeyOpen(!keyOpen) },
                         keyOpen ? "▾" : "▸",
@@ -9147,6 +9280,24 @@ const CSS = `
 .grade-stats strong { font-family: 'Archivo'; font-weight: 700; font-size: 17px; }
 .grade-stats strong.neg { color: var(--rust); }
 .grade-note { font-size: 12px; color: var(--ink-dim); line-height: 1.55; }
+.cvg { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
+.cvg-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; margin-bottom: 7px; }
+.cvg-pct { font-family: 'Archivo'; font-weight: 700; font-size: 15px; color: var(--ink); }
+.cvg-bar { height: 4px; border-radius: 3px; background: var(--field); border: 1px solid var(--line); overflow: hidden; }
+.cvg-bar i { display: block; height: 100%; background: var(--phos); }
+.cvg-sum { font-size: 12px; color: var(--ink-dim); line-height: 1.55; margin: 8px 0 0; }
+.cvg-sum strong { color: var(--ink); font-family: 'Archivo'; }
+.cvg-rows { display: flex; flex-direction: column; gap: 5px; margin-top: 10px; }
+.cvg-row { display: flex; align-items: flex-start; gap: 10px; background: var(--field); border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; }
+.cvg-row.flag { border-color: rgba(232,115,79,0.4); }
+.cvg-n { font-family: 'Archivo'; font-weight: 700; font-size: 15px; color: var(--ink); min-width: 22px; text-align: right; flex-shrink: 0; }
+.cvg-row.flag .cvg-n { color: var(--rust); }
+.cvg-lbl { display: flex; flex-direction: column; gap: 2px; }
+.cvg-lbl b { font-size: 12px; font-weight: 600; color: var(--ink); }
+.cvg-lbl em { font-style: normal; font-size: 11px; color: var(--ink-dim); line-height: 1.45; }
+.cvg-warn { margin: 10px 0 0; font-size: 11.5px; line-height: 1.55; color: var(--ink); background: rgba(232,115,79,0.07); border-left: 2px solid var(--rust); padding: 9px 11px; border-radius: 6px; }
+.cvg-warn b { color: var(--rust); }
+.cvg-note { margin: 9px 0 0; font-size: 11px; color: var(--ink-dim); line-height: 1.5; }
 .br-key { margin: 10px 0; }
 .br-key-toggle { background: transparent; border: 1px solid var(--line); color: var(--ink-dim); font-family: 'Archivo'; font-size: 10.5px; letter-spacing: 0.07em; text-transform: uppercase; padding: 7px 11px; border-radius: 6px; cursor: pointer; width: 100%; text-align: left; }
 .br-key-body { padding: 12px; border: 1px solid var(--line); border-top: none; border-radius: 0 0 8px 8px; background: var(--field); }
