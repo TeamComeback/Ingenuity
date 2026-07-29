@@ -2643,6 +2643,20 @@ function Terminal({ onHome, pendingGame, onPendingConsumed }) {
             outcome: "Pending",
             note: `Logged from terminal. SP: ${r.awayStarter || "?"} v ${r.homeStarter || "?"}. Median ${r.median.toFixed(1)}, 80% range ${r.p10.toFixed(0)}–${r.p90.toFixed(0)}.`,
         };
+        // v3.1 — re-running a projection and logging it again used to stack a
+        // second near-identical row (same game, model 8.65 vs 8.64), which then
+        // double-counted in the Brain's bias and MAE. Same game on the same day
+        // is the SAME research record: replace it and say so, rather than
+        // silently accumulating duplicates that quietly weight one game twice.
+        const dupe = games.find((x) => x.date === g.date && normName(x.matchup || "") === normName(g.matchup));
+        if (dupe) {
+            // keep whatever grading already exists — a re-projection shouldn't
+            // wipe a final you already have.
+            const merged = { ...g, id: dupe.id, final: dupe.final, outcome: dupe.outcome };
+            await store.set("ingenuity:ledger:games", games.map((x) => (x.id === dupe.id ? merged : x)));
+            setLogMsg(`Updated the existing ${g.matchup} record with this run (${g.decision}) — not a second copy.`);
+            return;
+        }
         await store.set("ingenuity:ledger:games", [g, ...games]);
         setLogMsg(`Logged ${g.matchup} to the ledger as ${g.decision}.`);
     };
@@ -4118,8 +4132,23 @@ function Ledger({ onHome }) {
     const [betFilter, setBetFilter] = useState("all"); // all | manual
     useEffect(() => {
         (async () => {
-            const g = await store.get("ingenuity:ledger:games", null);
+            let g = await store.get("ingenuity:ledger:games", null);
             const b = await store.get("ingenuity:ledger:bets", null);
+            // v3.1 REPAIR — undo the postponed-game corruption described at
+            // extractFinals(). A completed MLB game cannot total zero runs, so
+            // any final of 0 is known-bad data rather than a real result.
+            // Reset those to pending so they stop poisoning the Brain's bias
+            // and MAE; the corrected fetch will re-grade them properly once
+            // the game is actually played.
+            if (g) {
+                const bad = g.filter((x) => x.final === 0).length;
+                if (bad) {
+                    g = g.map((x) => (x.final === 0
+                        ? { ...x, final: null, outcome: "Pending", note: (x.note || "") + " [auto-grade reset: recorded 0 runs, which is not a possible final \u2014 the game was postponed or the feed was incomplete]" }
+                        : x));
+                    await store.set("ingenuity:ledger:games", g);
+                }
+            }
             if (g)
                 setGames(g);
             else
@@ -4166,12 +4195,7 @@ function Ledger({ onHome }) {
                 if (!r.ok)
                     continue;
                 const j = await r.json();
-                const finals = (j.dates?.[0]?.games || [])
-                    .filter((gm) => gm.status?.abstractGameState === "Final")
-                    .map((gm) => ({
-                    away: gm.teams.away.team.name, home: gm.teams.home.team.name,
-                    total: (gm.teams.away.score ?? 0) + (gm.teams.home.score ?? 0),
-                }));
+                const finals = extractFinals(j);
                 checked += byDate[date].length;
                 for (const g of byDate[date]) {
                     const [rawAway, rawHome] = g.matchup.split(" @ ").map((s) => s.trim());
@@ -4423,6 +4447,7 @@ function Ledger({ onHome }) {
             React.createElement("div", { className: "lg-cards" }, games.map((g) => React.createElement(GameCard, {
                 g: g, key: g.id,
                 onGrade: (id, patch) => saveGames(games.map((x) => (x.id === id ? { ...x, ...patch } : x))),
+                onDelete: (id) => saveGames(games.filter((x) => x.id !== id)),
             }))))),
         tab === "history" && React.createElement(HistoryView, null),
         tab === "addgame" && (React.createElement("main", { className: "lg-main narrow" },
@@ -4542,7 +4567,7 @@ function deriveGameOutcome(g, finalVal, typedOutcome) {
     }
     return out || (finalVal == null ? "Pending" : out);
 }
-function GameCard({ g, onGrade }) {
+function GameCard({ g, onGrade, onDelete }) {
     const missed = g.model != null && g.final != null ? (g.final - g.model) : null;
     const decisionClass = g.decision.includes("against") ? "warn" :
         g.decision.includes("independent") ? "warn" :
@@ -4551,6 +4576,7 @@ function GameCard({ g, onGrade }) {
     const [final, setFinal] = useState(g.final != null ? String(g.final) : "");
     const [outcome, setOutcome] = useState(g.outcome && g.outcome !== "Pending" ? g.outcome : "");
     const isPending = g.final == null;
+    const [confirmDel, setConfirmDel] = useState(false);
     const save = () => {
         const f = parseFloat(final);
         if (final.trim() !== "" && isNaN(f))
@@ -4585,8 +4611,13 @@ function GameCard({ g, onGrade }) {
         g.betDetail && React.createElement("div", { className: "lg-card-bet" }, g.betDetail),
         React.createElement("div", { className: "lg-card-outcome" }, g.outcome),
         React.createElement("p", { className: "lg-card-note" }, g.note),
-        !open && onGrade && (React.createElement("button", { className: "lg-grade-btn", onClick: () => setOpen(true) },
-            isPending ? "Grade this game" : "Edit final / outcome")),
+        !open && (React.createElement("div", { className: "lg-card-actions" },
+            onGrade && React.createElement("button", { className: "lg-grade-btn", onClick: () => setOpen(true) },
+                isPending ? "Grade this game" : "Edit final / outcome"),
+            onDelete && !confirmDel && React.createElement("button", { className: "lg-del-btn", onClick: () => setConfirmDel(true), title: "Remove this record" }, "Remove"),
+            onDelete && confirmDel && React.createElement(React.Fragment, null,
+                React.createElement("button", { className: "lg-del-btn confirm", onClick: () => onDelete(g.id) }, "Delete \u2014 tap to confirm"),
+                React.createElement("button", { className: "lg-grade-btn", onClick: () => setConfirmDel(false) }, "Keep")))),
         open && (React.createElement("div", { className: "lg-grade" },
             React.createElement("label", { className: "lg-f" },
                 React.createElement("span", null, "Final total runs"),
@@ -5313,6 +5344,43 @@ function parsePlayerCards(text) {
         ip: null,
         wobaFrom: null,
     }));
+}
+// v3.1 FIX — MLB reports a POSTPONED game as abstractGameState "Final" with no
+// scores attached. The old extraction did `(score ?? 0) + (score ?? 0)`, so a
+// rainout was recorded as a real 0-run final: the model was then charged an
+// error of ~-8.7 on a game that was never played, and the ledger stamped
+// "Model lean missed" on it. That is exactly the silent-garbage write this app
+// refuses everywhere else, and it poisons the Brain's bias/MAE directly.
+//
+// A game is only graded now if BOTH are true:
+//   * it genuinely completed — codedGameState "F", or a detailedState of
+//     Final / Game Over / Completed Early. Postponed, Cancelled, Suspended,
+//     Forfeit and Delayed are all excluded.
+//   * both scores are real numbers. No zero-substitution, ever — a missing
+//     score means we don't know, and "don't know" stays blank.
+const COMPLETED_STATES = new Set(["final", "game over", "completed early"]);
+function extractFinals(scheduleJson) {
+    const out = [];
+    for (const dt of (scheduleJson?.dates || [])) {
+        for (const gm of (dt.games || [])) {
+            const st = gm.status || {};
+            const detailed = String(st.detailedState || "").toLowerCase();
+            const completed = st.codedGameState === "F"
+                || (st.abstractGameState === "Final" && COMPLETED_STATES.has(detailed));
+            if (!completed)
+                continue;
+            const a = gm.teams?.away?.score, h = gm.teams?.home?.score;
+            if (typeof a !== "number" || typeof h !== "number" || isNaN(a) || isNaN(h))
+                continue; // Final-but-scoreless = postponed/cancelled. Leave it pending.
+            const total = a + h;
+            // No MLB game can end with zero total runs — somebody has to win.
+            // If we ever see one, the payload is wrong, not the game.
+            if (total <= 0)
+                continue;
+            out.push({ away: gm.teams.away.team.name, home: gm.teams.home.team.name, total });
+        }
+    }
+    return out;
 }
 // ---------------------------------------------------------------------------
 // MLB API CACHE (v3.1)
@@ -7378,10 +7446,7 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
                     continue;
                 const j = await r.json();
                 reached = true;
-                const finals = (j.dates?.[0]?.games || [])
-                    .filter((g) => g.status?.abstractGameState === "Final")
-                    .map((g) => ({ away: g.teams.away.team.name, home: g.teams.home.team.name,
-                    total: (g.teams.away.score ?? 0) + (g.teams.home.score ?? 0) }));
+                const finals = extractFinals(j);
                 if (!finals.length)
                     continue;
                 arch[d] = { ...arch[d], games: (arch[d].games || []).map((g) => {
@@ -9276,6 +9341,11 @@ const CSS = `
 .lg-card-bet { font-size: 12px; color: var(--amber); margin-bottom: 7px; font-weight: 500; }
 .lg-card-outcome { font-size: 13px; font-weight: 600; margin-bottom: 8px; }
 .lg-card-note { font-size: 12px; color: var(--ink-dim); line-height: 1.55; }
+.lg-card-actions { display: flex; gap: 8px; margin-top: 10px; align-items: stretch; }
+.lg-card-actions .lg-grade-btn { margin-top: 0; flex: 1; }
+.lg-del-btn { background: transparent; border: 1px dashed rgba(232,115,79,0.4); color: var(--rust); font-size: 11.5px; padding: 7px 12px; border-radius: 7px; cursor: pointer; white-space: nowrap; }
+.lg-del-btn:hover { border-color: var(--rust); background: rgba(232,115,79,0.08); }
+.lg-del-btn.confirm { background: rgba(232,115,79,0.14); border-style: solid; flex: 1; }
 .lg-archive-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 8px; flex-wrap: wrap; }
 .lg-archive-head .lg-hint { margin: 0; }
 .lg-grade-btn { margin-top: 10px; background: transparent; border: 1px dashed var(--line); color: var(--cyan); font-size: 11.5px; letter-spacing: 0.04em; padding: 7px 12px; border-radius: 7px; cursor: pointer; width: 100%; }
