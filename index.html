@@ -320,8 +320,22 @@ function daysOld(iso) {
 // separates the two by roughly an order of magnitude, in any month.
 function detectTimeframe(rows) {
     const pas = (rows || []).map((r) => r && r.pa).filter((p) => p != null && p > 0).sort((a, b) => b - a);
-    if (pas.length < 5)
-        return { verdict: "unknown", why: "too few rows carry a PA column to tell", med: null, max: null, n: pas.length };
+    if (pas.length < 5) {
+        // Pitcher exports carry no PA at all. Innings are the same kind of signal:
+        // a rotation regular is near 130 IP by late July and about 19 over a
+        // two-week window, so the top of the distribution separates them cleanly.
+        const ips = (rows || []).map((r) => r && r.ip).filter((x) => x != null && x > 0).sort((a, b) => b - a);
+        if (ips.length >= 5) {
+            const topI = ips.slice(0, Math.min(50, ips.length));
+            const medI = topI[Math.floor(topI.length / 2)];
+            if (medI >= 60)
+                return { verdict: "season", why: `the fifty busiest arms median ${medI.toFixed(1)} IP (max ${ips[0].toFixed(1)}) ` + "\u2014" + ` that is a full season of work`, med: medI, max: ips[0], n: ips.length, unit: "IP" };
+            if (medI <= 35)
+                return { verdict: "recent", why: `the fifty busiest arms median ${medI.toFixed(1)} IP (max ${ips[0].toFixed(1)}) ` + "\u2014" + ` consistent with a two-week window`, med: medI, max: ips[0], n: ips.length, unit: "IP" };
+            return { verdict: "ambiguous", why: `the fifty busiest arms median ${medI.toFixed(1)} IP (max ${ips[0].toFixed(1)}), between a clear window and a clear season`, med: medI, max: ips[0], n: ips.length, unit: "IP" };
+        }
+        return { verdict: "unknown", why: "no PA or IP column to judge the date range from", med: null, max: null, n: pas.length };
+    }
     const top = pas.slice(0, Math.min(50, pas.length));
     const med = top[Math.floor(top.length / 2)];
     const max = pas[0];
@@ -3068,21 +3082,30 @@ function Database({ teams, saveTeams, loaded }) {
                                     "Rotation ",
                                     React.createElement("i", { className: "ing-groupnote" }, "starters \u00B7 by workload")),
                                 React.createElement("div", { className: "ing-roster-preview" },
-                                    rotation.map((p, j) => (React.createElement("span", { key: j, className: "pit" },
-                                        "\u26BE ",
-                                        p.name || "?",
-                                        " ",
-                                        React.createElement("em", null, p.xwoba || "—"),
-                                        p.era ? React.createElement("i", { className: "ip" },
-                                            p.era,
-                                            " era") : null,
-                                        p.ip ? React.createElement("i", { className: "ip" },
-                                            p.ip,
-                                            " ip") : null,
-                                        (p.recentEra || p.recentXera) ? React.createElement("i", { className: "ip r14", title: "Last 14 days \u2014 stored separately; the projection still uses the season line" },
-                                            "14d ",
-                                            p.recentXera || p.recentEra,
-                                            p.recentIp ? ` / ${p.recentIp} ip` : "") : null))),
+                                    rotation.map((p, j) => (React.createElement("div", { key: j, className: "arm" },
+                                        React.createElement("span", { className: "arm-name" },
+                                            "\u26BE ",
+                                            p.name || "?"),
+                                        React.createElement("span", { className: "arm-line season" },
+                                            React.createElement("b", null, "SEASON"),
+                                            React.createElement("em", null, p.xwoba || "—"),
+                                            React.createElement("i", null, "xwOBA"),
+                                            p.era ? React.createElement("em", null, p.era) : null,
+                                            p.era ? React.createElement("i", null, "era") : null,
+                                            p.ip ? React.createElement("em", null, p.ip) : null,
+                                            p.ip ? React.createElement("i", null, "ip") : null),
+                                        (p.recentEra || p.recentXera || p.recentIp)
+                                            ? React.createElement("span", { className: "arm-line r14", title: "Last 14 days. Stored separately \u2014 the projection still uses the season line." },
+                                                React.createElement("b", null, "14 DAY"),
+                                                p.recentXera ? React.createElement("em", null, p.recentXera) : null,
+                                                p.recentXera ? React.createElement("i", null, "xera") : null,
+                                                p.recentEra ? React.createElement("em", null, p.recentEra) : null,
+                                                p.recentEra ? React.createElement("i", null, "era") : null,
+                                                p.recentIp ? React.createElement("em", null, p.recentIp) : null,
+                                                p.recentIp ? React.createElement("i", null, "ip") : null)
+                                            : React.createElement("span", { className: "arm-line none" },
+                                                React.createElement("b", null, "14 DAY"),
+                                                React.createElement("i", null, "not loaded"))))),
                                     !rotation.length && React.createElement("span", { className: "pit" }, "no starters have workload stats yet")),
                                 React.createElement("h4", null,
                                     "Bullpen ",
@@ -6623,10 +6646,37 @@ function PlatoonImport({ teams, saveTeams }) {
         setMsg(`Catcher framing imported \u2014 ${matched} of ${total} catchers routed into ${applied.length} team${applied.length === 1 ? "" : "s"}, summed per club. Best: ${best.name} ${best.rv > 0 ? "+" : ""}${best.rv} runs. Worst: ${worst.name} ${worst.rv > 0 ? "+" : ""}${worst.rv}.${usedIds ? "" : " Matched by name \u2014 re-sync MLB rosters to match on player ID instead, which is exact."}${unrouted.length ? ` Not on a current roster: ${unrouted.slice(0, 4).join(", ")}${unrouted.length > 4 ? ` +${unrouted.length - 4}` : ""}.` : ""}${unknownTeam.length ? ` Teams not in your database: ${unknownTeam.slice(0, 3).join(", ")}.` : ""} A club whose third catcher is below Savant's pitch minimum will read slightly high.`);
         return true;
     };
+    // The two import boxes look nearly identical and this app has already shipped
+    // one bug from a fix landing in only one of them. The roster box already
+    // falls back to the team-level parser; this is the missing mirror image.
+    const tryPlayerRows = async (content) => {
+        const parsed = savantCsvToRows(content);
+        if (!parsed.rows || !parsed.rows.length)
+            return false;
+        // No timeframe toggle exists in this box, so the date range has to be
+        // read off the data. Refusing to guess is the whole point: writing a
+        // season file into the 14-day window is the failure this app already had.
+        const tf = detectTimeframe(parsed.rows);
+        if (tf.verdict !== "season" && tf.verdict !== "recent") {
+            setMsg(`That parsed as ${parsed.rows.length} player rows, not team stats ` + "\u2014" + ` but this box has no season/recent switch and the data doesn't say which it is (${tf.why}). Paste it into the roster stats box above, where you can set the timeframe yourself. Nothing was written.`);
+            return true;
+        }
+        const rm = await store.get("ingenuity:mlb:rosterMap", null);
+        const { next, hitters, pitchers, teamsTouched, seeded } = applyStatRows(parsed.rows, teams, tf.verdict, rm && rm.map);
+        if (!hitters && !pitchers && !seeded) {
+            setMsg(`Parsed ${parsed.rows.length} player rows and read them as ${tf.verdict === "recent" ? "a recent window" : "season stats"} (${tf.why}), but none could be routed to a club. Tap "Sync MLB rosters" in the box above and try again.`);
+            return true;
+        }
+        await saveTeams(next);
+        setMsg(`That was player stats, not team stats ` + "\u2014" + ` imported it anyway. Read as ${tf.verdict === "recent" ? "LAST 14 DAYS" : "SEASON"} because ${tf.why}. ${hitters ? `${hitters} hitters` : ""}${hitters && pitchers ? " and " : ""}${pitchers ? `${pitchers} starters` : ""} across ${teamsTouched.length} team${teamsTouched.length === 1 ? "" : "s"}${seeded ? `, ${seeded} new player${seeded === 1 ? "" : "s"} added to rosters` : ""}. ${tf.verdict === "recent" ? "Season figures were left untouched." : ""}`);
+        return true;
+    };
     const importTeamStats = async () => {
         if (await tryCatcherFraming(statText))
             return;
         const { rows, err } = parseTeamStats(statText);
+        if (!rows.length && await tryPlayerRows(statText))
+            return;
         if (!rows.length) {
             setMsg(err
                 ? `Couldn't read that — ${err}. Keep the header row; it needs a Team column plus at least one recognised stat (OAA, Framing, Barrel%, HardHit%, wOBA, xwOBA, Pen xwOBA). Savant's per-player catcher framing export (an rv_tot column) is handled automatically \u2014 if you pasted that and still see this, sync MLB rosters first so catchers can be routed to clubs.`
@@ -9675,7 +9725,15 @@ const CSS = `
 .fresh-audit-tally .aging { color: var(--amber); border-color: rgba(245,196,81,0.3); }
 .fresh-audit-tally .stale { color: var(--rust); border-color: rgba(232,115,79,0.35); }
 .fresh-audit-age { font-family: 'Archivo'; font-size: 9.5px; color: var(--ink-dim); min-width: 62px; text-align: right; flex-shrink: 0; }
-.ip.r14 { color: var(--amber); }
+.arm { display: flex; flex-direction: column; gap: 3px; padding: 8px 10px; background: var(--field); border: 1px solid var(--line); border-radius: 7px; margin-bottom: 6px; }
+.arm-name { font-size: 12.5px; font-weight: 600; color: var(--ink); }
+.arm-line { display: flex; flex-wrap: wrap; align-items: baseline; gap: 5px; font-size: 11px; }
+.arm-line b { font-family: 'Archivo'; font-size: 8.5px; letter-spacing: 0.11em; color: var(--ink-dim); min-width: 46px; }
+.arm-line em { font-style: normal; font-weight: 600; color: var(--ink); }
+.arm-line i { font-style: normal; font-size: 9.5px; color: var(--ink-dim); margin-right: 4px; }
+.arm-line.r14 em { color: var(--amber); }
+.arm-line.r14 b { color: var(--amber); }
+.arm-line.none i { color: var(--ink-dim); opacity: 0.65; }
 .fresh-audit-note { margin: 10px 0 0; font-size: 11px; color: var(--ink-dim); line-height: 1.55; }
 .stamp.unknown { border-left-color: var(--ink-dim); }
 .stamp.unknown b { color: var(--ink-dim); }
