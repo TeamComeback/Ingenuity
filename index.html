@@ -704,6 +704,7 @@ async function refreshMlbRosterMap() {
         const j = await r.json();
         const people = j.people || [];
         const map = {};
+        const ids = {}; // MLB player_id -> team; survives accents and spelling variants
         const hands = {}; // v1.6: MLB's own pitchHand — fills platoon handedness with no manual entry
         for (const p of people) {
             const team = p.currentTeam?.name;
@@ -712,6 +713,8 @@ async function refreshMlbRosterMap() {
             if (team) {
                 const resolved = resolveTeamName(team) || team;
                 map[normName(p.fullName)] = resolved;
+                if (p.id != null)
+                    ids[String(p.id)] = resolved; // exact routing for Savant exports
             }
             const ph = p.pitchHand?.code;
             if (ph === "L" || ph === "R")
@@ -727,7 +730,7 @@ async function refreshMlbRosterMap() {
         // synced" could be shown even when the write silently failed (usually a
         // full browser storage quota) — leaving the actual matching pool empty
         // while the UI claimed it was populated. Verify the write, don't assume it.
-        const wrote = await store.set("ingenuity:mlb:rosterMap", { asOf: etDayKey(), map, hands });
+        const wrote = await store.set("ingenuity:mlb:rosterMap", { asOf: etDayKey(), map, ids, hands });
         if (!wrote)
             return { ok: false, n: 0, err: `fetched ${n} players but couldn't save them — ${store.lastError || "the browser refused the write"}` };
         return { ok: true, n, hands: Object.keys(hands).length };
@@ -5860,6 +5863,7 @@ function SmartImport({ teams, saveTeams, onGameLine, statsFocus }) {
     const [timeframe, setTimeframe] = useState("season"); // season | recent
     const [lastImport, setLastImport] = useState(null); // { teams:[{name, added, updated, players:[...]}] } — what the last import changed
     const [rosterMap, setRosterMap] = useState(null); // MLB name -> team, for CSVs with no team column
+    const [rosterIds, setRosterIds] = useState(null); // MLB player_id -> team; exact where names are fragile
     const [rosterSync, setRosterSync] = useState(""); // status line for the sync control
     useEffect(() => {
         if (!statsFocus)
@@ -5868,6 +5872,7 @@ function SmartImport({ teams, saveTeams, onGameLine, statsFocus }) {
             const cached = await store.get("ingenuity:mlb:rosterMap", null);
             if (cached) {
                 setRosterMap(cached.map);
+                setRosterIds(cached.ids || null);
                 const age = Math.floor((Date.now() - new Date(cached.asOf + "T12:00:00Z").getTime()) / 86400000);
                 if (age > ROSTER_MAP_MAX_AGE_DAYS)
                     syncRosters(true); // stale — refresh quietly
@@ -5890,6 +5895,7 @@ function SmartImport({ teams, saveTeams, onGameLine, statsFocus }) {
             const cached = await store.get("ingenuity:mlb:rosterMap", null);
             const count = cached?.map ? Object.keys(cached.map).length : 0;
             setRosterMap(cached?.map || null);
+            setRosterIds(cached?.ids || null);
             if (count > 0) {
                 setRosterSync(`MLB rosters synced just now — ${count} players. This lets stats CSVs with no team column still route correctly.`);
             }
@@ -5906,6 +5912,22 @@ function SmartImport({ teams, saveTeams, onGameLine, statsFocus }) {
     const [msg, setMsg] = useState("");
     const [staged, setStaged] = useState(null); // { file, name, isImage, url }
     const [inputKey, setInputKey] = useState(0); // remount the file input to truly clear it
+    // Catcher framing lands here just as often as in the team-level box.
+    const framingAttempt = async (content, label) => {
+        const cf = parseCatcherFraming(content);
+        if (!cf.rows.length)
+            return false;
+        const { next, applied, matched, total, unrouted, usedIds } = applyCatcherFraming(cf.rows, teams, rosterMap ? { map: rosterMap, ids: rosterIds } : null);
+        if (!applied.length) {
+            setMsg(`${label}: read ${total} catchers but none could be routed to a club. Tap "Sync MLB rosters" above first \u2014 Savant's framing export has no team column, so routing depends on it.`);
+            logInterp("framing", false, "no roster map");
+            return true;
+        }
+        await saveTeams(next);
+        setMsg(`${label}: catcher framing \u2014 ${matched} of ${total} catchers summed into ${applied.length} team${applied.length === 1 ? "" : "s"}.${usedIds ? "" : " Matched by name; re-sync rosters for exact player-ID matching."}${unrouted.length ? ` Not on a current roster: ${unrouted.slice(0, 4).join(", ")}.` : ""}`);
+        logInterp("framing", true, `${applied.length} teams`);
+        return true;
+    };
     const applyRows = async (rows, label) => {
         // Refuse a load whose PA distribution contradicts the selected timeframe.
         // Writing a season export into the 14-day window is silently destructive:
@@ -6040,7 +6062,7 @@ If none of these: {"kind":"unknown"}` },
                 const { rows, headers } = savantCsvToRows(content);
                 if (rows)
                     await applyRows(rows, `${file.name} (${rows.length} rows)`);
-                else {
+                else if (!(await framingAttempt(content, file.name))) {
                     // Same fallback as the paste path: a team-level export (OAA, framing,
                     // bullpen contact) is a perfectly reasonable thing to drop here.
                     const ts = parseTeamStats(content);
@@ -6096,6 +6118,7 @@ If none of these: {"kind":"unknown"}` },
                     // further down the page, but the two look nearly identical and there
                     // is no good reason to make someone find the right one — if the data
                     // parses as team stats, just apply it here and say what happened.
+                    if (await framingAttempt(text, "Pasted")) { setText(""); return; }
                     const ts = parseTeamStats(text);
                     if (ts.rows && ts.rows.length) {
                         const { next, applied, fieldsSet, unmatched } = applyTeamStats(ts.rows, teams);
@@ -6331,6 +6354,86 @@ const stripQuotes = (s) => {
     const t = String(s).trim();
     return t.length >= 2 && t[0] === '"' && t[t.length - 1] === '"' ? t.slice(1, -1).trim() : t;
 };
+// ---- Catcher framing (Baseball Savant) --------------------------------------
+// Savant publishes framing PER CATCHER with no team column at all, so the
+// team-level parser correctly rejected it: there is no Team column and rv_tot
+// is not a recognised stat label. Framing is a team input in this engine
+// (FRAMING_FACTOR_SCALE is runs-per-framing-run), and a club's framing is the
+// work of its whole catching corps, so the catchers are routed to their teams
+// and their run values summed.
+function isCatcherFraming(headers) {
+    const h = (headers || []).map((x) => String(x).trim().toLowerCase().replace(/^"|"$/g, ""));
+    return h.includes("rv_tot") && (h.includes("pitches") || h.includes("pct_tot"));
+}
+function parseCatcherFraming(text) {
+    const rows = parseCsvText(String(text || ""));
+    if (rows.length < 2)
+        return { rows: [], headers: rows[0] || [] };
+    const head = rows[0].map((x) => String(x).trim().toLowerCase());
+    if (!isCatcherFraming(head))
+        return { rows: [], headers: rows[0] };
+    const at = (n) => head.indexOf(n);
+    const iId = at("id") !== -1 ? at("id") : at("player_id");
+    const iName = at("name") !== -1 ? at("name") : at("last_name, first_name");
+    const iRv = at("rv_tot"), iP = at("pitches");
+    const out = [];
+    for (const r of rows.slice(1)) {
+        if (!r || r.length < 3)
+            continue;
+        const rv = parseFloat(r[iRv]);
+        if (!isFinite(rv))
+            continue;
+        // "Raleigh, Cal" -> "Cal Raleigh", matching how the roster map is keyed.
+        let nm = iName !== -1 ? String(r[iName] || "").trim() : "";
+        const c = nm.indexOf(",");
+        if (c > 0)
+            nm = (nm.slice(c + 1) + " " + nm.slice(0, c)).replace(/\s+/g, " ").trim();
+        out.push({ id: iId !== -1 ? String(r[iId] || "").trim() : "", name: nm, rv, pitches: iP !== -1 ? parseFloat(r[iP]) || 0 : 0 });
+    }
+    return { rows: out, headers: rows[0] };
+}
+// Sum each club's catchers into one team framing figure. Routing prefers MLB
+// player_id (exact) and falls back to name; a catcher who matches neither is
+// reported rather than silently dropped, because a missing catcher understates
+// his team's framing without changing anything visible.
+function applyCatcherFraming(rows, teams, rosterMap) {
+    const next = teams.map((t) => ({ ...t }));
+    const byName = new Map(next.map((t, i) => [normName(t.name), i]));
+    const ids = (rosterMap && rosterMap.ids) || null;
+    const names = (rosterMap && rosterMap.map) || null;
+    const totals = new Map(); // team index -> {rv, catchers}
+    const unrouted = [], unknownTeam = [];
+    for (const r of rows) {
+        let team = null;
+        if (ids && r.id && ids[r.id])
+            team = ids[r.id];
+        else if (names && r.name && names[normName(r.name)])
+            team = names[normName(r.name)];
+        if (!team) {
+            unrouted.push(r.name || r.id);
+            continue;
+        }
+        const at = byName.get(normName(team));
+        if (at == null) {
+            unknownTeam.push(team);
+            continue;
+        }
+        const cur = totals.get(at) || { rv: 0, catchers: 0 };
+        cur.rv += r.rv;
+        cur.catchers++;
+        totals.set(at, cur);
+    }
+    const stamp = etDayKey();
+    const applied = [];
+    for (const [at, v] of totals) {
+        next[at].framing = v.rv.toFixed(1);
+        next[at].teamStatsAsOf = stamp;
+        applied.push({ name: next[at].name, rv: +v.rv.toFixed(1), catchers: v.catchers });
+    }
+    applied.sort((a, b) => b.rv - a.rv);
+    return { next, applied, matched: rows.length - unrouted.length, total: rows.length,
+        unrouted: [...new Set(unrouted)], unknownTeam: [...new Set(unknownTeam)], usedIds: !!ids };
+}
 function parseTeamStats(text) {
     const raw = normalizeFangraphsPaste(String(text || ""));
     const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
@@ -6458,11 +6561,32 @@ function PlatoonImport({ teams, saveTeams }) {
         await saveTeams(next);
         setMsg(`Platoon splits saved for ${applied} team${applied === 1 ? "" : "s"}.${unmatched.length ? ` Unmatched: ${unmatched.slice(0, 6).join(", ")}${unmatched.length > 6 ? "…" : ""} — check team names against the Database.` : ""} These now nudge each lineup's projection by the opposing starter's hand.`);
     };
+    // Savant's catcher-framing export is per-catcher and has no Team column, so
+    // it is tried BEFORE the team-level parser rather than after it fails.
+    const tryCatcherFraming = async (content) => {
+        const cf = parseCatcherFraming(content);
+        if (!cf.rows.length)
+            return false;
+        const rm = await store.get("ingenuity:mlb:rosterMap", null);
+        const { next, applied, matched, total, unrouted, unknownTeam, usedIds } = applyCatcherFraming(cf.rows, teams, rm);
+        if (!applied.length) {
+            setMsg(rm
+                ? `Read ${total} catchers but none could be routed to a team. Tap \u201CSync MLB rosters\u201D in the stats box above and try again \u2014 that is what maps a catcher to his club.`
+                : `Read ${total} catchers, but there are no MLB rosters cached to route them with. Tap \u201CSync MLB rosters\u201D in the stats box above first.`);
+            return true;
+        }
+        await saveTeams(next);
+        const best = applied[0], worst = applied[applied.length - 1];
+        setMsg(`Catcher framing imported \u2014 ${matched} of ${total} catchers routed into ${applied.length} team${applied.length === 1 ? "" : "s"}, summed per club. Best: ${best.name} ${best.rv > 0 ? "+" : ""}${best.rv} runs. Worst: ${worst.name} ${worst.rv > 0 ? "+" : ""}${worst.rv}.${usedIds ? "" : " Matched by name \u2014 re-sync MLB rosters to match on player ID instead, which is exact."}${unrouted.length ? ` Not on a current roster: ${unrouted.slice(0, 4).join(", ")}${unrouted.length > 4 ? ` +${unrouted.length - 4}` : ""}.` : ""}${unknownTeam.length ? ` Teams not in your database: ${unknownTeam.slice(0, 3).join(", ")}.` : ""} A club whose third catcher is below Savant's pitch minimum will read slightly high.`);
+        return true;
+    };
     const importTeamStats = async () => {
+        if (await tryCatcherFraming(statText))
+            return;
         const { rows, err } = parseTeamStats(statText);
         if (!rows.length) {
             setMsg(err
-                ? `Couldn't read that — ${err}. Keep the header row; it needs a Team column plus at least one recognised stat (OAA, Framing, Barrel%, HardHit%, wOBA, xwOBA, Pen xwOBA).`
+                ? `Couldn't read that — ${err}. Keep the header row; it needs a Team column plus at least one recognised stat (OAA, Framing, Barrel%, HardHit%, wOBA, xwOBA, Pen xwOBA). Savant's per-player catcher framing export (an rv_tot column) is handled automatically \u2014 if you pasted that and still see this, sync MLB rosters first so catchers can be routed to clubs.`
                 : "No team rows recognised. Paste the header row along with the data.");
             return;
         }
