@@ -351,6 +351,7 @@ const DATA_CLASSES = [
     { key: "recentAsOf", label: "14-day form", fresh: 2, stale: 7, note: "A rolling window \u2014 goes stale by definition" },
     { key: "splitsAsOf", label: "Platoon splits", fresh: 14, stale: 30, note: "wOBA vs LHP and vs RHP" },
     { key: "teamStatsAsOf", label: "Defense & framing", fresh: 14, stale: 30, note: "OAA, catcher framing, pen contact quality" },
+    { key: "recentArmsAsOf", label: "14-day starters", fresh: 2, stale: 7, note: "Recent ERA/xERA per starter \u2014 a 2-3 start window" },
     { key: "lineupAsOf", label: "Lineup", fresh: 0, stale: 2, note: "Changes daily \u2014 anything older is last night's card" },
     { key: "penFatigueAsOf", label: "Bullpen fatigue", fresh: 0, stale: 1, note: "Must be same-day or it means nothing" },
 ];
@@ -385,6 +386,8 @@ function teamHasClass(t, key) {
         return !!(t.offVsL || t.offVsR);
     if (key === "teamStatsAsOf")
         return !!(t.oaa || t.framing || t.penBarrel || t.penHardHit);
+    if (key === "recentArmsAsOf")
+        return (t.rotation || []).some((p) => p.recentEra || p.recentXera);
     if (key === "lineupAsOf")
         return !!(t.lineup && t.lineup.length);
     if (key === "penFatigueAsOf")
@@ -1415,7 +1418,7 @@ function dedupeTeams(teams) {
         // Timestamps are not "keep whichever exists" — a merge that pairs newer
         // data with an older stamp would report the result as fresher or staler
         // than it is. Always carry the later of the two.
-        for (const f of ["statsAsOf", "recentAsOf", "splitsAsOf", "teamStatsAsOf", "lineupAsOf", "penFatigueAsOf"])
+        for (const f of ["statsAsOf", "recentAsOf", "recentArmsAsOf", "splitsAsOf", "teamStatsAsOf", "lineupAsOf", "penFatigueAsOf"])
             out[f] = [a[f], t[f]].filter(Boolean).sort().pop();
         out.players = mergeList(a.players, t.players);
         out.rotation = mergeList(a.rotation, t.rotation);
@@ -3075,7 +3078,11 @@ function Database({ teams, saveTeams, loaded }) {
                                             " era") : null,
                                         p.ip ? React.createElement("i", { className: "ip" },
                                             p.ip,
-                                            " ip") : null))),
+                                            " ip") : null,
+                                        (p.recentEra || p.recentXera) ? React.createElement("i", { className: "ip r14", title: "Last 14 days \u2014 stored separately; the projection still uses the season line" },
+                                            "14d ",
+                                            p.recentXera || p.recentEra,
+                                            p.recentIp ? ` / ${p.recentIp} ip` : "") : null))),
                                     !rotation.length && React.createElement("span", { className: "pit" }, "no starters have workload stats yet")),
                                 React.createElement("h4", null,
                                     "Bullpen ",
@@ -5083,15 +5090,29 @@ function applyStatRows(rows, teams, mode = "season", rosterMap = null) {
     // A pitcher row (has ERA/xERA or barrel-allowed but no wOBA) seeds the
     // rotation; a hitter row seeds the lineup.
     let seeded = 0, unroutable = 0;
-    if (rows.some((r) => r.team) || (rosterMap && Object.keys(rosterMap).length)) {
+    // Third source: the database itself. If a player is already on a roster here,
+    // that is a stated fact about where he plays and beats having no answer at
+    // all. Checked last, so a file's own team column and MLB's live rosters both
+    // win over it — a stale local roster should never override a current one.
+    const dbTeamOf = new Map();
+    for (const t of teams)
+        for (const bucket of ["players", "rotation"])
+            for (const pl of (t[bucket] || []))
+                if (pl && pl.name) {
+                    const k = normName(pl.name);
+                    // A name on two rosters is ambiguous; refuse rather than guess.
+                    dbTeamOf.set(k, dbTeamOf.has(k) && dbTeamOf.get(k) !== t.name ? null : t.name);
+                }
+    if (rows.some((r) => r.team) || (rosterMap && Object.keys(rosterMap).length) || dbTeamOf.size) {
         const idx = new Map(); // resolved team name -> team object
         teams.forEach((t) => idx.set(normName(t.name), t));
         for (const r of rows) {
             const fromMap = !r.team && rosterMap ? rosterMap[normName(r.name)] : null;
-            if (!r.team && !fromMap) {
+            const fromDb = !r.team && !fromMap ? dbTeamOf.get(normName(r.name)) : null;
+            if (!r.team && !fromMap && !fromDb) {
                 continue;
             } // no team label anywhere for this player — leave to the season/recent name-match below
-            const resolved = r.team ? (resolveTeamName(r.team) || r.team) : fromMap;
+            const resolved = r.team ? (resolveTeamName(r.team) || r.team) : (fromMap || fromDb);
             let t = idx.get(normName(resolved));
             if (!t) {
                 unroutable++;
@@ -5130,7 +5151,7 @@ function applyStatRows(rows, teams, mode = "season", rosterMap = null) {
     };
     // ---- recent (14-day) mode: team-level form only ----
     if (mode === "recent") {
-        let matched = 0;
+        let matched = 0, armsMatched = 0;
         const nextR = teams.map((t) => {
             let wSum = 0, paSum = 0, bbkSum = 0, bbkPA = 0, hit = 0;
             for (const pl of (t.players || [])) {
@@ -5150,19 +5171,38 @@ function applyStatRows(rows, teams, mode = "season", rosterMap = null) {
                     bbkPA += pa;
                 }
             }
-            if (!hit && !bbkPA)
+            // Pitchers were previously ignored entirely in recent mode: the loop
+            // above only walks t.players, so a 14-day pitcher export matched
+            // nothing and reported it as a team-label problem. Recent starter
+            // form is written to its own fields and never over season stats.
+            let arms = 0;
+            const rot = (t.rotation || []).map((p) => {
+                const st = look(p.name);
+                if (!st || (st.era == null && st.xera == null && st.ip == null))
+                    return p;
+                arms++;
+                return { ...p,
+                    recentEra: st.era != null ? String(st.era) : p.recentEra,
+                    recentXera: st.xera != null ? String(st.xera) : p.recentXera,
+                    recentIp: st.ip != null ? String(st.ip) : p.recentIp,
+                };
+            });
+            if (!hit && !bbkPA && !arms)
                 return t;
             matched += hit;
+            armsMatched += arms;
             return {
                 ...t,
+                rotation: arms ? rot : t.rotation,
                 recent: paSum ? (wSum / paSum).toFixed(3) : t.recent,
                 recentPA: paSum ? String(Math.round(paSum)) : t.recentPA,
                 recentBbk: bbkPA ? (bbkSum / bbkPA).toFixed(1) : t.recentBbk,
-                recentAsOf: etDayKey(),
+                recentAsOf: (hit || bbkPA) ? etDayKey() : t.recentAsOf,
+                recentArmsAsOf: arms ? etDayKey() : t.recentArmsAsOf,
             };
         });
         const teamsTouched = nextR.filter((t, i2) => t !== teams[i2]).map((t) => ({ name: t.name, n: 0 })).sort();
-        return { next: nextR, hitters: matched, pitchers: 0, mode: "recent", teamsTouched, seeded, unroutable };
+        return { next: nextR, hitters: matched, pitchers: armsMatched, mode: "recent", teamsTouched, seeded, unroutable };
     }
     let hitters = 0, pitchers = 0;
     const next = teams.map((t) => {
@@ -5961,8 +6001,11 @@ function SmartImport({ teams, saveTeams, onGameLine, statsFocus }) {
                 return rosterMap && Object.keys(rosterMap).length
                     ? `${label}: parsed ${rows.length} players, but none matched MLB's current rosters by name — check for nicknames, suffixes, or typos, or tap "Sync MLB rosters" if it's been a while.`
                     : `${label}: parsed ${rows.length} players. Baseball Savant's exports don't include a team column (there's no button for that — the "Team" control on Savant is a filter, not an export column), so the app resolves each player's team from MLB's own roster list instead. That list hasn't synced yet — tap "Sync MLB rosters" above and re-run this import.`;
+            const pitcherOnly = rows.length > 0 && rows.every((r) => r.woba == null && r.xwoba == null) && rows.some((r) => r.era != null || r.xera != null || r.ip != null);
+            if (pitcherOnly && timeframe === "recent")
+                return `${label}: parsed ${rows.length} pitchers but couldn't route any of them to a club. Recent mode creates missing arms by itself, so this means no routing source worked: the file has no usable team column, MLB rosters aren't synced, and none of these names are already on a rotation here. Tap “Sync MLB rosters” above and try again.`;
             if (unroutable)
-                return `${label}: parsed ${rows.length} players, but their team labels didn't match any of the 30 MLB clubs (${unroutable} unresolved). If the file uses an unusual team code, tell me the format and I'll map it.`;
+                return `${label}: parsed ${rows.length} players. ${unroutable} had a team label that isn't one of the 30 clubs—combined lines like “2 Tms” for a traded player can't be routed and are expected to fail. The rest matched nothing on your rosters. If the file uses an unusual team code, tell me the format and I'll map it.`;
             return `${label}: parsed ${rows.length} players but none matched — check name spellings against the Database tab.`;
         };
         // Ambiguous PA distributions are let through rather than blocked \u2014 an
@@ -5973,7 +6016,7 @@ function SmartImport({ teams, saveTeams, onGameLine, statsFocus }) {
             : "";
         if (timeframe === "recent") {
             setMsg((hitters || touched.length
-                ? `${label}: read as LAST-14-DAY form — ${hitters} hitters recognized across ${touched.length} team${touched.length === 1 ? "" : "s"}${touched.length ? `: ${teamList}` : ""}.${seededNote} Season numbers untouched.`
+                ? `${label}: read as LAST-14-DAY form — ${hitters} hitters${pitchers ? ` and ${pitchers} starters` : ""} recognized across ${touched.length} team${touched.length === 1 ? "" : "s"}${touched.length ? `: ${teamList}` : ""}.${seededNote} Season numbers untouched.`
                 : diagnose()) + tfNote);
         }
         else {
@@ -9632,6 +9675,7 @@ const CSS = `
 .fresh-audit-tally .aging { color: var(--amber); border-color: rgba(245,196,81,0.3); }
 .fresh-audit-tally .stale { color: var(--rust); border-color: rgba(232,115,79,0.35); }
 .fresh-audit-age { font-family: 'Archivo'; font-size: 9.5px; color: var(--ink-dim); min-width: 62px; text-align: right; flex-shrink: 0; }
+.ip.r14 { color: var(--amber); }
 .fresh-audit-note { margin: 10px 0 0; font-size: 11px; color: var(--ink-dim); line-height: 1.55; }
 .stamp.unknown { border-left-color: var(--ink-dim); }
 .stamp.unknown b { color: var(--ink-dim); }
