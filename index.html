@@ -313,6 +313,35 @@ function daysOld(iso) {
     const d = Math.floor((Date.now() - new Date(iso + "T12:00:00Z").getTime()) / 86400000);
     return d < 0 ? 0 : d;
 }
+// ---- Timeframe detection ----------------------------------------------------
+// A Savant export carries no label saying which date range it covers, so the
+// only honest signal is plate appearances. A regular accumulates ~450 PA over a
+// season but ~50 over a trailing 14 days. Reading the top of the PA distribution
+// separates the two by roughly an order of magnitude, in any month.
+function detectTimeframe(rows) {
+    const pas = (rows || []).map((r) => r && r.pa).filter((p) => p != null && p > 0).sort((a, b) => b - a);
+    if (pas.length < 5)
+        return { verdict: "unknown", why: "too few rows carry a PA column to tell", med: null, max: null, n: pas.length };
+    const top = pas.slice(0, Math.min(50, pas.length));
+    const med = top[Math.floor(top.length / 2)];
+    const max = pas[0];
+    // Regulars in a trailing-14-day window top out near 60-70 PA. Anything where
+    // the busiest fifty hitters median above ~150 is cumulative, not a window.
+    if (med >= 150)
+        return { verdict: "season", why: `the fifty busiest hitters median ${med} PA (max ${max}) \u2014 that is cumulative, not a window`, med, max, n: pas.length };
+    if (med <= 70)
+        return { verdict: "recent", why: `the fifty busiest hitters median ${med} PA (max ${max}) \u2014 consistent with a short window`, med, max, n: pas.length };
+    return { verdict: "ambiguous", why: `the fifty busiest hitters median ${med} PA (max ${max}), which sits between a clear window and a clear season`, med, max, n: pas.length };
+}
+// Has a season import overwritten this team's 14-day form? If the two wOBA
+// figures are identical there is no independent recent signal left, only a
+// duplicate of season talent wearing today's date.
+function recentIsDuplicate(t) {
+    const r = parseFloat(t.recent), o = parseFloat(t.off);
+    if (!isFinite(r) || !isFinite(o))
+        return false;
+    return Math.abs(r - o) < 0.0015;
+}
 // ---- Data freshness ---------------------------------------------------------
 // Every class of imported data rots at a different rate. A 14-day form window is
 // meaningless a week later; season wOBA barely moves in that time. These
@@ -338,7 +367,7 @@ function fmtStamp(iso) {
 function ageMeta(stamp, cls) {
     const d = daysOld(stamp);
     if (d == null)
-        return { days: null, tone: "never", text: "never loaded", date: null };
+        return { days: null, tone: "unknown", text: "not timestamped", date: null };
     const date = fmtStamp(stamp);
     const rel = d === 0 ? "today" : d === 1 ? "yesterday" : `${d}d ago`;
     const tone = d <= cls.fresh ? "fresh" : d <= cls.stale ? "aging" : "stale";
@@ -367,7 +396,7 @@ function Stamp({ cls, value, compact }) {
     const a = ageMeta(value, cls);
     return React.createElement("span", { className: "stamp " + a.tone, title: a.date ? `${cls.label} loaded ${a.date}. ${cls.note}.` : `${cls.label} has never been loaded. ${cls.note}.` },
         React.createElement("em", null, cls.label),
-        React.createElement("b", null, a.date ? (compact ? a.text : `${a.text} \u00B7 ${a.date}`) : "never loaded"));
+        React.createElement("b", null, a.date ? (compact ? a.text : `${a.text} \u00B7 ${a.date}`) : "not timestamped"));
 }
 // Stadium coordinates + roof + approximate home-plate→center-field bearing
 // (degrees true). Bearings are approximations good to ~±20°; with the engine's
@@ -2810,6 +2839,9 @@ function TeamFreshness({ t }) {
         React.createElement("div", { className: "fresh-head" }, "Last loaded"),
         React.createElement("div", { className: "fresh-chips" }, held.map((c) => React.createElement(Stamp, { key: c.key, cls: c, value: t[c.key] }))),
         !held.length && React.createElement("p", { className: "fresh-none" }, "No stats loaded for this team yet."),
+        recentIsDuplicate(t) && React.createElement("p", { className: "fresh-dupe" },
+            React.createElement("b", null, "14-day form matches season wOBA exactly "),
+            `(${t.recent} vs ${t.off}). A season export has overwritten the recent window, so there is no independent form signal here \u2014 only season talent carrying today's date. Clearing it is more honest than leaving a duplicate the engine will read as real.`),
         absent.length > 0 && React.createElement("p", { className: "fresh-absent" },
             "Not loaded: ",
             absent.map((c) => c.label).join(", "),
@@ -2817,11 +2849,12 @@ function TeamFreshness({ t }) {
 }
 // Roll-up across every team, so stale data is something you audit rather than
 // something you discover in a projection.
-function FreshnessAudit({ teams }) {
+function FreshnessAudit({ teams, onRepair }) {
     const [open, setOpen] = useState(false);
+    const [confirmed, setConfirmed] = useState(false);
     const rows = DATA_CLASSES.map((c) => {
         const hold = teams.filter((t) => teamHasClass(t, c.key));
-        const tally = { fresh: 0, aging: 0, stale: 0, never: 0 };
+        const tally = { fresh: 0, aging: 0, stale: 0, unknown: 0 };
         let oldest = null;
         for (const t of hold) {
             const a = ageMeta(t[c.key], c);
@@ -2831,7 +2864,9 @@ function FreshnessAudit({ teams }) {
         }
         return { c, held: hold.length, missing: teams.length - hold.length, tally, oldest };
     });
-    const rotten = rows.reduce((n, r) => n + r.tally.stale + r.tally.never, 0);
+    const rotten = rows.reduce((n, r) => n + r.tally.stale, 0);
+    const unstamped = rows.reduce((n, r) => n + r.tally.unknown, 0);
+    const dupes = teams.filter(recentIsDuplicate);
     return React.createElement("section", { className: "fresh-audit" },
         React.createElement("button", { className: "fresh-audit-toggle", onClick: () => setOpen(!open) },
             React.createElement("span", null, "Data freshness \u00B7 " + teams.length + " teams"),
@@ -2845,9 +2880,21 @@ function FreshnessAudit({ teams }) {
                     r.tally.fresh > 0 && React.createElement("span", { className: "fresh" }, r.tally.fresh + " fresh"),
                     r.tally.aging > 0 && React.createElement("span", { className: "aging" }, r.tally.aging + " aging"),
                     r.tally.stale > 0 && React.createElement("span", { className: "stale" }, r.tally.stale + " stale"),
+                    r.tally.unknown > 0 && React.createElement("span", { className: "unknown" }, r.tally.unknown + " no date"),
                     r.missing > 0 && React.createElement("span", { className: "never" }, r.missing + " not loaded"),
                     r.held === 0 && r.missing === 0 && React.createElement("span", { className: "never" }, "\u2014")),
                 r.oldest != null && React.createElement("div", { className: "fresh-audit-age" }, "oldest " + r.oldest + "d"))),
+            dupes.length > 0 && React.createElement("div", { className: "fresh-repair" },
+                React.createElement("p", null,
+                    React.createElement("b", null, dupes.length + " team" + (dupes.length === 1 ? "" : "s") + " have 14-day form identical to season wOBA. "),
+                    "That is a season export written into the recent window. Clearing those three fields (recent, recentPA, recentBbk) restores the engine's league-average fallback, which is the honest answer when the window is unknown \u2014 better than a duplicate it will treat as a real form read."),
+                React.createElement("button", { className: "ing-ghost", onClick: () => {
+                        if (!confirmed) { setConfirmed(true); return; }
+                        onRepair(dupes.map((t) => t.name));
+                        setConfirmed(false);
+                    } }, confirmed ? `Confirm \u2014 clear 14-day form on ${dupes.length} team${dupes.length === 1 ? "" : "s"}` : "Clear the duplicated 14-day form"),
+                confirmed && React.createElement("button", { className: "ing-ghost", onClick: () => setConfirmed(false) }, "Cancel")),
+            unstamped > 0 && React.createElement("p", { className: "fresh-audit-note" }, `${unstamped} input${unstamped === 1 ? " has" : "s have"} no date on file \u2014 loaded before freshness tracking existed. Their age is unknown, not necessarily stale; the next import stamps them.`),
             React.createElement("p", { className: "fresh-audit-note" }, "Stale means past that input's shelf life, not wrong. A 14-day form number from three weeks ago is describing a window that has already closed \u2014 the engine will still use it, silently, which is the failure mode worth watching for.")));
 }
 function Database({ teams, saveTeams, loaded }) {
@@ -2895,7 +2942,10 @@ function Database({ teams, saveTeams, loaded }) {
         .map((g) => ({ g, items: teams.map((t, i) => ({ t, i })).filter(({ t }) => leagueOf(t.name) === g) }))
         .filter(({ items }) => items.length > 0);
     return (React.createElement("main", { className: "ing-db" },
-        teams.length > 0 && React.createElement(FreshnessAudit, { teams: teams }),
+        teams.length > 0 && React.createElement(FreshnessAudit, { teams: teams, onRepair: (names) => {
+            const hit = new Set(names);
+            saveTeams(teams.map((t) => hit.has(t.name) ? { ...t, recent: "", recentPA: "", recentBbk: "", recentAsOf: undefined } : t));
+        } }),
         editIndex >= 0 && (React.createElement("section", { className: "ing-db-editor" },
             React.createElement("h2", null,
                 "Edit team \u2014 ",
@@ -2963,8 +3013,9 @@ function Database({ teams, saveTeams, loaded }) {
                                 const held = DATA_CLASSES.filter((c) => teamHasClass(t, c.key));
                                 if (!held.length)
                                     return null;
-                                const worst = held.map((c) => ageMeta(t[c.key], c)).reduce((w, a) => (["never", "stale", "aging", "fresh"].indexOf(a.tone) < ["never", "stale", "aging", "fresh"].indexOf(w.tone) ? a : w));
-                                return React.createElement("span", { className: "ing-dir-age " + worst.tone, title: "Oldest input on this team" }, worst.days == null ? "?" : worst.days === 0 ? "today" : worst.days + "d");
+                                const RANK = ["stale", "unknown", "aging", "fresh"];
+                                const worst = held.map((c) => ageMeta(t[c.key], c)).reduce((w, a) => (RANK.indexOf(a.tone) < RANK.indexOf(w.tone) ? a : w));
+                                return React.createElement("span", { className: "ing-dir-age " + worst.tone, title: worst.days == null ? "Some inputs on this team have no timestamp \u2014 loaded before freshness tracking existed" : "Oldest input on this team" }, worst.days == null ? "no date" : worst.days === 0 ? "today" : worst.days + "d");
                             })()),
                         React.createElement("div", { className: "ing-dir-btns" },
                             React.createElement("button", { onClick: () => { setEditing({ ...EMPTY_TEAM, ...t }); setEditIndex(i); }, "aria-label": `Edit ${t.name}` }, "\u270E"),
@@ -5183,7 +5234,9 @@ function applyStatRows(rows, teams, mode = "season", rosterMap = null) {
         }
         return {
             ...t, players, rotation, off: off ?? t.off, pa: off != null ? String(pa) : t.pa,
-            recentBbk: bbkPA ? (bbkW / bbkPA).toFixed(1) : t.recentBbk,
+            // recentBbk is deliberately NOT written here. It is a 14-day field, and
+            // filling it from a season export is what made recent form a copy of
+            // season talent. Season mode touches season fields only.
             pen: penB ? (penW / penB).toFixed(3) : t.pen, penBf: penB ? String(Math.round(penB)) : t.penBf,
             penBarrel: cqB ? (barrelW / cqB).toFixed(1) : t.penBarrel,
             penHardHit: cqB ? (hardHitW / cqB).toFixed(1) : t.penHardHit,
@@ -5854,6 +5907,16 @@ function SmartImport({ teams, saveTeams, onGameLine, statsFocus }) {
     const [staged, setStaged] = useState(null); // { file, name, isImage, url }
     const [inputKey, setInputKey] = useState(0); // remount the file input to truly clear it
     const applyRows = async (rows, label) => {
+        // Refuse a load whose PA distribution contradicts the selected timeframe.
+        // Writing a season export into the 14-day window is silently destructive:
+        // the numbers look plausible, the stamp reads fresh, and the form signal
+        // is gone. Better to stop and say so than to import and be wrong.
+        const tf = detectTimeframe(rows);
+        if (tf.verdict !== "unknown" && tf.verdict !== "ambiguous" && tf.verdict !== timeframe) {
+            setMsg(`Stopped \u2014 nothing was written. You selected ${timeframe === "recent" ? "\u201CRecent form\u201D" : "\u201CFull roster / season\u201D"}, but this file looks like ${tf.verdict === "season" ? "a full season" : "a short recent window"}: ${tf.why}. ${tf.verdict === "season" ? "Loading it as recent form would overwrite your 14-day window with season talent and stamp it as fresh. On Savant, set the date range to the last 14 days and re-export \u2014 PA should read 40-60, not 400-500." : "Loading a short window as season stats would replace full-season talent with a small sample."} Switch the timeframe toggle to ${tf.verdict === "season" ? "\u201CFull roster\u201D" : "\u201CRecent form\u201D"} if that is really what you want.`);
+            logInterp("timeframe-guard", false, `${timeframe} selected, looks ${tf.verdict} (med ${tf.med} PA)`);
+            return;
+        }
         const hadTeamCol = rows.some((r) => r.team);
         const { next, hitters, pitchers, teamsTouched, seeded, unroutable } = applyStatRows(rows, teams, timeframe, rosterMap);
         await saveTeams(next);
@@ -5880,15 +5943,21 @@ function SmartImport({ teams, saveTeams, onGameLine, statsFocus }) {
                 return `${label}: parsed ${rows.length} players, but their team labels didn't match any of the 30 MLB clubs (${unroutable} unresolved). If the file uses an unusual team code, tell me the format and I'll map it.`;
             return `${label}: parsed ${rows.length} players but none matched — check name spellings against the Database tab.`;
         };
+        // Ambiguous PA distributions are let through rather than blocked \u2014 an
+        // early-season export genuinely sits between the two \u2014 but the caller is
+        // told what the numbers looked like so the call stays theirs.
+        const tfNote = tf.verdict === "ambiguous"
+            ? ` Heads up: ${tf.why}, so this could be either. Loaded as ${timeframe === "recent" ? "recent form" : "season stats"} because that is what the toggle said \u2014 check the values if that was not the intent.`
+            : "";
         if (timeframe === "recent") {
-            setMsg(hitters || touched.length
+            setMsg((hitters || touched.length
                 ? `${label}: read as LAST-14-DAY form — ${hitters} hitters recognized across ${touched.length} team${touched.length === 1 ? "" : "s"}${touched.length ? `: ${teamList}` : ""}.${seededNote} Season numbers untouched.`
-                : diagnose());
+                : diagnose()) + tfNote);
         }
         else {
-            setMsg(touched.length || seeded
+            setMsg((touched.length || seeded
                 ? `${label}: ${hitters} hitters and ${pitchers} pitchers recognized across ${touched.length} team${touched.length === 1 ? "" : "s"}${touched.length ? `: ${teamList}` : ""}.${seededNote} Team wOBA, bullpens, and freshness stamps updated.`
-                : diagnose());
+                : diagnose()) + tfNote);
         }
     };
     const stageFile = async (file) => {
@@ -5905,9 +5974,13 @@ function SmartImport({ teams, saveTeams, onGameLine, statsFocus }) {
         }
         setStaged({ file, name: file.name, isImage, url });
     };
-    const removeStaged = () => {
+    // silent=true is the post-import cleanup: it clears the staged file WITHOUT
+    // touching the message. This used to overwrite every import result with
+    // "nothing was imported", so a successful load reported failure every time.
+    const removeStaged = (silent) => {
         setStaged(null);
-        setMsg("File removed — nothing was imported.");
+        if (!silent)
+            setMsg("File removed — nothing was imported.");
         setInputKey((k) => k + 1);
     };
     const importStaged = async () => {
@@ -5982,7 +6055,7 @@ If none of these: {"kind":"unknown"}` },
                     }
                 }
             }
-            removeStaged();
+            removeStaged(true); // keep the result message that was just set
         }
         catch (e) {
             setMsg(`Import failed: ${e.message}. CSV paste always works as a fallback.`);
@@ -8893,7 +8966,7 @@ const CSS = `
 .ing-dir-league { font-family: 'Archivo'; font-size: 10.5px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--phos); margin-bottom: 8px; }
 .ing-dir-row { position: relative; background: var(--field2); border: 1px solid var(--line); border-radius: 10px; margin-bottom: 7px; transition: border-color 0.15s; }
 .ing-dir-row:hover, .ing-dir-row.open { border-color: var(--phos-dim); }
-.ing-dir-main { display: grid; grid-template-columns: minmax(110px, auto) 1fr minmax(70px, 130px) 38px; gap: 12px; align-items: center; width: 100%; background: transparent; border: none; color: var(--ink); font-family: inherit; text-align: left; padding: 12px 78px 12px 15px; cursor: pointer; }
+.ing-dir-main { display: grid; grid-template-columns: minmax(110px, auto) 1fr minmax(70px, 130px) 38px auto; gap: 12px; align-items: center; width: 100%; background: transparent; border: none; color: var(--ink); font-family: inherit; text-align: left; padding: 12px 78px 12px 15px; cursor: pointer; }
 @media (max-width: 640px) { .ing-dir-main { grid-template-columns: 1fr 60px 34px; } .ing-dir-meta { display: none; } }
 .ing-dir-name { font-weight: 600; font-size: 14.5px; }
 .ing-dir-meta { font-size: 11px; color: var(--ink-dim); }
@@ -9436,6 +9509,17 @@ const CSS = `
 .fresh-audit-tally .stale { color: var(--rust); border-color: rgba(232,115,79,0.35); }
 .fresh-audit-age { font-family: 'Archivo'; font-size: 9.5px; color: var(--ink-dim); min-width: 62px; text-align: right; flex-shrink: 0; }
 .fresh-audit-note { margin: 10px 0 0; font-size: 11px; color: var(--ink-dim); line-height: 1.55; }
+.stamp.unknown { border-left-color: var(--ink-dim); }
+.stamp.unknown b { color: var(--ink-dim); }
+.ing-dir-age.unknown { color: var(--ink-dim); border-color: var(--line); }
+.ing-dir-age.stale { color: var(--rust); border-color: rgba(232,115,79,0.4); }
+.fresh-audit-tally .unknown { color: var(--ink-dim); border-color: var(--line); }
+.fresh-dupe { margin: 10px 0 0; font-size: 11.5px; line-height: 1.55; color: var(--ink); background: rgba(232,115,79,0.07); border-left: 2px solid var(--rust); padding: 9px 11px; border-radius: 6px; }
+.fresh-dupe b { color: var(--rust); }
+.fresh-repair { margin-top: 12px; padding: 12px; border: 1px solid rgba(232,115,79,0.35); border-radius: 8px; background: rgba(232,115,79,0.06); }
+.fresh-repair p { margin: 0 0 10px; font-size: 11.5px; line-height: 1.55; color: var(--ink); }
+.fresh-repair b { color: var(--rust); }
+.fresh-repair button { margin-right: 8px; }
 @media (max-width: 560px) {
   .fresh-audit-row { flex-wrap: wrap; gap: 6px; }
   .fresh-audit-tally { justify-content: flex-start; width: 100%; }
