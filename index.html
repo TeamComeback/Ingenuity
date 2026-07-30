@@ -313,6 +313,62 @@ function daysOld(iso) {
     const d = Math.floor((Date.now() - new Date(iso + "T12:00:00Z").getTime()) / 86400000);
     return d < 0 ? 0 : d;
 }
+// ---- Data freshness ---------------------------------------------------------
+// Every class of imported data rots at a different rate. A 14-day form window is
+// meaningless a week later; season wOBA barely moves in that time. These
+// thresholds are the honest shelf life of each input, not a uniform rule.
+const DATA_CLASSES = [
+    { key: "statsAsOf", label: "Season stats", fresh: 7, stale: 21, note: "Team wOBA, rotation and bullpen rates" },
+    { key: "recentAsOf", label: "14-day form", fresh: 2, stale: 7, note: "A rolling window \u2014 goes stale by definition" },
+    { key: "splitsAsOf", label: "Platoon splits", fresh: 14, stale: 30, note: "wOBA vs LHP and vs RHP" },
+    { key: "teamStatsAsOf", label: "Defense & framing", fresh: 14, stale: 30, note: "OAA, catcher framing, pen contact quality" },
+    { key: "lineupAsOf", label: "Lineup", fresh: 0, stale: 2, note: "Changes daily \u2014 anything older is last night's card" },
+    { key: "penFatigueAsOf", label: "Bullpen fatigue", fresh: 0, stale: 1, note: "Must be same-day or it means nothing" },
+];
+// "Jul 27" from a YYYY-MM-DD stamp, without dragging the browser timezone in.
+function fmtStamp(iso) {
+    if (!iso)
+        return null;
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(iso));
+    if (!m)
+        return String(iso);
+    return new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], 12)).toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "UTC" });
+}
+// Age of a stamp against that data class's shelf life.
+function ageMeta(stamp, cls) {
+    const d = daysOld(stamp);
+    if (d == null)
+        return { days: null, tone: "never", text: "never loaded", date: null };
+    const date = fmtStamp(stamp);
+    const rel = d === 0 ? "today" : d === 1 ? "yesterday" : `${d}d ago`;
+    const tone = d <= cls.fresh ? "fresh" : d <= cls.stale ? "aging" : "stale";
+    return { days: d, tone, text: rel, date };
+}
+// Which classes a team actually carries data for. A team with no splits loaded
+// shouldn't be scored as having stale splits — absent and rotten are different
+// problems and get counted separately.
+function teamHasClass(t, key) {
+    if (key === "statsAsOf")
+        return !!(t.off || (t.players || []).some((p) => p.woba) || (t.rotation || []).some((p) => p.xwoba));
+    if (key === "recentAsOf")
+        return !!(t.recent || t.recentBbk);
+    if (key === "splitsAsOf")
+        return !!(t.offVsL || t.offVsR);
+    if (key === "teamStatsAsOf")
+        return !!(t.oaa || t.framing || t.penBarrel || t.penHardHit);
+    if (key === "lineupAsOf")
+        return !!(t.lineup && t.lineup.length);
+    if (key === "penFatigueAsOf")
+        return !!t.penFatigue;
+    return false;
+}
+// One inline "loaded 3d ago \u00B7 Jul 27" chip.
+function Stamp({ cls, value, compact }) {
+    const a = ageMeta(value, cls);
+    return React.createElement("span", { className: "stamp " + a.tone, title: a.date ? `${cls.label} loaded ${a.date}. ${cls.note}.` : `${cls.label} has never been loaded. ${cls.note}.` },
+        React.createElement("em", null, cls.label),
+        React.createElement("b", null, a.date ? (compact ? a.text : `${a.text} \u00B7 ${a.date}`) : "never loaded"));
+}
 // Stadium coordinates + roof + approximate home-plate→center-field bearing
 // (degrees true). Bearings are approximations good to ~±20°; with the engine's
 // weather boost capped at ±6%, that error is bounded and acceptable. Roofed
@@ -1322,8 +1378,13 @@ function dedupeTeams(teams) {
         const out = { ...a };
         for (const f of ["off", "xoff", "pa", "recent", "recentPA", "recentBbk", "offVsL", "paVsL", "offVsR", "paVsR",
             "pen", "penBf", "penBarrel", "penHardHit", "oaa", "framing", "penFatigue", "penFatigueAsOf",
-            "penFatigueDetail", "lineup", "lineupAsOf", "splitsAsOf"])
+            "penFatigueDetail", "lineup"])
             out[f] = pick(f);
+        // Timestamps are not "keep whichever exists" — a merge that pairs newer
+        // data with an older stamp would report the result as fresher or staler
+        // than it is. Always carry the later of the two.
+        for (const f of ["statsAsOf", "recentAsOf", "splitsAsOf", "teamStatsAsOf", "lineupAsOf", "penFatigueAsOf"])
+            out[f] = [a[f], t[f]].filter(Boolean).sort().pop();
         out.players = mergeList(a.players, t.players);
         out.rotation = mergeList(a.rotation, t.rotation);
         out.penArms = (a.penArms && a.penArms.length) ? a.penArms : (t.penArms || []);
@@ -2739,6 +2800,56 @@ function Terminal({ onHome, pendingGame, onPendingConsumed }) {
 // ---------------------------------------------------------------------------
 // DATABASE — teams + lineups/rosters
 // ---------------------------------------------------------------------------
+// Freshness strip: what this team carries and when each piece was last loaded.
+function TeamFreshness({ t }) {
+    const held = DATA_CLASSES.filter((c) => teamHasClass(t, c.key));
+    const absent = DATA_CLASSES.filter((c) => !teamHasClass(t, c.key));
+    if (!held.length && !absent.length)
+        return null;
+    return React.createElement("div", { className: "fresh-strip" },
+        React.createElement("div", { className: "fresh-head" }, "Last loaded"),
+        React.createElement("div", { className: "fresh-chips" }, held.map((c) => React.createElement(Stamp, { key: c.key, cls: c, value: t[c.key] }))),
+        !held.length && React.createElement("p", { className: "fresh-none" }, "No stats loaded for this team yet."),
+        absent.length > 0 && React.createElement("p", { className: "fresh-absent" },
+            "Not loaded: ",
+            absent.map((c) => c.label).join(", "),
+            ". Blank inputs fall back to league average rather than breaking \u2014 that is why they are easy to miss."));
+}
+// Roll-up across every team, so stale data is something you audit rather than
+// something you discover in a projection.
+function FreshnessAudit({ teams }) {
+    const [open, setOpen] = useState(false);
+    const rows = DATA_CLASSES.map((c) => {
+        const hold = teams.filter((t) => teamHasClass(t, c.key));
+        const tally = { fresh: 0, aging: 0, stale: 0, never: 0 };
+        let oldest = null;
+        for (const t of hold) {
+            const a = ageMeta(t[c.key], c);
+            tally[a.tone]++;
+            if (a.days != null && (oldest == null || a.days > oldest))
+                oldest = a.days;
+        }
+        return { c, held: hold.length, missing: teams.length - hold.length, tally, oldest };
+    });
+    const rotten = rows.reduce((n, r) => n + r.tally.stale + r.tally.never, 0);
+    return React.createElement("section", { className: "fresh-audit" },
+        React.createElement("button", { className: "fresh-audit-toggle", onClick: () => setOpen(!open) },
+            React.createElement("span", null, "Data freshness \u00B7 " + teams.length + " teams"),
+            React.createElement("span", { className: "fresh-audit-flag " + (rotten ? "bad" : "good") }, rotten ? `${rotten} stale` : "all current")),
+        open && React.createElement("div", { className: "fresh-audit-body" },
+            rows.map((r) => React.createElement("div", { key: r.c.key, className: "fresh-audit-row" },
+                React.createElement("div", { className: "fresh-audit-lbl" },
+                    React.createElement("b", null, r.c.label),
+                    React.createElement("em", null, r.c.note)),
+                React.createElement("div", { className: "fresh-audit-tally" },
+                    r.tally.fresh > 0 && React.createElement("span", { className: "fresh" }, r.tally.fresh + " fresh"),
+                    r.tally.aging > 0 && React.createElement("span", { className: "aging" }, r.tally.aging + " aging"),
+                    r.tally.stale > 0 && React.createElement("span", { className: "stale" }, r.tally.stale + " stale"),
+                    r.missing > 0 && React.createElement("span", { className: "never" }, r.missing + " not loaded"),
+                    r.held === 0 && r.missing === 0 && React.createElement("span", { className: "never" }, "\u2014")),
+                r.oldest != null && React.createElement("div", { className: "fresh-audit-age" }, "oldest " + r.oldest + "d"))),
+            React.createElement("p", { className: "fresh-audit-note" }, "Stale means past that input's shelf life, not wrong. A 14-day form number from three weeks ago is describing a window that has already closed \u2014 the engine will still use it, silently, which is the failure mode worth watching for.")));
+}
 function Database({ teams, saveTeams, loaded }) {
     const [editing, setEditing] = useState({ ...EMPTY_TEAM });
     const [editIndex, setEditIndex] = useState(-1);
@@ -2784,6 +2895,7 @@ function Database({ teams, saveTeams, loaded }) {
         .map((g) => ({ g, items: teams.map((t, i) => ({ t, i })).filter(({ t }) => leagueOf(t.name) === g) }))
         .filter(({ items }) => items.length > 0);
     return (React.createElement("main", { className: "ing-db" },
+        teams.length > 0 && React.createElement(FreshnessAudit, { teams: teams }),
         editIndex >= 0 && (React.createElement("section", { className: "ing-db-editor" },
             React.createElement("h2", null,
                 "Edit team \u2014 ",
@@ -2846,7 +2958,14 @@ function Database({ teams, saveTeams, loaded }) {
                                 React.createElement("span", { className: "ing-dir-fill", style: { width: `${pct}%` } })),
                             React.createElement("span", { className: "ing-dir-pct" },
                                 pct,
-                                "%")),
+                                "%"),
+                            (() => {
+                                const held = DATA_CLASSES.filter((c) => teamHasClass(t, c.key));
+                                if (!held.length)
+                                    return null;
+                                const worst = held.map((c) => ageMeta(t[c.key], c)).reduce((w, a) => (["never", "stale", "aging", "fresh"].indexOf(a.tone) < ["never", "stale", "aging", "fresh"].indexOf(w.tone) ? a : w));
+                                return React.createElement("span", { className: "ing-dir-age " + worst.tone, title: "Oldest input on this team" }, worst.days == null ? "?" : worst.days === 0 ? "today" : worst.days + "d");
+                            })()),
                         React.createElement("div", { className: "ing-dir-btns" },
                             React.createElement("button", { onClick: () => { setEditing({ ...EMPTY_TEAM, ...t }); setEditIndex(i); }, "aria-label": `Edit ${t.name}` }, "\u270E"),
                             React.createElement("button", { onClick: () => { const n = teams.filter((_, j) => j !== i); saveTeams(n); if (open)
@@ -2859,6 +2978,7 @@ function Database({ teams, saveTeams, loaded }) {
                             const lineup = (t.players || []).slice(0, 9);
                             const bench = (t.players || []).slice(9);
                             return (React.createElement("div", { className: "ing-dir-detail" },
+                                React.createElement(TeamFreshness, { t: t }),
                                 React.createElement("div", { className: "ing-dir-teamstats" },
                                     React.createElement("span", null,
                                         React.createElement("em", null, "Team wOBA"),
@@ -6208,6 +6328,7 @@ function applyTeamStats(rows, teams) {
             t[f] = f === "off" || f === "xoff" || f === "pen" ? v.toFixed(3) : String(v);
             fieldsSet++;
         }
+        t.teamStatsAsOf = etDayKey(); // was unstamped — no way to tell fresh OAA from March's
         applied++;
     }
     return { next, applied, fieldsSet, unmatched: [...new Set(unmatched)] };
@@ -9280,6 +9401,46 @@ const CSS = `
 .grade-stats strong { font-family: 'Archivo'; font-weight: 700; font-size: 17px; }
 .grade-stats strong.neg { color: var(--rust); }
 .grade-note { font-size: 12px; color: var(--ink-dim); line-height: 1.55; }
+.stamp { display: inline-flex; flex-direction: column; gap: 2px; background: var(--field); border: 1px solid var(--line); border-left-width: 2px; border-radius: 6px; padding: 6px 9px; }
+.stamp em { font-style: normal; font-size: 8.5px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-dim); font-family: 'Archivo'; }
+.stamp b { font-size: 11.5px; font-weight: 600; color: var(--ink); }
+.stamp.fresh { border-left-color: var(--phos); }
+.stamp.aging { border-left-color: var(--amber); }
+.stamp.stale { border-left-color: var(--rust); }
+.stamp.stale b { color: var(--rust); }
+.stamp.never { border-left-color: var(--line); }
+.stamp.never b { color: var(--ink-dim); }
+.fresh-strip { margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px solid var(--line); }
+.fresh-head { font-family: 'Archivo'; font-size: 9px; letter-spacing: 0.13em; text-transform: uppercase; color: var(--ink-dim); margin-bottom: 7px; }
+.fresh-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.fresh-none, .fresh-absent { margin: 8px 0 0; font-size: 11px; color: var(--ink-dim); line-height: 1.5; }
+.ing-dir-age { font-family: 'Archivo'; font-size: 9.5px; letter-spacing: 0.05em; padding: 2px 6px; border-radius: 4px; border: 1px solid var(--line); color: var(--ink-dim); flex-shrink: 0; }
+.ing-dir-age.fresh { color: var(--phos); border-color: rgba(52,230,168,0.35); }
+.ing-dir-age.aging { color: var(--amber); border-color: rgba(245,196,81,0.35); }
+.ing-dir-age.stale, .ing-dir-age.never { color: var(--rust); border-color: rgba(232,115,79,0.4); }
+.fresh-audit { margin-bottom: 16px; }
+.fresh-audit-toggle { width: 100%; display: flex; justify-content: space-between; align-items: center; gap: 10px; background: var(--field2); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; cursor: pointer; font-family: 'Archivo'; font-size: 10.5px; letter-spacing: 0.11em; text-transform: uppercase; color: var(--ink-dim); }
+.fresh-audit-flag { font-size: 10px; padding: 3px 8px; border-radius: 5px; }
+.fresh-audit-flag.good { color: var(--phos); background: rgba(52,230,168,0.1); }
+.fresh-audit-flag.bad { color: var(--rust); background: rgba(232,115,79,0.1); }
+.fresh-audit-body { border: 1px solid var(--line); border-top: none; border-radius: 0 0 10px 10px; padding: 12px 14px; background: var(--field); }
+.fresh-audit-row { display: flex; align-items: center; gap: 12px; padding: 9px 0; border-bottom: 1px solid var(--line); }
+.fresh-audit-row:last-of-type { border-bottom: none; }
+.fresh-audit-lbl { flex: 1; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.fresh-audit-lbl b { font-size: 12px; font-weight: 600; color: var(--ink); }
+.fresh-audit-lbl em { font-style: normal; font-size: 10.5px; color: var(--ink-dim); line-height: 1.4; }
+.fresh-audit-tally { display: flex; flex-wrap: wrap; gap: 5px; justify-content: flex-end; }
+.fresh-audit-tally span { font-family: 'Archivo'; font-size: 9.5px; letter-spacing: 0.05em; padding: 3px 7px; border-radius: 4px; border: 1px solid var(--line); color: var(--ink-dim); white-space: nowrap; }
+.fresh-audit-tally .fresh { color: var(--phos); border-color: rgba(52,230,168,0.3); }
+.fresh-audit-tally .aging { color: var(--amber); border-color: rgba(245,196,81,0.3); }
+.fresh-audit-tally .stale { color: var(--rust); border-color: rgba(232,115,79,0.35); }
+.fresh-audit-age { font-family: 'Archivo'; font-size: 9.5px; color: var(--ink-dim); min-width: 62px; text-align: right; flex-shrink: 0; }
+.fresh-audit-note { margin: 10px 0 0; font-size: 11px; color: var(--ink-dim); line-height: 1.55; }
+@media (max-width: 560px) {
+  .fresh-audit-row { flex-wrap: wrap; gap: 6px; }
+  .fresh-audit-tally { justify-content: flex-start; width: 100%; }
+  .fresh-audit-age { min-width: 0; text-align: left; }
+}
 .cvg { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
 .cvg-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; margin-bottom: 7px; }
 .cvg-pct { font-family: 'Archivo'; font-weight: 700; font-size: 15px; color: var(--ink); }
