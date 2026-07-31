@@ -3005,6 +3005,17 @@ function FreshnessAudit({ teams, onRepair }) {
 }
 function Database({ teams, saveTeams, loaded }) {
     const [editing, setEditing] = useState({ ...EMPTY_TEAM });
+    const [posMap, setPosMap] = useState(null); // MLB primaryPosition, cached by the roster sync
+    const [fixNote, setFixNote] = useState("");
+    useEffect(() => {
+        let live = true;
+        (async () => {
+            const rm = await store.get("ingenuity:mlb:rosterMap", null);
+            if (live && rm && rm.pos)
+                setPosMap(rm.pos);
+        })();
+        return () => { live = false; };
+    }, []);
     const [editIndex, setEditIndex] = useState(-1);
     const [openRoster, setOpenRoster] = useState(-1);
     const commitTeam = () => {
@@ -7184,17 +7195,6 @@ function SlateHub({ onOpenInTerminal }) {
     const [lean, setLean] = useState(null);
     const [acc, setAcc] = useState(null);
     const [cov, setCov] = useState(null);
-    const [posMap, setPosMap] = useState(null); // MLB primaryPosition, cached by the roster sync
-    const [fixNote, setFixNote] = useState("");
-    useEffect(() => {
-        let live = true;
-        (async () => {
-            const rm = await store.get("ingenuity:mlb:rosterMap", null);
-            if (live && rm && rm.pos)
-                setPosMap(rm.pos);
-        })();
-        return () => { live = false; };
-    }, []);
     const [detailGame, setDetailGame] = useState(null);
     const [morning, setMorning] = useState(null); // one-tap refresh: per-step progress
     const [stepsOpen, setStepsOpen] = useState(false); // individual-step drawer
