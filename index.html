@@ -722,6 +722,8 @@ async function refreshMlbRosterMap() {
         const people = j.people || [];
         const map = {};
         const ids = {}; // MLB player_id -> team; survives accents and spelling variants
+        const pos = {}; // normName -> "P"; MLB's own primaryPosition, the only reliable pitcher flag
+        const posIds = {}; // player_id -> "P"
         const hands = {}; // v1.6: MLB's own pitchHand — fills platoon handedness with no manual entry
         for (const p of people) {
             const team = p.currentTeam?.name;
@@ -732,6 +734,14 @@ async function refreshMlbRosterMap() {
                 map[normName(p.fullName)] = resolved;
                 if (p.id != null)
                     ids[String(p.id)] = resolved; // exact routing for Savant exports
+            }
+            // NOTE: pitchHand is present for position players too (it is their
+            // throwing hand), so it is useless as a pitcher test. primaryPosition is not.
+            const pp = p.primaryPosition;
+            if (pp && (pp.abbreviation === "P" || pp.code === "1" || pp.type === "Pitcher")) {
+                pos[normName(p.fullName)] = "P";
+                if (p.id != null)
+                    posIds[String(p.id)] = "P";
             }
             const ph = p.pitchHand?.code;
             if (ph === "L" || ph === "R")
@@ -747,10 +757,10 @@ async function refreshMlbRosterMap() {
         // synced" could be shown even when the write silently failed (usually a
         // full browser storage quota) — leaving the actual matching pool empty
         // while the UI claimed it was populated. Verify the write, don't assume it.
-        const wrote = await store.set("ingenuity:mlb:rosterMap", { asOf: etDayKey(), map, ids, hands });
+        const wrote = await store.set("ingenuity:mlb:rosterMap", { asOf: etDayKey(), map, ids, pos, posIds, hands });
         if (!wrote)
             return { ok: false, n: 0, err: `fetched ${n} players but couldn't save them — ${store.lastError || "the browser refused the write"}` };
-        return { ok: true, n, hands: Object.keys(hands).length };
+        return { ok: true, n, hands: Object.keys(hands).length, pitchers: Object.keys(pos).length };
     }
     catch (e) {
         return { ok: false, n: 0, err: String(e && e.message ? e.message : e) };
@@ -2849,6 +2859,82 @@ function Terminal({ onHome, pendingGame, onPendingConsumed }) {
 // ---------------------------------------------------------------------------
 // DATABASE — teams + lineups/rosters
 // ---------------------------------------------------------------------------
+// Pitchers sitting in the hitters bucket. Two independent signals, neither of
+// which needs the file that put them there: MLB's own position, and the fact
+// that the same name already appears on some rotation in this database (a
+// pitcher listed in both buckets is self-evidently misfiled).
+function findMisfiledPitchers(teams, posMap) {
+    const known = new Set();
+    for (const t of teams)
+        for (const pl of (t.rotation || []))
+            if (pl && pl.name)
+                known.add(normName(pl.name));
+    const out = [];
+    for (const t of teams) {
+        for (const pl of (t.players || [])) {
+            if (!pl || !pl.name)
+                continue;
+            const k = normName(pl.name);
+            const byPos = posMap && posMap[k] === "P";
+            const byRoster = known.has(k);
+            if (byPos || byRoster)
+                out.push({ team: t.name, name: pl.name, why: byPos ? "position" : "rotation" });
+        }
+    }
+    return out;
+}
+// Move them across. A pitcher's wOBA figure is xwOBA ALLOWED, which is exactly
+// what a rotation entry stores, so the number carries over rather than being
+// thrown away. Anyone already on the rotation is just removed from the hitters.
+function repairMisfiledPitchers(teams, posMap) {
+    const hits = findMisfiledPitchers(teams, posMap);
+    if (!hits.length)
+        return { next: teams, moved: 0, merged: 0 };
+    const byTeam = new Map();
+    for (const h of hits)
+        byTeam.set(h.team, (byTeam.get(h.team) || new Set()).add(normName(h.name)));
+    let moved = 0, merged = 0;
+    const next = teams.map((t) => {
+        const drop = byTeam.get(t.name);
+        if (!drop)
+            return t;
+        const rot = [...(t.rotation || [])];
+        const onRot = new Set(rot.map((p) => normName(p.name)));
+        const players = [];
+        for (const pl of (t.players || [])) {
+            const k = normName(pl.name || "");
+            if (!drop.has(k)) {
+                players.push(pl);
+                continue;
+            }
+            if (onRot.has(k)) {
+                merged++; // already a pitcher here; just stop listing him as a hitter
+                continue;
+            }
+            rot.push({ name: pl.name, xwoba: pl.woba || "", bf: pl.pa || "", ip: "", era: "" });
+            onRot.add(k);
+            moved++;
+        }
+        return { ...t, players, rotation: rot };
+    });
+    return { next, moved, merged };
+}
+function MisfiledPitchers({ teams, posMap, onRepair }) {
+    const [armed, setArmed] = useState(false);
+    const hits = findMisfiledPitchers(teams, posMap);
+    if (!hits.length)
+        return null;
+    const byPos = hits.filter((h) => h.why === "position").length;
+    return React.createElement("section", { className: "fresh-repair misfiled" },
+        React.createElement("p", null,
+            React.createElement("b", null, `${hits.length} pitcher${hits.length === 1 ? " is" : "s are"} filed as hitters. `),
+            `Savant's pitcher export uses the same columns as its hitter export ` + "\u2014" + ` pa, woba, est_woba, no ERA ` + "\u2014" + ` so an import had no way to tell them apart from the file alone. Their wOBA figures are runs ALLOWED, and while they sit in the lineup pool the engine reads them as offence. ${byPos ? `${byPos} confirmed by MLB position` : ""}${byPos && byPos < hits.length ? ", " : ""}${hits.length - byPos ? `${hits.length - byPos} already on a rotation here` : ""}.`),
+        React.createElement("p", { className: "misfiled-list" }, hits.slice(0, 12).map((h) => `${h.name} (${h.team})`).join(" \u00B7 "), hits.length > 12 ? ` \u00B7 +${hits.length - 12} more` : ""),
+        !posMap && React.createElement("p", { className: "misfiled-note" }, "MLB positions aren't cached, so this is only catching names already on a rotation. Sync MLB rosters in the Database import box to catch the rest."),
+        React.createElement("button", { className: "ing-ghost", onClick: () => { if (!armed) { setArmed(true); return; } onRepair(); setArmed(false); } },
+            armed ? `Confirm ` + "\u2014" + ` move ${hits.length} to the pitching staff` : "Move them to the pitching staff"),
+        armed && React.createElement("button", { className: "ing-ghost", onClick: () => setArmed(false) }, "Cancel"));
+}
 // Freshness strip: what this team carries and when each piece was last loaded.
 function TeamFreshness({ t }) {
     const held = DATA_CLASSES.filter((c) => teamHasClass(t, c.key));
@@ -2962,6 +3048,12 @@ function Database({ teams, saveTeams, loaded }) {
         .map((g) => ({ g, items: teams.map((t, i) => ({ t, i })).filter(({ t }) => leagueOf(t.name) === g) }))
         .filter(({ items }) => items.length > 0);
     return (React.createElement("main", { className: "ing-db" },
+        teams.length > 0 && React.createElement(MisfiledPitchers, { teams: teams, posMap: posMap, onRepair: () => {
+            const { next, moved, merged } = repairMisfiledPitchers(teams, posMap);
+            saveTeams(next);
+            setFixNote(`Moved ${moved} pitcher${moved === 1 ? "" : "s"} to the pitching staff${merged ? `, and removed ${merged} duplicate${merged === 1 ? "" : "s"} already listed there` : ""}.`);
+        } }),
+        fixNote && React.createElement("p", { className: "fresh-audit-note fixnote" }, fixNote),
         teams.length > 0 && React.createElement(FreshnessAudit, { teams: teams, onRepair: (names) => {
             const hit = new Set(names);
             saveTeams(teams.map((t) => hit.has(t.name) ? { ...t, recent: "", recentPA: "", recentBbk: "", recentAsOf: undefined } : t));
@@ -5103,7 +5195,28 @@ function applyPitcherHands(hands, teams) {
     }
     return { next, applied, unmatched };
 }
-function applyStatRows(rows, teams, mode = "season", rosterMap = null) {
+// A pitcher's Savant expected_stats export is column-identical to a hitter's:
+// pa, woba, est_woba, no ERA anywhere. The numbers mean "allowed", not "produced".
+// Nothing in the file says which, so identity has to come from outside it:
+// MLB's own primaryPosition first, then any rotation this database already has
+// him on, and only then the ERA/xERA column heuristic.
+function makePitcherTest(pos, teams) {
+    const known = new Set();
+    for (const t of (teams || []))
+        for (const pl of (t.rotation || []))
+            if (pl && pl.name)
+                known.add(normName(pl.name));
+    return (r) => {
+        const k = normName(r.name || "");
+        if (pos && pos[k] === "P")
+            return true;
+        if (known.has(k))
+            return true;
+        return r.era != null || r.xera != null || (r.barrel != null && r.woba == null && r.xwoba == null);
+    };
+}
+function applyStatRows(rows, teams, mode = "season", rosterMap = null, posMap = null) {
+    const isPitcherRow = makePitcherTest(posMap, teams);
     // Auto-roster: figure out each player's team, then make sure he exists on
     // that team's roster before matching. This lets an import work even when
     // rosters are empty or thin. Two sources, in order: (1) the CSV's own team
@@ -5141,7 +5254,7 @@ function applyStatRows(rows, teams, mode = "season", rosterMap = null) {
                 unroutable++;
                 continue;
             } // team not in the 30-team DB (shouldn't happen, but safe)
-            const isPitcher = (r.era != null || r.xera != null || (r.barrel != null && r.woba == null && r.xwoba == null));
+            const isPitcher = isPitcherRow(r);
             const bucket = isPitcher ? "rotation" : "players";
             t[bucket] = t[bucket] || [];
             const exists = t[bucket].some((p) => normName(p.name) === normName(r.name));
@@ -5927,6 +6040,7 @@ function SmartImport({ teams, saveTeams, onGameLine, statsFocus }) {
     const [lastImport, setLastImport] = useState(null); // { teams:[{name, added, updated, players:[...]}] } — what the last import changed
     const [rosterMap, setRosterMap] = useState(null); // MLB name -> team, for CSVs with no team column
     const [rosterIds, setRosterIds] = useState(null); // MLB player_id -> team; exact where names are fragile
+    const [rosterPos, setRosterPos] = useState(null); // normName -> "P"; keeps pitchers out of the hitters bucket
     const [rosterSync, setRosterSync] = useState(""); // status line for the sync control
     useEffect(() => {
         if (!statsFocus)
@@ -5936,6 +6050,7 @@ function SmartImport({ teams, saveTeams, onGameLine, statsFocus }) {
             if (cached) {
                 setRosterMap(cached.map);
                 setRosterIds(cached.ids || null);
+                setRosterPos(cached.pos || null);
                 const age = Math.floor((Date.now() - new Date(cached.asOf + "T12:00:00Z").getTime()) / 86400000);
                 if (age > ROSTER_MAP_MAX_AGE_DAYS)
                     syncRosters(true); // stale — refresh quietly
@@ -5959,6 +6074,7 @@ function SmartImport({ teams, saveTeams, onGameLine, statsFocus }) {
             const count = cached?.map ? Object.keys(cached.map).length : 0;
             setRosterMap(cached?.map || null);
             setRosterIds(cached?.ids || null);
+            setRosterPos(cached?.pos || null);
             if (count > 0) {
                 setRosterSync(`MLB rosters synced just now — ${count} players. This lets stats CSVs with no team column still route correctly.`);
             }
@@ -6003,7 +6119,7 @@ function SmartImport({ teams, saveTeams, onGameLine, statsFocus }) {
             return;
         }
         const hadTeamCol = rows.some((r) => r.team);
-        const { next, hitters, pitchers, teamsTouched, seeded, unroutable } = applyStatRows(rows, teams, timeframe, rosterMap);
+        const { next, hitters, pitchers, teamsTouched, seeded, unroutable } = applyStatRows(rows, teams, timeframe, rosterMap, rosterPos);
         await saveTeams(next);
         setLastImport({ ts: new Date().toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" }), mode: timeframe, teams: teamsTouched || [], seeded: seeded || 0 });
         const touched = teamsTouched || [];
@@ -6662,7 +6778,7 @@ function PlatoonImport({ teams, saveTeams }) {
             return true;
         }
         const rm = await store.get("ingenuity:mlb:rosterMap", null);
-        const { next, hitters, pitchers, teamsTouched, seeded } = applyStatRows(parsed.rows, teams, tf.verdict, rm && rm.map);
+        const { next, hitters, pitchers, teamsTouched, seeded } = applyStatRows(parsed.rows, teams, tf.verdict, rm && rm.map, rm && rm.pos);
         if (!hitters && !pitchers && !seeded) {
             setMsg(`Parsed ${parsed.rows.length} player rows and read them as ${tf.verdict === "recent" ? "a recent window" : "season stats"} (${tf.why}), but none could be routed to a club. Tap "Sync MLB rosters" in the box above and try again.`);
             return true;
@@ -7068,6 +7184,17 @@ function SlateHub({ onOpenInTerminal }) {
     const [lean, setLean] = useState(null);
     const [acc, setAcc] = useState(null);
     const [cov, setCov] = useState(null);
+    const [posMap, setPosMap] = useState(null); // MLB primaryPosition, cached by the roster sync
+    const [fixNote, setFixNote] = useState("");
+    useEffect(() => {
+        let live = true;
+        (async () => {
+            const rm = await store.get("ingenuity:mlb:rosterMap", null);
+            if (live && rm && rm.pos)
+                setPosMap(rm.pos);
+        })();
+        return () => { live = false; };
+    }, []);
     const [detailGame, setDetailGame] = useState(null);
     const [morning, setMorning] = useState(null); // one-tap refresh: per-step progress
     const [stepsOpen, setStepsOpen] = useState(false); // individual-step drawer
@@ -9746,6 +9873,10 @@ const CSS = `
 .fresh-repair p { margin: 0 0 10px; font-size: 11.5px; line-height: 1.55; color: var(--ink); }
 .fresh-repair b { color: var(--rust); }
 .fresh-repair button { margin-right: 8px; }
+.fresh-repair.misfiled { margin-bottom: 14px; }
+.misfiled-list { font-size: 11px; color: var(--ink-dim); line-height: 1.5; margin: 0 0 10px; }
+.misfiled-note { font-size: 11px; color: var(--amber); margin: 0 0 10px; line-height: 1.5; }
+.fixnote { color: var(--phos); margin-bottom: 12px; }
 @media (max-width: 560px) {
   .fresh-audit-row { flex-wrap: wrap; gap: 6px; }
   .fresh-audit-tally { justify-content: flex-start; width: 100%; }
