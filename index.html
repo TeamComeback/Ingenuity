@@ -1857,36 +1857,27 @@ function App() {
             React.createElement("div", { className: "home-brand" },
                 React.createElement("span", { className: "ing-logo big" }, "\u25C6"),
                 React.createElement("h1", null, "INGENUITY"),
-                React.createElement("p", null, "MLB totals research suite \u00B7 projection engine v1.7 \u00B7 UI v1.9 \u00B7 honest bookkeeping")),
-            React.createElement("div", { className: "home-cards" },
+                React.createElement("p", null, "MLB run totals \u00B7 research, not tips")),
+            React.createElement("nav", { className: "home-cards", "aria-label": "Sections" },
                 React.createElement("button", { className: "home-card", onClick: () => setView("terminal") },
                     React.createElement("span", { className: "home-card-glyph" }, "\u03A3"),
-                    React.createElement("h2", null, "Projection Terminal"),
-                    React.createElement("p", null, "Run 20,000-game simulations, manage the team & lineup database, and pull real lineups from the MLB Stats API."),
-                    React.createElement("span", { className: "home-card-meta" },
-                        teamsCount,
-                        " team",
-                        teamsCount === 1 ? "" : "s",
-                        " in database")),
+                    React.createElement("h2", null, "Terminal"),
+                    React.createElement("span", { className: "home-card-meta" }, `${teamsCount} team${teamsCount === 1 ? "" : "s"}`)),
                 React.createElement("button", { className: "home-card", onClick: () => setView("ledger") },
                     React.createElement("span", { className: "home-card-glyph" }, "\u2261"),
-                    React.createElement("h2", null, "Research Ledger"),
-                    React.createElement("p", null, "The full game archive, the performance record, and manual entry for any bet \u2014 straight or parlay \u2014 with notes."),
-                    React.createElement("span", { className: "home-card-meta" }, netPreview != null ? `${netPreview < 0 ? "-" : "+"}$${Math.abs(netPreview)} net` : "…")),
+                    React.createElement("h2", null, "Ledger"),
+                    React.createElement("span", { className: "home-card-meta" + (netPreview != null && netPreview < 0 ? " down" : "") }, netPreview != null ? `${netPreview < 0 ? "\u2212" : "+"}$${Math.abs(netPreview)}` : "\u2026")),
                 React.createElement("button", { className: "home-card", onClick: () => setView("brain") },
                     React.createElement("span", { className: "home-card-glyph" }, "\u25CE"),
-                    React.createElement("h2", null, "Model Brain"),
-                    React.createElement("p", null, "Model health from the ledger, tunable engine parameters, and AI-assisted recalibration \u2014 every change human-approved and logged."),
-                    React.createElement("span", { className: "home-card-meta" },
-                        brainTweaks,
-                        " parameter",
-                        brainTweaks === 1 ? "" : "s",
-                        " tuned"))),
+                    React.createElement("h2", null, "Brain"),
+                    React.createElement("span", { className: "home-card-meta" }, `${brainTweaks} tuned`))),
             React.createElement(BetOfTheDay, null),
             React.createElement(SlateHub, { onOpenInTerminal: (g) => { setPendingGame(g); setView("terminal"); } }),
             React.createElement(Backup, null),
             React.createElement(Journal, null),
-            React.createElement("p", { className: "home-foot" }, "Research instrument. Projections and records are only as good as the data entered. Not betting advice."))),
+            React.createElement("p", { className: "home-foot" },
+                "Research instrument. Projections and records are only as good as the data entered. Not betting advice.",
+                React.createElement("span", { className: "home-ver" }, "Engine v1.7 \u00B7 UI v2.0")))),
         view === "terminal" && React.createElement(Terminal, { onHome: () => setView("home"), pendingGame: pendingGame, onPendingConsumed: () => setPendingGame(null) }),
         view === "ledger" && React.createElement(Ledger, { onHome: () => setView("home") }),
         view === "brain" && React.createElement(Brain, { onHome: () => setView("home") })));
@@ -7457,6 +7448,7 @@ function SlateHub({ onOpenInTerminal }) {
     const [lean, setLean] = useState(null);
     const [acc, setAcc] = useState(null);
     const [cov, setCov] = useState(null);
+    const [gradeOpen, setGradeOpen] = useState(false); // diagnostics are weekly reading; the board is the daily job
     const [detailGame, setDetailGame] = useState(null);
     const [morning, setMorning] = useState(null); // one-tap refresh: per-step progress
     const [stepsOpen, setStepsOpen] = useState(false); // individual-step drawer
@@ -8418,11 +8410,23 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
                 viewDate,
                 "."),
             " This board is frozen as it was: its odds, its pitchers, and what the model said at the time. Scanning here is for study only; it won't touch today's read or the Brain's record.")),
-        React.createElement("div", { className: "grade" },
-            React.createElement("div", { className: "grade-head" },
-                React.createElement("span", { className: "bc-title" }, "Model accuracy \u00B7 graded against real finals"),
+        React.createElement("div", { className: "grade" + (gradeOpen ? " open" : "") },
+            React.createElement("button", { className: "grade-strip", onClick: () => setGradeOpen(!gradeOpen), "aria-expanded": gradeOpen },
+                React.createElement("span", { className: "gs-label" }, "Model accuracy"),
+                acc && acc.n > 0
+                    ? React.createElement("span", { className: "gs-nums" },
+                        React.createElement("b", null, acc.n),
+                        React.createElement("i", null, "graded"),
+                        React.createElement("b", { className: biasSignal(acc.n, acc.bias, acc.mae).real ? "warn" : "" }, `${acc.bias > 0 ? "+" : ""}${acc.bias.toFixed(2)}`),
+                        React.createElement("i", null, "bias"),
+                        React.createElement("b", null, acc.mae.toFixed(2)),
+                        React.createElement("i", null, "typical miss"))
+                    : React.createElement("span", { className: "gs-nums" }, React.createElement("i", null, "nothing graded yet")),
+                React.createElement("span", { className: "gs-caret" }, gradeOpen ? "\u25B4" : "\u25BE")),
+            gradeOpen && React.createElement("div", { className: "grade-head" },
+                React.createElement("span", { className: "bc-title" }, "Graded against real finals"),
                 React.createElement("button", { className: "ing-ghost", onClick: () => gradeArchive(false), disabled: grading }, grading ? "Grading…" : "Grade past boards")),
-            acc && acc.n > 0 ? (React.createElement(React.Fragment, null,
+            gradeOpen && (acc && acc.n > 0 ? (React.createElement(React.Fragment, null,
                 React.createElement("div", { className: "grade-stats" },
                     React.createElement("div", null,
                         React.createElement("em", null, "Graded"),
@@ -8455,8 +8459,8 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
                         return `The model is running ${mag} runs ${dir} across ${acc.n} games, and that clears the ±${band} noise band — a real bias, not a sample artifact. Worth a calibration look. Check the Brain first: only games projected since your last parameter change should count.`;
                     return `Mean error is ${acc.bias > 0 ? "+" : ""}${acc.bias.toFixed(2)} runs across ${acc.n} games, inside the ±${band} noise band at this sample — it reads directional but is not distinguishable from chance. Confirming a bias this size takes about ${sig.needed} games. The typical miss is ${acc.mae.toFixed(2)} runs, which is the honest width of this model's uncertainty. Change nothing yet.`;
                 })()),
-                cov && cov.total > 0 && React.createElement(GradeCoveragePanel, { cov: cov }))) : (React.createElement("p", { className: "grade-note" }, "Nothing graded yet. Each scan freezes its projection onto that day's board; once the games finish, this settles up against the real final scores and tracks how wrong the model actually was. It needs boards on file first \u2014 from Thursday, that starts accumulating on its own.")),
-            gradeMsg && React.createElement("p", { className: "ing-hint" }, gradeMsg)),
+                cov && cov.total > 0 && React.createElement(GradeCoveragePanel, { cov: cov }))) : (React.createElement("p", { className: "grade-note" }, "Nothing graded yet. Each scan freezes its projection onto that day's board; once the games finish, this settles up against the real final scores and tracks how wrong the model actually was. It needs boards on file first \u2014 from Thursday, that starts accumulating on its own."))),
+            gradeOpen && gradeMsg && React.createElement("p", { className: "ing-hint" }, gradeMsg)),
         games.length > 0 && (rows || games.some((g) => g.proj)) && (React.createElement(BoardChart, { games: games, rows: rows, onOpen: (g) => (onOpenInTerminal ? onOpenInTerminal(g) : setDetailGame(g)) })),
         detailGame && (React.createElement(GameDetail, { g: detailGame, teams: teams, dateKey: viewDate, isToday: isToday, onClose: () => setDetailGame(null) })),
         games.length > 0 && (React.createElement("div", { className: "slate-chips" },
@@ -9510,28 +9514,42 @@ const CSS = `
 }
 
 /* ---------- home ---------- */
-.home { min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 40px 24px; text-align: center; }
-.home-brand { margin-bottom: 44px; animation: fadein 0.5s ease; }
+.home { min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: flex-start; padding: 40px 24px; text-align: center; }
+.home-brand { margin-bottom: 24px; animation: fadein 0.5s ease; }
 .ing-logo { font-size: 26px; color: var(--phos); filter: drop-shadow(0 0 8px var(--phos-dim)); animation: pulse 3s ease-in-out infinite; }
-.ing-logo.big { font-size: 44px; display: block; margin-bottom: 14px; }
+.ing-logo.big { font-size: 30px; display: block; margin-bottom: 8px; }
 @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.55; } }
-.home-brand h1 { font-family: 'Archivo'; font-weight: 700; font-size: 34px; letter-spacing: 0.22em; }
-.home-brand p { font-size: 11px; color: var(--ink-dim); letter-spacing: 0.13em; text-transform: uppercase; margin-top: 8px; }
-.home-cards { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 18px; max-width: 1080px; width: 100%; }
-@media (max-width: 980px) { .home-cards { grid-template-columns: 1fr 1fr; } }
-@media (max-width: 700px) { .home-cards { grid-template-columns: 1fr; } }
+.home-brand h1 { font-family: 'Archivo'; font-weight: 700; font-size: 26px; letter-spacing: 0.22em; }
+.home-brand p { font-size: 10px; color: var(--ink-dim); letter-spacing: 0.13em; text-transform: uppercase; margin-top: 6px; }
+/* Three destinations, equal weight, always one row — the tile is a signpost,
+   not a place to explain the section. Descriptions lived here and were read
+   once; the live figure is the part that stays worth glancing at. */
+.home-cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; max-width: 620px; width: 100%; margin-bottom: 22px; }
 .home-card {
-  background: var(--field2); border: 1px solid var(--line); border-radius: 16px; padding: 30px 26px;
-  color: var(--ink); text-align: left; cursor: pointer; font-family: inherit;
-  transition: border-color 0.18s, transform 0.18s, box-shadow 0.18s;
+  display: flex; flex-direction: column; align-items: center; gap: 5px;
+  background: var(--field2); border: 1px solid var(--line); border-radius: 12px; padding: 14px 10px;
+  color: var(--ink); text-align: center; cursor: pointer; font-family: inherit;
+  transition: border-color 0.18s, background 0.18s;
 }
-.home-card:hover { border-color: var(--phos); transform: translateY(-3px); box-shadow: 0 0 34px rgba(52,230,168,0.14); }
+.home-card:hover { border-color: var(--phos); background: rgba(52,230,168,0.06); }
 .home-card:focus-visible { outline: 2px solid var(--phos); outline-offset: 3px; }
-.home-card-glyph { font-family: 'Archivo'; font-size: 30px; color: var(--phos); display: block; margin-bottom: 14px; filter: drop-shadow(0 0 10px var(--phos-dim)); }
-.home-card h2 { font-family: 'Archivo'; font-size: 17px; letter-spacing: 0.1em; text-transform: uppercase; margin-bottom: 9px; }
-.home-card p { font-size: 13px; color: var(--ink-dim); line-height: 1.6; margin-bottom: 16px; }
-.home-card-meta { font-size: 10.5px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--cyan); font-family: 'Archivo'; }
-.home-foot { margin-top: 44px; font-size: 11px; color: var(--ink-dim); }
+.home-card-glyph { font-family: 'Archivo'; font-size: 19px; color: var(--phos); line-height: 1; }
+.home-card h2 { font-family: 'Archivo'; font-size: 11px; font-weight: 600; letter-spacing: 0.11em; text-transform: uppercase; margin: 0; }
+.home-card-meta { font-size: 10.5px; letter-spacing: 0.04em; color: var(--ink-dim); font-family: 'Archivo'; }
+.home-card-meta.down { color: var(--rust); }
+.home-foot { margin-top: 28px; font-size: 10.5px; color: var(--ink-dim); line-height: 1.6; max-width: 560px; }
+.home-ver { display: block; margin-top: 6px; font-family: 'Archivo'; font-size: 9.5px; letter-spacing: 0.1em; opacity: 0.6; }
+@media (max-width: 560px) {
+  .home { padding: 26px 14px; }
+  .home-brand { margin-bottom: 18px; }
+  .ing-logo.big { font-size: 26px; margin-bottom: 6px; }
+  .home-brand h1 { font-size: 21px; letter-spacing: 0.18em; }
+  .home-cards { gap: 8px; margin-bottom: 16px; }
+  .home-card { padding: 11px 6px; }
+  .home-card h2 { font-size: 10px; letter-spacing: 0.07em; }
+  .home-card-glyph { font-size: 17px; }
+  .home-card-meta { font-size: 9.5px; }
+}
 
 /* ---------- shared header ---------- */
 .ing-head { display: flex; justify-content: space-between; align-items: center; padding: 20px 26px; border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 10; background: rgba(7,20,14,0.85); backdrop-filter: blur(12px); flex-wrap: wrap; gap: 12px; }
@@ -10071,7 +10089,19 @@ const CSS = `
 .ing-platoon-auto strong { color: var(--phos); }
 .ing-platoon-auto .ing-run.small { display: block; margin-top: 11px; }
 .ing-platoon-msg { margin-top: 12px; font-size: 12.5px; color: var(--phos); line-height: 1.5; background: rgba(52,230,168,0.06); border-left: 2px solid var(--phos); padding: 9px 12px; border-radius: 6px; }
-.grade { background: var(--field2); border: 1px solid var(--line); border-radius: 12px; padding: 14px; margin-bottom: 14px; }
+.grade { background: var(--field2); border: 1px solid var(--line); border-radius: 12px; margin-bottom: 12px; }
+.grade.open { padding: 0 14px 14px; }
+/* Collapsed by default: this is a weekly diagnostic sitting above a daily board.
+   The strip still states the verdict, so collapsing hides detail, never the signal. */
+.grade-strip { display: flex; align-items: center; gap: 10px; width: 100%; padding: 11px 14px; background: none; border: none; cursor: pointer; font-family: inherit; text-align: left; color: var(--ink); }
+.grade-strip:focus-visible { outline: 2px solid var(--phos); outline-offset: -2px; border-radius: 12px; }
+.gs-label { font-family: 'Archivo'; font-size: 9.5px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-dim); white-space: nowrap; }
+.gs-nums { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 7px; flex: 1; }
+.gs-nums b { font-family: 'Archivo'; font-size: 12.5px; font-weight: 700; color: var(--ink); }
+.gs-nums b.warn { color: var(--amber); }
+.gs-nums i { font-style: normal; font-size: 9.5px; color: var(--ink-dim); margin-right: 3px; }
+.gs-caret { color: var(--ink-dim); font-size: 10px; }
+@media (max-width: 560px) { .gs-label { display: none; } .grade-strip { padding: 10px 12px; } }
 .grade-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
 .grade-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 9px; margin-bottom: 9px; }
 @media (max-width: 560px) { .grade-stats { grid-template-columns: 1fr 1fr; } }
@@ -10557,14 +10587,14 @@ const CSS = `
 .br-mem-grid strong { font-size: 13px; font-weight: 600; line-height: 1.45; }
 .slate { max-width: 1080px; width: 100%; margin-top: 22px; background: var(--field2); border: 1px solid var(--line); border-radius: 14px; padding: 20px 22px; text-align: left; }
 .slate-head { display: flex; flex-direction: column; gap: 3px; margin-bottom: 12px; }
-.slate-head h2 { font-family: 'Archivo'; font-size: 13px; letter-spacing: 0.11em; text-transform: uppercase; color: var(--cyan); }
+.slate-head h2 { font-family: 'Archivo'; font-size: 13px; letter-spacing: 0.11em; text-transform: uppercase; color: var(--ink); }
 .ing-run.ghosty.warn { color: var(--amber); }
 .ing-run.ghosty.warn:hover:not(:disabled) { border-color: var(--amber); box-shadow: 0 0 14px rgba(245,196,81,0.25); }
 .ing-run.ghosty { background: transparent; border: 1px solid var(--line); color: var(--cyan); box-shadow: none; }
 .ing-run.ghosty:hover:not(:disabled) { border-color: var(--cyan); box-shadow: 0 0 14px rgba(95,217,232,0.25); }
 .slate-controls { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
 .slate-input { width: 100%; background: var(--field); border: 1px solid var(--line); color: var(--ink); padding: 11px 13px; border-radius: 8px; font-family: 'Space Grotesk'; font-size: 13px; resize: vertical; margin-bottom: 8px; }
-.slate-input:focus { outline: none; border-color: var(--cyan); box-shadow: 0 0 0 3px rgba(95,217,232,0.12); }
+.slate-input:focus { outline: none; border-color: var(--phos); box-shadow: 0 0 0 3px rgba(52,230,168,0.12); }
 .slate-lean { display: flex; flex-direction: column; gap: 6px; padding: 14px 16px; border-radius: 10px; border-left: 3px solid var(--ink-dim); background: rgba(122,153,140,0.07); margin: 12px 0; }
 .slate-lean.hot { border-left-color: var(--amber); background: rgba(245,196,81,0.07); }
 .slate-lean strong { font-family: 'Archivo'; font-size: 14px; }
