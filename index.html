@@ -7068,6 +7068,90 @@ async function recordFinals(arch) {
         await store.set("ingenuity:results:log", rec);
     return added;
 }
+// ---- Results log verifier ---------------------------------------------------
+// The permanent log never expires by design, so a row written from a mis-parsed
+// board persists forever and quietly feeds the accuracy panel. This checks every
+// stored row against MLB's own schedule for that date. It reports; it never
+// deletes on its own, because a row that looks wrong to a matcher is not proof
+// the row is wrong.
+async function verifyResultsLog(log) {
+    const byDate = {};
+    for (const [key, r] of Object.entries(log || {})) {
+        if (!r || !r.date)
+            continue;
+        (byDate[r.date] = byDate[r.date] || []).push({ key, r });
+    }
+    const dates = Object.keys(byDate).sort();
+    const out = { total: 0, checked: 0, ok: 0, bad: [], unreachable: [], dates: dates.length };
+    for (const d of dates)
+        out.total += byDate[d].length;
+    for (const d of dates) {
+        let real = null;
+        try {
+            const res = await mlbFetch(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${d}`);
+            if (res.ok) {
+                const j = await res.json();
+                real = [];
+                for (const dt of (j.dates || []))
+                    for (const gm of (dt.games || [])) {
+                        const a = gm.teams?.away, h = gm.teams?.home;
+                        if (typeof a?.score !== "number" || typeof h?.score !== "number")
+                            continue;
+                        real.push({
+                            away: resolveTeamName(a.team?.name) || a.team?.name,
+                            home: resolveTeamName(h.team?.name) || h.team?.name,
+                            total: a.score + h.score, pk: gm.gamePk,
+                        });
+                    }
+            }
+        }
+        catch (e) { /* offline; recorded as unreachable below */ }
+        // A successful-but-empty schedule would otherwise mark every row on that
+        // date as fake and offer to delete them. An empty payload for a date the
+        // log has games on is far more likely an API hiccup than a whole invented
+        // slate, so it is reported as unverified rather than accused.
+        if (!real || !real.length) {
+            out.unreachable.push(d);
+            continue;
+        }
+        for (const { key, r } of byDate[d]) {
+            out.checked++;
+            const la = normName(resolveTeamName(r.away) || r.away || "");
+            const lh = normName(resolveTeamName(r.home) || r.home || "");
+            const hits = real.filter((x) => normName(x.away) === la && normName(x.home) === lh);
+            if (!hits.length) {
+                out.bad.push({ key, r, verdict: "no-match", totals: [] });
+                continue;
+            }
+            if (hits.some((x) => x.total === r.final)) {
+                out.ok++;
+                continue;
+            }
+            // A doubleheader gives two legitimate totals for the same matchup, so
+            // a single stored final can't be assigned to one of them with certainty.
+            out.bad.push({ key, r, verdict: hits.length > 1 ? "doubleheader" : "wrong-total", totals: hits.map((x) => x.total) });
+        }
+    }
+    return out;
+}
+// Only the unambiguous case is auto-fixable: one real game, one real total.
+function repairResultsLog(log, bad, mode) {
+    const next = { ...log };
+    let fixed = 0, removed = 0;
+    for (const b of bad) {
+        if (mode === "fix" && b.verdict === "wrong-total" && b.totals.length === 1) {
+            const final = b.totals[0], line = next[b.key].line;
+            next[b.key] = { ...next[b.key], final,
+                ou: line == null ? null : final > line ? "O" : final < line ? "U" : "P" };
+            fixed++;
+        }
+        else if (mode === "remove" && b.verdict === "no-match") {
+            delete next[b.key];
+            removed++;
+        }
+    }
+    return { next, fixed, removed };
+}
 // Per-team over/under streak from the permanent log. Returns the most recent
 // run of the SAME result and the last few games, newest first. This is a
 // research signal to SURFACE — not a model input. The "hot unders will keep
@@ -7428,6 +7512,75 @@ function GradeCoveragePanel({ cov }) {
             `${cov.reasons.no_sp_db} game${cov.reasons.no_sp_db === 1 ? "" : "s"} dropped for a missing starter. Those are disproportionately call-ups and spot starts \u2014 the high-variance arms. Grading only the games where your database was already complete flatters the model, and the bias you measure will not transfer to the games where your data is thinnest.`),
         cov.unrecorded > 0 && React.createElement("p", { className: "cvg-note" },
             `${cov.unrecorded} ungraded game${cov.unrecorded === 1 ? " has" : "s have"} no reason on file \u2014 those boards were scanned before reasons were tracked. Reasons record from this build forward; the count above is honest, the breakdown is only complete for new boards.`));
+}
+function ResultsLogAudit() {
+    const [res, setRes] = useState(null);
+    const [busy, setBusy] = useState(false);
+    const [msg, setMsg] = useState("");
+    const [armed, setArmed] = useState("");
+    const run = async () => {
+        setBusy(true);
+        setMsg("");
+        const log = await store.get("ingenuity:results:log", {});
+        const r = await verifyResultsLog(log);
+        setRes(r);
+        setBusy(false);
+        if (r.unreachable.length && !r.checked)
+            setMsg("Couldn't reach the MLB schedule for any stored date \u2014 nothing was checked and nothing changed.");
+    };
+    const apply = async (mode) => {
+        const log = await store.get("ingenuity:results:log", {});
+        const { next, fixed, removed } = repairResultsLog(log, res.bad, mode);
+        const wrote = await store.set("ingenuity:results:log", next);
+        if (!wrote) {
+            setMsg("The repair didn't save \u2014 nothing was changed. Try again.");
+            return;
+        }
+        setMsg(mode === "fix"
+            ? `Corrected ${fixed} total${fixed === 1 ? "" : "s"} from MLB's own scores. Re-grade to refresh the accuracy panel.`
+            : `Removed ${removed} row${removed === 1 ? "" : "s"} that matched no real game. Re-grade to refresh the accuracy panel.`);
+        setArmed("");
+        await run();
+    };
+    const fixable = res ? res.bad.filter((b) => b.verdict === "wrong-total" && b.totals.length === 1) : [];
+    const orphans = res ? res.bad.filter((b) => b.verdict === "no-match") : [];
+    const dh = res ? res.bad.filter((b) => b.verdict === "doubleheader") : [];
+    return React.createElement("div", { className: "rla" },
+        React.createElement("div", { className: "rla-head" },
+            React.createElement("span", { className: "bc-title" }, "Verify results log against MLB"),
+            React.createElement("button", { className: "ing-ghost", onClick: run, disabled: busy }, busy ? "Checking\u2026" : res ? "Re-check" : "Check")),
+        !res && React.createElement("p", { className: "grade-note" }, "Every graded row is stored with the team names its board carried, not MLB's. This re-checks each one against the real schedule for that date and reports what doesn't line up. Nothing is changed without your say-so."),
+        msg && React.createElement("p", { className: "ing-hint" }, msg),
+        res && React.createElement(React.Fragment, null,
+            React.createElement("p", { className: "rla-sum" },
+                React.createElement("b", null, `${res.ok} of ${res.checked}`),
+                ` stored rows match a real MLB game and total across ${res.dates} date${res.dates === 1 ? "" : "s"}.`,
+                res.unreachable.length ? ` ${res.unreachable.length} date${res.unreachable.length === 1 ? "" : "s"} couldn't be reached and were skipped.` : ""),
+            res.bad.length === 0
+                ? React.createElement("p", { className: "grade-note ok" }, "Nothing suspect. The accuracy numbers are reading real games.")
+                : React.createElement(React.Fragment, null,
+                    fixable.length > 0 && React.createElement("div", { className: "rla-group" },
+                        React.createElement("h5", null, `${fixable.length} row${fixable.length === 1 ? "" : "s"} with the wrong final`),
+                        React.createElement("p", { className: "grade-note" }, "The matchup is real, but the stored total isn't what that game finished. This is what the loose name matcher produces when it hands one game's score to more than one row."),
+                        React.createElement("div", { className: "rla-list" }, fixable.slice(0, 8).map((b) => React.createElement("div", { key: b.key, className: "rla-row" },
+                            React.createElement("span", null, `${b.r.date} ${b.r.away} @ ${b.r.home}`),
+                            React.createElement("i", null, `stored ${b.r.final} \u2192 actual ${b.totals[0]}`)))),
+                        fixable.length > 8 && React.createElement("p", { className: "grade-note" }, `+${fixable.length - 8} more`),
+                        React.createElement("button", { className: "ing-ghost", onClick: () => (armed === "fix" ? apply("fix") : setArmed("fix")) },
+                            armed === "fix" ? `Confirm \u2014 correct ${fixable.length} total${fixable.length === 1 ? "" : "s"}` : "Correct these from MLB's scores")),
+                    orphans.length > 0 && React.createElement("div", { className: "rla-group" },
+                        React.createElement("h5", null, `${orphans.length} row${orphans.length === 1 ? "" : "s"} matching no real game`),
+                        React.createElement("p", { className: "grade-note" }, "No game with this matchup was played on this date. Most likely a board built from a mis-read screenshot. These can't be corrected, only dropped \u2014 and dropping them changes your accuracy figures, so look before you confirm."),
+                        React.createElement("div", { className: "rla-list" }, orphans.slice(0, 8).map((b) => React.createElement("div", { key: b.key, className: "rla-row bad" },
+                            React.createElement("span", null, `${b.r.date} ${b.r.away} @ ${b.r.home}`),
+                            React.createElement("i", null, `stored ${b.r.final}, model ${b.r.model != null ? b.r.model.toFixed(1) : "\u2014"}`)))),
+                        orphans.length > 8 && React.createElement("p", { className: "grade-note" }, `+${orphans.length - 8} more`),
+                        React.createElement("button", { className: "ing-ghost", onClick: () => (armed === "remove" ? apply("remove") : setArmed("remove")) },
+                            armed === "remove" ? `Confirm \u2014 remove ${orphans.length} row${orphans.length === 1 ? "" : "s"}` : "Remove these rows")),
+                    dh.length > 0 && React.createElement("div", { className: "rla-group" },
+                        React.createElement("h5", null, `${dh.length} doubleheader row${dh.length === 1 ? "" : "s"}`),
+                        React.createElement("p", { className: "grade-note" }, `Two games with this matchup were played that day and the stored total matches neither. There is no way to tell which game the board meant, so these are left alone rather than guessed. ${dh.map((b) => `${b.r.date} ${b.r.away} @ ${b.r.home} (stored ${b.r.final}, real ${b.totals.join(" and ")})`).join(" \u00B7 ")}`))),
+            armed && React.createElement("button", { className: "ing-ghost", onClick: () => setArmed("") }, "Cancel")));
 }
 function SlateHub({ onOpenInTerminal }) {
     const hosted = typeof STANDALONE !== "undefined" && STANDALONE;
@@ -8460,6 +8613,7 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
                     return `Mean error is ${acc.bias > 0 ? "+" : ""}${acc.bias.toFixed(2)} runs across ${acc.n} games, inside the ±${band} noise band at this sample — it reads directional but is not distinguishable from chance. Confirming a bias this size takes about ${sig.needed} games. The typical miss is ${acc.mae.toFixed(2)} runs, which is the honest width of this model's uncertainty. Change nothing yet.`;
                 })()),
                 cov && cov.total > 0 && React.createElement(GradeCoveragePanel, { cov: cov }))) : (React.createElement("p", { className: "grade-note" }, "Nothing graded yet. Each scan freezes its projection onto that day's board; once the games finish, this settles up against the real final scores and tracks how wrong the model actually was. It needs boards on file first \u2014 from Thursday, that starts accumulating on its own."))),
+            gradeOpen && React.createElement(ResultsLogAudit, null),
             gradeOpen && gradeMsg && React.createElement("p", { className: "ing-hint" }, gradeMsg)),
         games.length > 0 && (rows || games.some((g) => g.proj)) && (React.createElement(BoardChart, { games: games, rows: rows, onOpen: (g) => (onOpenInTerminal ? onOpenInTerminal(g) : setDetailGame(g)) })),
         detailGame && (React.createElement(GameDetail, { g: detailGame, teams: teams, dateKey: viewDate, isToday: isToday, onClose: () => setDetailGame(null) })),
@@ -10110,6 +10264,18 @@ const CSS = `
 .grade-stats strong { font-family: 'Archivo'; font-weight: 700; font-size: 17px; }
 .grade-stats strong.neg { color: var(--rust); }
 .grade-note { font-size: 12px; color: var(--ink-dim); line-height: 1.55; }
+.grade-note.ok { color: var(--phos); }
+.rla { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
+.rla-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 8px; flex-wrap: wrap; }
+.rla-sum { font-size: 12px; color: var(--ink-dim); line-height: 1.55; margin: 8px 0; }
+.rla-sum b { color: var(--ink); font-family: 'Archivo'; }
+.rla-group { margin-top: 12px; padding: 11px; border: 1px solid var(--line); border-radius: 8px; background: var(--field); }
+.rla-group h5 { font-family: 'Archivo'; font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--amber); margin: 0 0 6px; }
+.rla-list { display: flex; flex-direction: column; gap: 4px; margin: 8px 0; }
+.rla-row { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 10px; font-size: 11.5px; color: var(--ink); padding: 5px 8px; background: var(--field2); border-radius: 5px; }
+.rla-row i { font-style: normal; color: var(--amber); font-family: 'Archivo'; font-size: 10.5px; }
+.rla-row.bad i { color: var(--rust); }
+.rla-group button { margin-top: 6px; }
 .stamp { display: inline-flex; flex-direction: column; gap: 2px; background: var(--field); border: 1px solid var(--line); border-left-width: 2px; border-radius: 6px; padding: 6px 9px; }
 .stamp em { font-style: normal; font-size: 8.5px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-dim); font-family: 'Archivo'; }
 .stamp b { font-size: 11.5px; font-weight: 600; color: var(--ink); }
