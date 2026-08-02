@@ -2791,7 +2791,8 @@ function Terminal({ onHome, pendingGame, onPendingConsumed }) {
                 React.createElement("button", { className: tab === "project" ? "on" : "", onClick: () => setTab("project") }, "Project"),
                 React.createElement("button", { className: tab === "database" ? "on" : "", onClick: () => setTab("database") }, "Database"),
                 React.createElement("button", { className: tab === "lineups" ? "on" : "", onClick: () => setTab("lineups") }, "Lineups"),
-                React.createElement("button", { className: tab === "bullpens" ? "on" : "", onClick: () => setTab("bullpens") }, "Bullpens"))),
+                React.createElement("button", { className: tab === "bullpens" ? "on" : "", onClick: () => setTab("bullpens") }, "Bullpens"),
+                React.createElement("button", { className: tab === "debrief" ? "on" : "", onClick: () => setTab("debrief") }, "Debrief"))),
         tab === "project" && (React.createElement("main", { className: "ing-main" },
             React.createElement("section", { className: "ing-inputs" },
                 React.createElement(SmartImport, { teams: teams, saveTeams: saveTeams, onGameLine: loadGameLine }),
@@ -2854,6 +2855,7 @@ function Terminal({ onHome, pendingGame, onPendingConsumed }) {
             React.createElement(Database, { teams: teams, saveTeams: saveTeams, loaded: loaded }))),
         tab === "lineups" && React.createElement(LineupFetcher, { teams: teams, saveTeams: saveTeams }),
         tab === "bullpens" && React.createElement(BullpenTab, { teams: teams }),
+        tab === "debrief" && React.createElement(DebriefTab, { teams: teams }),
         React.createElement("footer", { className: "ing-foot" }, "Research instrument. Projections are estimates from the inputs you provide \u2014 only as good as the data entered. Not betting advice.")));
 }
 // ---------------------------------------------------------------------------
@@ -7099,6 +7101,266 @@ function teamOUStreak(log, teamName) {
     const last = games.slice(0, 6).map((g) => ({ date: g.date, ou: g.ou, final: g.final, line: g.line, vs: normName(g.away).includes(n) ? g.home : g.away }));
     return { n: games.length, streak, side: top, last };
 }
+// ---- Daily debrief ----------------------------------------------------------
+// One sweep over the last three days of finals. Every claim here traces to a
+// box score or a linescore — nothing is generated prose, because on static
+// hosting there is no model to generate it and an invented narrative would be
+// worse than none. The research block comes first by design: the color block
+// exists to be read, not acted on, and the panel says so.
+const DEBRIEF_KEY = "ingenuity:debrief";
+function inningsFromOuts(outs) {
+    const full = Math.floor(outs / 3), rem = outs % 3;
+    return full + (rem ? "." + rem : "");
+}
+async function buildDebrief(days) {
+    const out = { asOf: new Date().toISOString().slice(0, 16).replace("T", " "), days: [], games: [], pens: {}, err: null };
+    try {
+        for (const day of days) {
+            const sr = await mlbFetch(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${day}&hydrate=linescore`);
+            if (!sr.ok)
+                continue;
+            const sj = await sr.json();
+            const pks = [];
+            for (const dt of (sj.dates || []))
+                for (const gm of (dt.games || [])) {
+                    if (gm.status?.abstractGameState !== "Final" || !gm.gamePk)
+                        continue;
+                    const ls = gm.linescore || {};
+                    const a = gm.teams?.away, h = gm.teams?.home;
+                    const as = a?.score, hs = h?.score;
+                    if (as == null || hs == null)
+                        continue;
+                    const innings = ls.currentInning || 9;
+                    // A walk-off is the home side winning with the last swing: the
+                    // bottom half was not completed because the run ended it.
+                    const walkoff = hs > as && (ls.isTopInning === false) && innings >= 9 && (ls.outs == null || ls.outs < 3);
+                    pks.push({
+                        pk: gm.gamePk, day,
+                        away: resolveTeamName(a?.team?.name) || a?.team?.name,
+                        home: resolveTeamName(h?.team?.name) || h?.team?.name,
+                        as, hs, total: as + hs, innings, extras: innings > 9, walkoff,
+                        margin: Math.abs(as - hs), venue: gm.venue?.name || "",
+                    });
+                }
+            if (pks.length)
+                out.days.push({ day, n: pks.length });
+            // Box scores give the bullpen lines. Same endpoint the fatigue sweep
+            // already warms, so this is usually served straight from cache.
+            for (let i = 0; i < pks.length; i += 5) {
+                const chunk = pks.slice(i, i + 5);
+                const boxes = await Promise.all(chunk.map(async (g) => {
+                    try {
+                        const br = await mlbFetch(`https://statsapi.mlb.com/api/v1/game/${g.pk}/boxscore`);
+                        return br.ok ? { g, bj: await br.json() } : { g, bj: null };
+                    }
+                    catch {
+                        return { g, bj: null };
+                    }
+                }));
+                for (const { g, bj } of boxes) {
+                    const rec = { ...g, penOuts: {}, penEr: {}, starters: {}, arms: {} };
+                    if (bj?.teams)
+                        for (const side of ["away", "home"]) {
+                            const sd = bj.teams[side];
+                            const team = resolveTeamName(sd?.team?.name) || sd?.team?.name;
+                            if (!team)
+                                continue;
+                            const ids = sd.pitchers || [];
+                            let outs = 0, er = 0;
+                            const arms = [];
+                            for (let k = 0; k < ids.length; k++) {
+                                const pl = sd.players?.["ID" + ids[k]];
+                                const pi = pl?.stats?.pitching || {};
+                                const o = parseFloat(pi.outs) || 0, e = parseFloat(pi.earnedRuns) || 0;
+                                const nm = pl?.person?.fullName;
+                                if (k === 0) {
+                                    rec.starters[team] = { name: nm, outs: o, er: e, k: parseFloat(pi.strikeOuts) || 0 };
+                                    continue;
+                                }
+                                outs += o;
+                                er += e;
+                                if (nm)
+                                    arms.push({ name: nm, outs: o, er: e, pitches: parseFloat(pi.pitchesThrown ?? pi.numberOfPitches) || 0 });
+                            }
+                            rec.penOuts[team] = outs;
+                            rec.penEr[team] = er;
+                            rec.arms[team] = arms;
+                            const pen = (out.pens[team] = out.pens[team] || { outs: 0, er: 0, games: 0, armDays: {} });
+                            pen.outs += outs;
+                            pen.er += er;
+                            pen.games++;
+                            for (const a of arms) {
+                                const rec2 = (pen.armDays[a.name] = pen.armDays[a.name] || { days: new Set(), outs: 0, pitches: 0 });
+                                rec2.days.add(day);
+                                rec2.outs += a.outs;
+                                rec2.pitches += a.pitches;
+                            }
+                        }
+                    out.games.push(rec);
+                }
+            }
+        }
+    }
+    catch (e) {
+        out.err = String(e && e.message ? e.message : e);
+    }
+    // Sets don't survive JSON, so collapse the arm-day tracking before storing.
+    for (const t of Object.keys(out.pens)) {
+        const p2 = out.pens[t];
+        p2.arms = Object.entries(p2.armDays).map(([name, a]) => ({ name, days: a.days.size, outs: a.outs, pitches: a.pitches }))
+            .sort((x, y) => y.pitches - x.pitches);
+        delete p2.armDays;
+    }
+    return out;
+}
+// Research block: what actually changes tomorrow's inputs.
+// Deliberately excludes anything that is just a story. A bullpen that threw
+// five innings yesterday is a real constraint on tomorrow; a bullpen that
+// "blew it again" is a narrative and a bad reason to move a number.
+function debriefResearch(db, teams, log) {
+    const games = db.games || [];
+    const totals = games.map((g) => g.total).filter((t) => t != null);
+    const mean = totals.length ? totals.reduce((a, b) => a + b, 0) / totals.length : null;
+    // Burned pens: the arms genuinely unavailable or short tomorrow.
+    const burned = Object.entries(db.pens || {}).map(([team, p]) => {
+        const b2b = (p.arms || []).filter((a) => a.days >= 2).length;
+        const heavy = (p.arms || []).filter((a) => a.pitches >= 35 || a.days >= 3);
+        return { team, ip: p.outs / 3, er: p.er, b2b, heavy, games: p.games,
+            score: p.outs / 3 + b2b * 1.5 + heavy.length };
+    }).sort((a, b) => b.score - a.score);
+    // Model performance over the same window, from the permanent log.
+    const inWindow = new Set((db.days || []).map((d) => d.day));
+    const graded = Object.values(log || {}).filter((r) => inWindow.has(r.date) && r.model != null && r.final != null);
+    const errs = graded.map((r) => r.final - r.model);
+    const bias = errs.length ? errs.reduce((a, b) => a + b, 0) / errs.length : null;
+    const mae = errs.length ? errs.reduce((a, b) => a + Math.abs(b), 0) / errs.length : null;
+    const worst = graded.map((r) => ({ ...r, err: r.final - r.model }))
+        .sort((a, b) => Math.abs(b.err) - Math.abs(a.err)).slice(0, 3);
+    // Starters who went deep or got knocked out — a real workload signal.
+    const short = [];
+    for (const g of games)
+        for (const [team, st] of Object.entries(g.starters || {}))
+            if (st && st.outs > 0 && st.outs <= 9)
+                short.push({ team, name: st.name, outs: st.outs, ip: inningsFromOuts(st.outs), er: st.er, day: g.day });
+    return { n: games.length, mean, burned: burned.slice(0, 6), bias, mae, gradedN: graded.length, worst,
+        short: short.sort((a, b) => a.outs - b.outs).slice(0, 5) };
+}
+// Color block: the things that were fun or brutal to watch. No model input.
+function debriefColor(db) {
+    const g = db.games || [];
+    const walkoffs = g.filter((x) => x.walkoff);
+    const extras = g.filter((x) => x.extras).sort((a, b) => b.innings - a.innings);
+    const slugfests = [...g].sort((a, b) => b.total - a.total).slice(0, 3);
+    const pitchers = [...g].sort((a, b) => a.total - b.total).slice(0, 3);
+    const blowouts = [...g].sort((a, b) => b.margin - a.margin).slice(0, 3);
+    // Bullpen meltdowns: a pen that gave up 4+ earned in a game it lost.
+    const melt = [];
+    for (const x of g)
+        for (const [team, er] of Object.entries(x.penEr || {})) {
+            const lost = (team === x.home && x.hs < x.as) || (team === x.away && x.as < x.hs);
+            if (er >= 4 && lost)
+                melt.push({ team, er, ip: inningsFromOuts(x.penOuts[team] || 0), day: x.day,
+                    vs: team === x.home ? x.away : x.home, score: `${x.as}-${x.hs}` });
+        }
+    // Gems: a starter with 18+ outs and no earned runs.
+    const gems = [];
+    for (const x of g)
+        for (const [team, st] of Object.entries(x.starters || {}))
+            if (st && st.outs >= 18 && st.er === 0)
+                gems.push({ team, name: st.name, ip: inningsFromOuts(st.outs), k: st.k, day: x.day });
+    return { walkoffs, extras: extras.slice(0, 3), slugfests, pitchers, blowouts,
+        melt: melt.sort((a, b) => b.er - a.er).slice(0, 3), gems: gems.sort((a, b) => b.k - a.k).slice(0, 3) };
+}
+function DebriefTab({ teams }) {
+    const [db, setDb] = useState(null);
+    const [log, setLog] = useState({});
+    const [busy, setBusy] = useState(false);
+    const [msg, setMsg] = useState("");
+    useEffect(() => {
+        let live = true;
+        (async () => {
+            const cached = await store.get(DEBRIEF_KEY, null);
+            const lg = await store.get("ingenuity:results:log", {});
+            if (!live)
+                return;
+            setLog(lg || {});
+            if (cached)
+                setDb(cached);
+        })();
+        return () => { live = false; };
+    }, []);
+    const refresh = async () => {
+        setBusy(true);
+        setMsg("");
+        const days = [1, 2, 3].map((i) => etDayKey(new Date(Date.now() - i * 86400000)));
+        const built = await buildDebrief(days);
+        if (!built.games.length) {
+            setBusy(false);
+            setMsg(built.err
+                ? `Couldn't reach MLB: ${built.err}. Nothing was overwritten.`
+                : "No completed games found in the last three days. Nothing was overwritten.");
+            return;
+        }
+        const wrote = await store.set(DEBRIEF_KEY, built);
+        setDb(built);
+        setBusy(false);
+        setMsg(wrote ? "" : "Built the debrief but couldn't save it — it will rebuild next time you open this tab.");
+    };
+    if (!db)
+        return React.createElement("main", { className: "ing-main dbf" },
+            React.createElement("section", { className: "ing-card" },
+                React.createElement("h2", null, "Three-day debrief"),
+                React.createElement("p", { className: "dbf-lede" }, "What happened around the league over the last three days, split into the part that changes your inputs and the part that is only worth reading. Pulls finals and box scores from the MLB Stats API \u2014 mostly already cached by the bullpen sweep."),
+                React.createElement("button", { className: "ing-primary", onClick: refresh, disabled: busy }, busy ? "Building\u2026" : "Build debrief"),
+                msg && React.createElement("p", { className: "ing-hint" }, msg)));
+    const R = debriefResearch(db, teams, log);
+    const C = debriefColor(db);
+    const row = (label, body, key) => React.createElement("div", { className: "dbf-row", key: key },
+        React.createElement("span", { className: "dbf-lbl" }, label),
+        React.createElement("span", { className: "dbf-body" }, body));
+    return React.createElement("main", { className: "ing-main dbf" },
+        React.createElement("section", { className: "ing-card" },
+            React.createElement("div", { className: "dbf-head" },
+                React.createElement("h2", null, "Three-day debrief"),
+                React.createElement("button", { className: "ing-ghost", onClick: refresh, disabled: busy }, busy ? "\u2026" : "Refresh")),
+            React.createElement("p", { className: "dbf-meta" }, `${R.n} final${R.n === 1 ? "" : "s"} across ${(db.days || []).length} day${(db.days || []).length === 1 ? "" : "s"} \u00B7 built ${db.asOf}`),
+            msg && React.createElement("p", { className: "ing-hint" }, msg)),
+        // ---- research ----
+        React.createElement("section", { className: "ing-card dbf-research" },
+            React.createElement("h3", null, "Changes your inputs"),
+            R.mean != null && row("Run environment", `${R.mean.toFixed(2)} runs per game across ${R.n} games. Three days is a small sample \u2014 this is context, not a trend.`),
+            R.burned.length > 0 && React.createElement("div", { className: "dbf-sub" },
+                React.createElement("h4", null, "Bullpens carrying load"),
+                R.burned.map((b) => React.createElement("div", { className: "dbf-pen", key: b.team },
+                    React.createElement("b", null, b.team),
+                    React.createElement("span", null, `${b.ip.toFixed(1)} relief IP, ${b.er} ER over ${b.games} game${b.games === 1 ? "" : "s"}`),
+                    b.b2b > 0 && React.createElement("i", null, `${b.b2b} arm${b.b2b === 1 ? "" : "s"} on back-to-back days`),
+                    b.heavy.length > 0 && React.createElement("em", null, `Heaviest: ${b.heavy.slice(0, 3).map((a) => `${a.name} (${a.pitches}p, ${a.days}d)`).join(", ")}`)))),
+            R.short.length > 0 && React.createElement("div", { className: "dbf-sub" },
+                React.createElement("h4", null, "Starters who didn't go deep"),
+                React.createElement("p", { className: "dbf-inline" }, R.short.map((x) => `${x.name || "?"} (${x.team}) ${x.ip} ip, ${x.er} er`).join(" \u00B7 ")),
+                React.createElement("p", { className: "dbf-note" }, "Short outings mean the pen behind them absorbed the innings \u2014 the constraint is on the relievers, not a verdict on the arm.")),
+            React.createElement("div", { className: "dbf-sub" },
+                React.createElement("h4", null, "How the model did"),
+                R.gradedN === 0
+                    ? React.createElement("p", { className: "dbf-note" }, "No graded projections in this window \u2014 either no boards were scanned or grading hasn't caught up.")
+                    : React.createElement(React.Fragment, null,
+                        row("Bias", `${R.bias > 0 ? "+" : ""}${R.bias.toFixed(2)} runs over ${R.gradedN} graded game${R.gradedN === 1 ? "" : "s"}`),
+                        row("Typical miss", `${R.mae.toFixed(2)} runs`),
+                        React.createElement("p", { className: "dbf-note" }, `${R.gradedN} games is far too few to mean anything \u2014 confirming any bias takes roughly 90. This is here to be watched over weeks, not reacted to.`),
+                        R.worst.length > 0 && React.createElement("p", { className: "dbf-inline" }, "Biggest misses: ", R.worst.map((w) => `${w.away} @ ${w.home} model ${w.model.toFixed(1)} vs ${w.final} (${w.err > 0 ? "+" : ""}${w.err.toFixed(1)})`).join(" \u00B7 ")))) ),
+        // ---- color ----
+        React.createElement("section", { className: "ing-card dbf-color" },
+            React.createElement("h3", null, "Worth reading, not acting on"),
+            React.createElement("p", { className: "dbf-warn" }, "Everything below is one game. A walk-off, a meltdown and a gem are the most memorable things that happened and among the least predictive \u2014 your model already prices these teams from full-season rates. Enjoy it; don't move a number for it."),
+            C.walkoffs.length > 0 && row("Walk-offs", C.walkoffs.map((w) => `${w.home} over ${w.away} ${w.hs}-${w.as}${w.extras ? ` in ${w.innings}` : ""}`).join(" \u00B7 ")),
+            C.extras.length > 0 && row("Longest", C.extras.map((x) => `${x.away} @ ${x.home} ${x.innings} innings, ${x.as}-${x.hs}`).join(" \u00B7 ")),
+            C.gems.length > 0 && row("Gems", C.gems.map((x) => `${x.name} (${x.team}) ${x.ip} ip shutout, ${x.k} K`).join(" \u00B7 ")),
+            C.melt.length > 0 && row("Pen meltdowns", C.melt.map((m) => `${m.team} pen ${m.er} ER in ${m.ip} ip vs ${m.vs}`).join(" \u00B7 ")),
+            C.slugfests.length > 0 && row("Highest scoring", C.slugfests.map((x) => `${x.away} @ ${x.home} ${x.total} runs`).join(" \u00B7 ")),
+            C.pitchers.length > 0 && row("Lowest scoring", C.pitchers.map((x) => `${x.away} @ ${x.home} ${x.total} runs`).join(" \u00B7 ")),
+            C.blowouts.length > 0 && row("Biggest margins", C.blowouts.map((x) => `${x.as > x.hs ? x.away : x.home} by ${x.margin}`).join(" \u00B7 "))));
+}
 // v2.1 — the morning chore list, in dependency order. Rosters feed name
 // routing and handedness; the board must exist before odds, weather or a scan
 // can attach to it. Only the odds step spends an API request.
@@ -9861,6 +10123,26 @@ const CSS = `
 .arm-line.r14 em { color: var(--amber); }
 .arm-line.r14 b { color: var(--amber); }
 .arm-line.none i { color: var(--ink-dim); opacity: 0.65; }
+.dbf h3 { font-family: 'Archivo'; font-size: 12px; letter-spacing: 0.11em; text-transform: uppercase; color: var(--ink); margin: 0 0 10px; }
+.dbf h4 { font-family: 'Archivo'; font-size: 9.5px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-dim); margin: 14px 0 7px; }
+.dbf-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+.dbf-lede { font-size: 12px; color: var(--ink-dim); line-height: 1.6; margin: 6px 0 14px; }
+.dbf-meta { font-family: 'Archivo'; font-size: 10px; letter-spacing: 0.06em; color: var(--ink-dim); margin: 6px 0 0; }
+.dbf-row { display: flex; flex-wrap: wrap; gap: 4px 10px; padding: 8px 0; border-bottom: 1px solid var(--line); }
+.dbf-row:last-child { border-bottom: none; }
+.dbf-lbl { font-family: 'Archivo'; font-size: 9px; letter-spacing: 0.11em; text-transform: uppercase; color: var(--ink-dim); min-width: 118px; padding-top: 2px; }
+.dbf-body { flex: 1; min-width: 190px; font-size: 12px; color: var(--ink); line-height: 1.55; }
+.dbf-sub { margin-top: 4px; }
+.dbf-pen { display: flex; flex-direction: column; gap: 2px; padding: 8px 10px; background: var(--field); border: 1px solid var(--line); border-radius: 7px; margin-bottom: 6px; }
+.dbf-pen b { font-size: 12.5px; color: var(--ink); }
+.dbf-pen span { font-size: 11.5px; color: var(--ink-dim); }
+.dbf-pen i { font-style: normal; font-size: 11px; color: var(--amber); }
+.dbf-pen em { font-style: normal; font-size: 10.5px; color: var(--ink-dim); }
+.dbf-inline { font-size: 11.5px; color: var(--ink); line-height: 1.6; margin: 0 0 6px; }
+.dbf-note { font-size: 11px; color: var(--ink-dim); line-height: 1.55; margin: 4px 0 0; }
+.dbf-research { border-left: 2px solid var(--phos); }
+.dbf-color { border-left: 2px solid var(--line); opacity: 0.92; }
+.dbf-warn { font-size: 11.5px; line-height: 1.6; color: var(--ink); background: rgba(245,196,81,0.07); border-left: 2px solid var(--amber); padding: 9px 11px; border-radius: 6px; margin: 0 0 12px; }
 .fresh-audit-note { margin: 10px 0 0; font-size: 11px; color: var(--ink-dim); line-height: 1.55; }
 .stamp.unknown { border-left-color: var(--ink-dim); }
 .stamp.unknown b { color: var(--ink-dim); }
