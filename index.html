@@ -7068,6 +7068,143 @@ async function recordFinals(arch) {
         await store.set("ingenuity:results:log", rec);
     return added;
 }
+// ---- Miss autopsy -----------------------------------------------------------
+// What can honestly be said about a game the model got wrong.
+// Two halves, deliberately kept apart: what HAPPENED (from the box score, all
+// fact) and where the final sat in the model's OWN distribution (only possible
+// when a snapshot was frozen at scan time). Games projected before snapshots
+// existed get the factual half and an explicit note that attribution is
+// unavailable — inventing a cause for them would be storytelling.
+async function autopsyGame(row, snap) {
+    const out = { row, snap, err: null, innings: null, big: null, split: null, hr: null, unearned: null, pk: null };
+    try {
+        const sr = await mlbFetch(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${row.date}&hydrate=linescore`);
+        if (!sr.ok)
+            throw new Error("schedule unavailable");
+        const sj = await sr.json();
+        const la = normName(resolveTeamName(row.away) || row.away || "");
+        const lh = normName(resolveTeamName(row.home) || row.home || "");
+        let hit = null;
+        for (const dt of (sj.dates || []))
+            for (const gm of (dt.games || [])) {
+                const a = resolveTeamName(gm.teams?.away?.team?.name) || gm.teams?.away?.team?.name;
+                const h = resolveTeamName(gm.teams?.home?.team?.name) || gm.teams?.home?.team?.name;
+                if (normName(a) === la && normName(h) === lh && (gm.teams.away.score + gm.teams.home.score) === row.final)
+                    hit = gm;
+            }
+        if (!hit)
+            throw new Error("couldn't find this game in MLB's schedule for that date");
+        out.pk = hit.gamePk;
+        const ls = hit.linescore || {};
+        out.innings = (ls.innings || []).map((i) => ({ n: i.num, a: i.away?.runs ?? 0, h: i.home?.runs ?? 0 }));
+        // One crooked inning is a different story from runs spread evenly, and the
+        // model prices an expected rate, not a single blow-up.
+        let worst = null;
+        for (const i of out.innings) {
+            const t = (i.a || 0) + (i.h || 0);
+            if (!worst || t > worst.runs)
+                worst = { inning: i.n, runs: t };
+        }
+        out.big = worst;
+        const br = await mlbFetch(`https://statsapi.mlb.com/api/v1/game/${out.pk}/boxscore`);
+        if (br.ok) {
+            const bj = await br.json();
+            let spOuts = 0, spEr = 0, penOuts = 0, penEr = 0, hr = 0, earned = 0, runs = 0;
+            for (const side of ["away", "home"]) {
+                const sd = bj.teams?.[side];
+                const ids = sd?.pitchers || [];
+                for (let k = 0; k < ids.length; k++) {
+                    const pi = sd.players?.["ID" + ids[k]]?.stats?.pitching || {};
+                    const o = parseFloat(pi.outs) || 0, e = parseFloat(pi.earnedRuns) || 0, rr = parseFloat(pi.runs) || 0;
+                    if (k === 0) { spOuts += o; spEr += e; }
+                    else { penOuts += o; penEr += e; }
+                    earned += e;
+                    runs += rr;
+                    hr += parseFloat(pi.homeRuns) || 0;
+                }
+            }
+            out.split = { spOuts, spEr, penOuts, penEr };
+            out.hr = hr;
+            out.unearned = Math.max(0, runs - earned);
+        }
+    }
+    catch (e) {
+        out.err = String(e && e.message ? e.message : e);
+    }
+    return out;
+}
+// Where the final landed in the model's own predicted range. This is the gate
+// that stops the tool manufacturing a lesson out of ordinary variance.
+function missVerdict(row, snap) {
+    const err = row.final - row.model;
+    if (!snap || snap.p10 == null || snap.p90 == null)
+        return { err, band: null, verdict: "unattributable",
+            text: "No distribution was saved for this projection, so there is no honest way to say whether this final was a tail outcome the model allowed for or a genuine failure. Projections made from now on store their own range." };
+    // p10..p90 is the middle 80%. Outside it happens one game in five by design.
+    const inside = row.final >= snap.p10 && row.final <= snap.p90;
+    // Approximate sigma from the 10-90 spread (2.563 sigma wide for a normal).
+    const sigma = (snap.p90 - snap.p10) / 2.563;
+    const z = sigma > 0 ? (row.final - row.model) / sigma : null;
+    if (inside)
+        return { err, band: [snap.p10, snap.p90], z, verdict: "expected",
+            text: `The model's own middle-80% range was ${snap.p10} to ${snap.p90} and the game finished at ${row.final} — inside it. The number was not wrong; totals are noisy. There is no lesson in this game.` };
+    if (z != null && Math.abs(z) < 2)
+        return { err, band: [snap.p10, snap.p90], z, verdict: "tail",
+            text: `Finished outside the middle-80% range (${snap.p10}–${snap.p90}) at ${row.final}, about ${Math.abs(z).toFixed(1)} standard deviations out. Roughly one game in five lands outside this band by construction, so this is unusual but not evidence of a broken input.` };
+    return { err, band: [snap.p10, snap.p90], z, verdict: "outlier",
+        text: `Finished at ${row.final}, about ${Math.abs(z).toFixed(1)} standard deviations from the projection and well outside the model's own range (${snap.p10}–${snap.p90}). A miss this size is where a real input error would show — but a single game still can't prove one. It is worth reading alongside the pattern panel below.` };
+}
+// ---- Pattern detection ------------------------------------------------------
+// The actual learning mechanism. A single miss is an anecdote; a lean that
+// survives across dozens of games is evidence. Every split here is reported
+// with its own sample size and a significance test, and the panel refuses to
+// call anything a finding until the numbers support it.
+function splitSignificance(errs) {
+    const n = errs.length;
+    if (!n)
+        return { n: 0, mean: null, se: null, real: false };
+    const mean = errs.reduce((a, b) => a + b, 0) / n;
+    const mae = errs.reduce((a, b) => a + Math.abs(b), 0) / n;
+    const sd = 1.2533 * mae;
+    const se = n ? sd / Math.sqrt(n) : null;
+    const ci = se != null ? 1.96 * se : null;
+    return { n, mean, mae, se, ci, real: n >= 30 && ci != null && Math.abs(mean) > ci };
+}
+function detectMissPatterns(log, boards) {
+    // Pull every graded row and attach whatever snapshot the board kept.
+    const rows = [];
+    for (const r of Object.values(log || {})) {
+        if (!r || r.model == null || r.final == null)
+            continue;
+        let snap = null;
+        const b = (boards || {})[r.date];
+        if (b && b.games)
+            for (const g of b.games) {
+                if (!g.proj || !g.proj.snap)
+                    continue;
+                if (normName(g.away) === normName(r.away) && normName(g.home) === normName(r.home))
+                    snap = g.proj.snap;
+            }
+        rows.push({ ...r, err: r.final - r.model, snap });
+    }
+    const overall = splitSignificance(rows.map((r) => r.err));
+    const splits = [];
+    const add = (label, hit, why) => {
+        const inn = rows.filter(hit), outn = rows.filter((r) => !hit(r));
+        if (inn.length < 8)
+            return;
+        const A = splitSignificance(inn.map((r) => r.err)), B = splitSignificance(outn.map((r) => r.err));
+        splits.push({ label, why, a: A, b: B, gap: A.mean != null && B.mean != null ? A.mean - B.mean : null });
+    };
+    add("High totals (line 9+)", (r) => r.line >= 9, "If the model misses differently on high-scoring games, its run-scaling is off at one end.");
+    add("Low totals (line under 8)", (r) => r.line < 8, "The other end of the same question.");
+    add("Model called OVER", (r) => r.model > r.line, "A lean that misses in one direction more than the other is a calibration signal, not luck.");
+    add("Snapshot: hot park (1.02+)", (r) => r.snap && r.snap.park != null && r.snap.park >= 1.02, "Park factors are applied multiplicatively; an error here shows up only in hitter parks.");
+    add("Snapshot: wind blowing out", (r) => r.snap && r.snap.windOut === true, "The weather boost is capped at +/-6%; this tests whether the cap is right.");
+    add("Snapshot: tired pen (fatigue 0.5+)", (r) => r.snap && (parseFloat(r.snap.aFat) >= 0.5 || parseFloat(r.snap.hFat) >= 0.5), "Fatigue is one of the newest inputs and the least validated.");
+    const withSnap = rows.filter((r) => r.snap).length;
+    return { rows, overall, splits: splits.sort((a, b) => Math.abs(b.gap || 0) - Math.abs(a.gap || 0)), withSnap };
+}
 // ---- Results log verifier ---------------------------------------------------
 // The permanent log never expires by design, so a row written from a mis-parsed
 // board persists forever and quietly feeds the accuracy panel. This checks every
@@ -7183,6 +7320,32 @@ function teamOUStreak(log, teamName) {
 // worse than none. The research block comes first by design: the color block
 // exists to be read, not acted on, and the panel says so.
 const DEBRIEF_KEY = "ingenuity:debrief";
+// Local clock for an ISO instant, in the reader's own timezone.
+function clockOf(iso) {
+    if (!iso)
+        return null;
+    const d = new Date(iso);
+    if (isNaN(d.getTime()))
+        return null;
+    return d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+}
+// "7:10 PM \u2192 ~10:24 PM" when duration is known, else just the start.
+function windowOf(g) {
+    const start = clockOf(g.firstPitch || g.sched);
+    if (!start)
+        return null;
+    if (!g.durationMin)
+        return start;
+    const base = new Date(g.firstPitch || g.sched);
+    const end = clockOf(new Date(base.getTime() + g.durationMin * 60000).toISOString());
+    return end ? `${start} \u2192 ~${end}` : start;
+}
+function dayLabelShort(day) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(day || ""));
+    if (!m)
+        return String(day || "");
+    return new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], 12)).toLocaleDateString([], { weekday: "short", month: "short", day: "numeric", timeZone: "UTC" });
+}
 function inningsFromOuts(outs) {
     const full = Math.floor(outs / 3), rem = outs % 3;
     return full + (rem ? "." + rem : "");
@@ -7215,6 +7378,10 @@ async function buildDebrief(days) {
                         home: resolveTeamName(h?.team?.name) || h?.team?.name,
                         as, hs, total: as + hs, innings, extras: innings > 9, walkoff,
                         margin: Math.abs(as - hs), venue: gm.venue?.name || "",
+                        // Scheduled start. Actual first pitch and duration come off the
+                        // boxscore below; MLB publishes no clock time per event, so a
+                        // finish time is first pitch plus duration and is labelled approx.
+                        sched: gm.gameDate || null,
                     });
                 }
             if (pks.length)
@@ -7234,6 +7401,9 @@ async function buildDebrief(days) {
                 }));
                 for (const { g, bj } of boxes) {
                     const rec = { ...g, penOuts: {}, penEr: {}, starters: {}, arms: {} };
+                    const gi = bj?.info || bj?.gameInfo || null;
+                    rec.firstPitch = bj?.gameInfo?.firstPitch || null;
+                    rec.durationMin = bj?.gameInfo?.gameDurationMinutes || null;
                     if (bj?.teams)
                         for (const side of ["away", "home"]) {
                             const sd = bj.teams[side];
@@ -7346,6 +7516,74 @@ function debriefColor(db) {
     return { walkoffs, extras: extras.slice(0, 3), slugfests, pitchers, blowouts,
         melt: melt.sort((a, b) => b.er - a.er).slice(0, 3), gems: gems.sort((a, b) => b.k - a.k).slice(0, 3) };
 }
+function MissLab({ log }) {
+    const [boards, setBoards] = useState({});
+    const [open, setOpen] = useState(null);
+    const [auto, setAuto] = useState({});
+    const [busy, setBusy] = useState("");
+    useEffect(() => {
+        let live = true;
+        (async () => {
+            const a = await store.get("ingenuity:slate:archive", {});
+            if (live)
+                setBoards(a || {});
+        })();
+        return () => { live = false; };
+    }, []);
+    const pat = detectMissPatterns(log, boards);
+    const misses = pat.rows.slice().sort((a, b) => Math.abs(b.err) - Math.abs(a.err)).slice(0, 6);
+    const dig = async (r) => {
+        const key = `${r.date}|${r.away}|${r.home}`;
+        setOpen(open === key ? null : key);
+        if (auto[key] || open === key)
+            return;
+        setBusy(key);
+        const res = await autopsyGame(r, r.snap);
+        setAuto((m) => ({ ...m, [key]: res }));
+        setBusy("");
+    };
+    return React.createElement("section", { className: "ing-card miss-lab" },
+        React.createElement("h3", null, "Miss autopsy"),
+        pat.rows.length === 0
+            ? React.createElement("p", { className: "dbf-note" }, "No graded projections on file yet.")
+            : React.createElement(React.Fragment, null,
+                React.createElement("p", { className: "dbf-note" }, `${pat.rows.length} graded game${pat.rows.length === 1 ? "" : "s"} on file, ${pat.withSnap} with a saved model snapshot. Only snapshotted games can be judged against the model's own predicted range \u2014 the rest can be described but not attributed.`),
+                misses.map((r) => {
+                    const key = `${r.date}|${r.away}|${r.home}`;
+                    const v = missVerdict(r, r.snap);
+                    const a = auto[key];
+                    return React.createElement("div", { className: "miss-row " + v.verdict, key: key },
+                        React.createElement("button", { className: "miss-head", onClick: () => dig(r) },
+                            React.createElement("span", { className: "miss-teams" }, `${r.away} @ ${r.home}`),
+                            React.createElement("span", { className: "miss-num" }, `model ${r.model.toFixed(1)} \u2192 ${r.final}`),
+                            React.createElement("span", { className: "miss-err" }, `${v.err > 0 ? "+" : ""}${v.err.toFixed(1)}`),
+                            React.createElement("span", { className: "miss-day" }, dayLabelShort(r.date))),
+                        open === key && React.createElement("div", { className: "miss-body" },
+                            React.createElement("p", { className: "miss-verdict" }, v.text),
+                            busy === key && React.createElement("p", { className: "dbf-note" }, "Pulling the box score\u2026"),
+                            a && a.err && React.createElement("p", { className: "dbf-note" }, `Couldn't reconstruct this game: ${a.err}`),
+                            a && !a.err && React.createElement(React.Fragment, null,
+                                a.innings && React.createElement("div", { className: "miss-innings" },
+                                    a.innings.map((i) => React.createElement("span", { key: i.n, className: (i.a + i.h) >= 4 ? "big" : "" },
+                                        React.createElement("b", null, i.n),
+                                        React.createElement("i", null, `${i.a}-${i.h}`)))),
+                                a.big && a.big.runs >= 4 && React.createElement("p", { className: "miss-fact" }, `${a.big.runs} of the ${r.final} runs came in a single inning (the ${a.big.inning}${a.big.inning === 1 ? "st" : a.big.inning === 2 ? "nd" : a.big.inning === 3 ? "rd" : "th"}). The model prices an expected rate across nine innings, not one blow-up, so a game decided by one frame tells you little about the inputs.`),
+                                a.split && React.createElement("p", { className: "miss-fact" }, `Starters: ${inningsFromOuts(a.split.spOuts)} ip, ${a.split.spEr} er. Bullpens: ${inningsFromOuts(a.split.penOuts)} ip, ${a.split.penEr} er.${a.split.penEr > a.split.spEr ? " Most of the damage was on the bullpens \u2014 the input with the widest error bars." : ""}`),
+                                (a.hr != null || a.unearned != null) && React.createElement("p", { className: "miss-fact" }, `${a.hr || 0} home run${a.hr === 1 ? "" : "s"}${a.unearned ? `, ${a.unearned} unearned run${a.unearned === 1 ? "" : "s"} \u2014 unearned runs come from defence the run model doesn't simulate` : ""}.`),
+                                r.snap && React.createElement("p", { className: "miss-fact snap" }, `Model expected ${r.snap.aMean} \u2013 ${r.snap.hMean} (${r.away} \u2013 ${r.home}), park ${r.snap.park ?? "\u2014"}${r.snap.temp != null ? `, ${r.snap.temp}\u00B0` : ""}${r.snap.windOut ? ", wind out" : ""}. Starters priced: ${r.snap.aSP || "?"} / ${r.snap.hSP || "?"}.`))));
+                }),
+                React.createElement("h4", null, "Patterns across all graded games"),
+                React.createElement("p", { className: "dbf-note" }, "One miss is an anecdote. A lean that holds across dozens of games is the only thing worth changing a parameter for."),
+                pat.overall.n > 0 && React.createElement("p", { className: "miss-fact" }, `Overall: ${pat.overall.mean > 0 ? "+" : ""}${pat.overall.mean.toFixed(2)} runs over ${pat.overall.n} games, noise band \u00B1${pat.overall.ci.toFixed(2)}. ${pat.overall.real ? "This clears its own noise band." : "Inside the noise band \u2014 not yet a finding."}`),
+                pat.splits.length === 0
+                    ? React.createElement("p", { className: "dbf-note" }, "No split has 8+ games yet. Splits appear as the sample grows; treating fewer than that as a pattern is how a model gets tuned onto noise.")
+                    : pat.splits.map((sp) => React.createElement("div", { className: "miss-split", key: sp.label },
+                        React.createElement("div", { className: "ms-head" },
+                            React.createElement("b", null, sp.label),
+                            React.createElement("span", { className: sp.a.real ? "sig" : "" }, sp.a.real ? "signal" : "not significant")),
+                        React.createElement("p", null, `${sp.a.mean > 0 ? "+" : ""}${sp.a.mean.toFixed(2)} runs over ${sp.a.n} game${sp.a.n === 1 ? "" : "s"} vs ${sp.b.mean != null ? `${sp.b.mean > 0 ? "+" : ""}${sp.b.mean.toFixed(2)} over ${sp.b.n}` : "\u2014"} elsewhere${sp.gap != null ? `, a gap of ${Math.abs(sp.gap).toFixed(2)} runs` : ""}. ${sp.a.n < 30 ? `Only ${sp.a.n} games \u2014 far too few; roughly 30 before this means anything.` : sp.a.real ? "Clears its own noise band. Worth investigating the underlying input." : "Inside the noise band."}`),
+                        React.createElement("em", null, sp.why)))));
+}
 function DebriefTab({ teams }) {
     const [db, setDb] = useState(null);
     const [log, setLog] = useState({});
@@ -7424,6 +7662,7 @@ function DebriefTab({ teams }) {
                         row("Typical miss", `${R.mae.toFixed(2)} runs`),
                         React.createElement("p", { className: "dbf-note" }, `${R.gradedN} games is far too few to mean anything \u2014 confirming any bias takes roughly 90. This is here to be watched over weeks, not reacted to.`),
                         R.worst.length > 0 && React.createElement("p", { className: "dbf-inline" }, "Biggest misses: ", R.worst.map((w) => `${w.away} @ ${w.home} model ${w.model.toFixed(1)} vs ${w.final} (${w.err > 0 ? "+" : ""}${w.err.toFixed(1)})`).join(" \u00B7 ")))) ),
+        React.createElement(MissLab, { log: log }),
         // ---- color ----
         React.createElement("section", { className: "ing-card dbf-color" },
             React.createElement("h3", null, "Worth reading, not acting on"),
@@ -7434,7 +7673,7 @@ function DebriefTab({ teams }) {
             C.melt.length > 0 && row("Pen meltdowns", C.melt.map((m) => `${m.team} pen ${m.er} ER in ${m.ip} ip vs ${m.vs}`).join(" \u00B7 ")),
             C.slugfests.length > 0 && row("Highest scoring", C.slugfests.map((x) => `${x.away} @ ${x.home} ${x.total} runs`).join(" \u00B7 ")),
             C.pitchers.length > 0 && row("Lowest scoring", C.pitchers.map((x) => `${x.away} @ ${x.home} ${x.total} runs`).join(" \u00B7 ")),
-            C.blowouts.length > 0 && row("Biggest margins", C.blowouts.map((x) => `${x.as > x.hs ? x.away : x.home} by ${x.margin}`).join(" \u00B7 "))));
+            C.blowouts.length > 0 && row("Biggest margins", C.blowouts.map((x) => `${x.as > x.hs ? x.away : x.home} by ${x.margin} \u2014 ${dayLabelShort(x.day)}`).join(" \u00B7 "))));
 }
 // v2.1 — the morning chore list, in dependency order. Rosters feed name
 // routing and handedness; the board must exist before odds, weather or a scan
@@ -8378,7 +8617,24 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
             const edge = (pW - fairOver) * 100;
             const evOver = r.pOver * (dO - 1) * 100 - r.pUnder * 100;
             const evUnder = r.pUnder * (dU - 1) * 100 - r.pOver * 100;
-            out.push({ ...g, status: "ok", awayName: A.name, homeName: H.name, model: r.mean, pW, edge, evOver, evUnder });
+            out.push({ ...g, status: "ok", awayName: A.name, homeName: H.name, model: r.mean, pW, edge, evOver, evUnder,
+                // The snapshot. Without this a past miss can only be described, never
+                // attributed: the model's spread and its per-side expectation are what
+                // separate "we were wrong" from "this landed in the tail we predicted".
+                snap: {
+                    aMean: +r.awayMean.toFixed(2), hMean: +r.homeMean.toFixed(2),
+                    p10: +r.p10.toFixed(1), p90: +r.p90.toFixed(1),
+                    park: homePark ? +homePark.toFixed(3) : null,
+                    temp: g.wx ? g.wx.temp : null, windOut: g.wx ? g.wx.windOut : null,
+                    aSP: g.awayP || null, hSP: g.homeP || null,
+                    aSPx: a.sp ?? null, hSPx: h.sp ?? null,
+                    aOff: a.off ?? null, hOff: h.off ?? null,
+                    aRec: a.recent ?? null, hRec: h.recent ?? null,
+                    aPen: a.pen ?? null, hPen: h.pen ?? null,
+                    aOaa: a.oaa ?? null, hOaa: h.oaa ?? null,
+                    aFat: a.penFatigue ?? null, hFat: h.penFatigue ?? null,
+                },
+            });
         }
         const scored = out.filter((x) => x.status === "ok");
         let top = null;
@@ -8395,7 +8651,7 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
         await saveSlate({ ...slate, games: slate.games.map((g) => {
                 const r = out.find((x) => x.away === g.away && x.home === g.home);
                 if (r && r.status === "ok")
-                    return { ...g, skip: undefined, proj: { model: +r.model.toFixed(2), edge: +r.edge.toFixed(1), pOver: +r.pW.toFixed(3), atLine: r.line, ts: stamp } };
+                    return { ...g, skip: undefined, proj: { model: +r.model.toFixed(2), edge: +r.edge.toFixed(1), pOver: +r.pW.toFixed(3), atLine: r.line, ts: stamp, day: viewDate, snap: r.snap || null } };
                 // A skip must never erase a projection frozen earlier — a post-first-pitch
                 // rescan skips everything, and that number is the honest pregame record.
                 // Only games that never got projected carry a skip reason.
@@ -10336,6 +10592,34 @@ const CSS = `
 .dbf-pen em { font-style: normal; font-size: 10.5px; color: var(--ink-dim); }
 .dbf-inline { font-size: 11.5px; color: var(--ink); line-height: 1.6; margin: 0 0 6px; }
 .dbf-note { font-size: 11px; color: var(--ink-dim); line-height: 1.55; margin: 4px 0 0; }
+.miss-lab h4 { margin-top: 18px; }
+.miss-row { border: 1px solid var(--line); border-left-width: 2px; border-radius: 8px; margin-bottom: 6px; background: var(--field); }
+.miss-row.expected { border-left-color: var(--line); }
+.miss-row.tail { border-left-color: var(--amber); }
+.miss-row.outlier { border-left-color: var(--rust); }
+.miss-row.unattributable { border-left-color: var(--ink-dim); }
+.miss-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; width: 100%; padding: 9px 11px; background: none; border: none; cursor: pointer; font-family: inherit; text-align: left; color: var(--ink); }
+.miss-teams { font-size: 12.5px; font-weight: 600; flex: 1; min-width: 140px; }
+.miss-num { font-size: 11px; color: var(--ink-dim); font-family: 'Archivo'; }
+.miss-err { font-family: 'Archivo'; font-weight: 700; font-size: 12.5px; color: var(--amber); }
+.miss-row.outlier .miss-err { color: var(--rust); }
+.miss-day { font-size: 10px; color: var(--ink-dim); font-family: 'Archivo'; }
+.miss-body { padding: 0 11px 11px; }
+.miss-verdict { font-size: 11.5px; line-height: 1.6; color: var(--ink); background: var(--field2); border-radius: 6px; padding: 9px 10px; margin: 0 0 8px; }
+.miss-innings { display: flex; flex-wrap: wrap; gap: 3px; margin-bottom: 8px; }
+.miss-innings span { display: flex; flex-direction: column; align-items: center; min-width: 26px; padding: 3px 4px; border: 1px solid var(--line); border-radius: 4px; background: var(--field2); }
+.miss-innings span.big { border-color: var(--rust); }
+.miss-innings b { font-family: 'Archivo'; font-size: 8.5px; color: var(--ink-dim); }
+.miss-innings i { font-style: normal; font-size: 10.5px; color: var(--ink); }
+.miss-fact { font-size: 11.5px; line-height: 1.6; color: var(--ink-dim); margin: 0 0 6px; }
+.miss-fact.snap { color: var(--ink); border-left: 2px solid var(--phos); padding-left: 9px; }
+.miss-split { border: 1px solid var(--line); border-radius: 8px; padding: 10px 11px; margin-bottom: 6px; background: var(--field); }
+.ms-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 5px; }
+.ms-head b { font-size: 12px; color: var(--ink); }
+.ms-head span { font-family: 'Archivo'; font-size: 9px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-dim); }
+.ms-head span.sig { color: var(--amber); }
+.miss-split p { font-size: 11.5px; color: var(--ink-dim); line-height: 1.55; margin: 0 0 5px; }
+.miss-split em { font-style: normal; font-size: 10.5px; color: var(--ink-dim); opacity: 0.8; line-height: 1.5; }
 .dbf-research { border-left: 2px solid var(--phos); }
 .dbf-color { border-left: 2px solid var(--line); opacity: 0.92; }
 .dbf-warn { font-size: 11.5px; line-height: 1.6; color: var(--ink); background: rgba(245,196,81,0.07); border-left: 2px solid var(--amber); padding: 9px 11px; border-radius: 6px; margin: 0 0 12px; }
