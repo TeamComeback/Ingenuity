@@ -1102,6 +1102,133 @@ const EMPTY_TEAM = {
     oaa: "", framing: "",
     players: [], rotation: [],
 };
+// Which offense number a projection should use for this team, right now.
+// Today's posted lineup beats the season figure; a stale lineup does not, because
+// yesterday's nine is not evidence about today's. Returns the source so the board
+// can say which one it used rather than leaving it implied.
+// Pull today's posted batting orders for a board and fold them into the teams.
+// Deliberately a "take what exists now" operation: MLB posts lineups team by team
+// as first pitch nears, so anything unposted is reported, never guessed at.
+function mergeLineupInto(t, into) {
+    const next = [...into];
+    // MLB's feed says "Colorado Rockies"; the database stores "Rockies". An
+    // exact string compare misses, which used to push a SECOND team with only
+    // lineup estimates on it — sitting alongside the real one with your
+    // imported stats. Resolve to the canonical name before matching.
+    const canon = resolveTeamName(t.name) || t.name;
+    const i = next.findIndex((x) => normName(x.name) === normName(canon));
+    const base = i >= 0 ? next[i] : { ...EMPTY_TEAM, name: canon };
+    const roster = [...(base.players || [])];
+    const byName = new Map(roster.map((p, idx) => [normName(p.name), idx]));
+    const isReal = (p) => p && !p.est && p.woba !== "" && p.woba != null && !isNaN(parseFloat(p.woba));
+    let kept = 0, estimated = 0, added = 0;
+    const lineup = [];
+    t.players.forEach((p, order) => {
+        const key = normName(p.name);
+        const at = byName.get(key);
+        if (at != null && isReal(roster[at])) {
+            kept++; // real stats on file — leave them alone
+            lineup.push({ name: roster[at].name, order: order + 1 });
+        }
+        else if (at != null) {
+            roster[at] = { ...roster[at], woba: p.woba, pa: String(p.pa || roster[at].pa || ""), est: true };
+            estimated++;
+            lineup.push({ name: roster[at].name, order: order + 1 });
+        }
+        else {
+            roster.push({ name: p.name, woba: p.woba, pa: String(p.pa || ""), est: true });
+            byName.set(key, roster.length - 1);
+            added++;
+            estimated++;
+            lineup.push({ name: p.name, order: order + 1 });
+        }
+    });
+    // Team offense from the nine actually playing, using each one's best number.
+    const lineupPlayers = lineup.map((l) => roster[byName.get(normName(l.name))]).filter(Boolean);
+    const { off, pa } = lineupToTeamOffense(lineupPlayers);
+    const merged = {
+        ...base,
+        players: roster, // full roster preserved
+        lineup, // today's batting order
+        lineupAsOf: etDayKey(),
+        // Lineup offense is kept SEPARATE from season offense. It used to
+        // overwrite `off`, which destroyed the season number permanently and
+        // meant a game with no posted lineup silently priced off whichever
+        // nine played last time lineups were pulled. Now the scan can choose.
+        lineupOff: off != null ? String(off) : base.lineupOff,
+        lineupPA: pa != null ? String(pa) : base.lineupPA,
+        lineupReal: kept, lineupEst: estimated,
+        rotation: t.probable && !(base.rotation || []).some((r) => normName(r.name) === normName(t.probable))
+            ? [...(base.rotation || []), { name: t.probable, xwoba: "", bf: "", ip: "" }]
+            : (base.rotation || []),
+    };
+    if (i >= 0)
+        next[i] = merged;
+    else
+        next.push(merged);
+    const spNote = t.probable
+        ? (base.rotation || []).some((r) => normName(r.name) === normName(t.probable))
+            ? `, ${t.probable} already in the rotation with his stats`
+            : `, ${t.probable} added to the rotation with no stats yet — import him from Savant or the projection will refuse to price this game`
+        : "";
+    return { next, kept, estimated, added, lineupLen: lineup.length, spNote };
+}
+async function pullLineupsForBoard(games, teams) {
+    const out = { teams, got: [], notPosted: [], failed: 0 };
+    const withPk = (games || []).filter((g) => g.gamePk);
+    if (!withPk.length)
+        return out;
+    let working = teams;
+    for (let i = 0; i < withPk.length; i += 4) {
+        const chunk = withPk.slice(i, i + 4);
+        const results = await Promise.all(chunk.map(async (g) => {
+            try {
+                const r = await mlbFetch(`https://statsapi.mlb.com/api/v1/game/${g.gamePk}/boxscore`);
+                return r.ok ? { g, j: await r.json() } : { g, err: true };
+            }
+            catch {
+                return { g, err: true };
+            }
+        }));
+        for (const { g, j, err } of results) {
+            if (err || !j?.teams) {
+                out.failed++;
+                continue;
+            }
+            for (const [slot, teamName] of [["away", g.away], ["home", g.home]]) {
+                const players = Object.values(j.teams[slot]?.players || {})
+                    .filter((p) => p.battingOrder)
+                    .sort((a, b) => parseInt(a.battingOrder) - parseInt(b.battingOrder))
+                    .map((p) => ({
+                        name: p.person?.fullName || "",
+                        woba: "", pa: "",
+                        order: Math.round(parseInt(p.battingOrder) / 100),
+                    }));
+                if (players.length < 9) {
+                    out.notPosted.push(teamName);
+                    continue;
+                }
+                working = mergeLineupInto({ name: teamName, players }, working).next;
+                out.got.push(teamName);
+            }
+        }
+    }
+    out.teams = working;
+    return out;
+}
+function offenseFor(t, today) {
+    const seasonOff = t.off === "" || t.off == null ? null : parseFloat(t.off);
+    const seasonPA = t.pa === "" || t.pa == null ? null : parseFloat(t.pa);
+    const lo = t.lineupOff === "" || t.lineupOff == null ? null : parseFloat(t.lineupOff);
+    const lpa = t.lineupPA === "" || t.lineupPA == null ? null : parseFloat(t.lineupPA);
+    const fresh = !!(t.lineupAsOf && today && t.lineupAsOf === today);
+    if (fresh && isFinite(lo))
+        return { off: lo, pa: isFinite(lpa) ? lpa : seasonPA, source: "lineup",
+            real: t.lineupReal || 0, est: t.lineupEst || 0, asOf: t.lineupAsOf };
+    return { off: isFinite(seasonOff) ? seasonOff : null, pa: seasonPA,
+        source: t.lineupAsOf ? "season-stale" : "season",
+        real: 0, est: 0, asOf: t.lineupAsOf || null };
+}
 function lineupToTeamOffense(players) {
     const valid = players.filter((p) => p.woba !== "" && !isNaN(parseFloat(p.woba)));
     if (!valid.length)
@@ -3317,64 +3444,7 @@ function LineupFetcher({ teams, saveTeams }) {
     // keep the full roster, and only estimate for players we've never seen.
     // Pure merge, so a bulk save can fold many teams into one accumulating array
     // instead of calling saveTeams in a loop against stale state.
-    const mergeLineup = (t, into) => {
-        const next = [...into];
-        // MLB's feed says "Colorado Rockies"; the database stores "Rockies". An
-        // exact string compare misses, which used to push a SECOND team with only
-        // lineup estimates on it — sitting alongside the real one with your
-        // imported stats. Resolve to the canonical name before matching.
-        const canon = resolveTeamName(t.name) || t.name;
-        const i = next.findIndex((x) => normName(x.name) === normName(canon));
-        const base = i >= 0 ? next[i] : { ...EMPTY_TEAM, name: canon };
-        const roster = [...(base.players || [])];
-        const byName = new Map(roster.map((p, idx) => [normName(p.name), idx]));
-        const isReal = (p) => p && !p.est && p.woba !== "" && p.woba != null && !isNaN(parseFloat(p.woba));
-        let kept = 0, estimated = 0, added = 0;
-        const lineup = [];
-        t.players.forEach((p, order) => {
-            const key = normName(p.name);
-            const at = byName.get(key);
-            if (at != null && isReal(roster[at])) {
-                kept++; // real stats on file — leave them alone
-                lineup.push({ name: roster[at].name, order: order + 1 });
-            }
-            else if (at != null) {
-                roster[at] = { ...roster[at], woba: p.woba, pa: String(p.pa || roster[at].pa || ""), est: true };
-                estimated++;
-                lineup.push({ name: roster[at].name, order: order + 1 });
-            }
-            else {
-                roster.push({ name: p.name, woba: p.woba, pa: String(p.pa || ""), est: true });
-                byName.set(key, roster.length - 1);
-                added++;
-                estimated++;
-                lineup.push({ name: p.name, order: order + 1 });
-            }
-        });
-        // Team offense from the nine actually playing, using each one's best number.
-        const lineupPlayers = lineup.map((l) => roster[byName.get(normName(l.name))]).filter(Boolean);
-        const { off, pa } = lineupToTeamOffense(lineupPlayers);
-        const merged = {
-            ...base,
-            players: roster, // full roster preserved
-            lineup, // today's batting order
-            lineupAsOf: etDayKey(),
-            off: off ?? base.off, pa: pa != null ? String(pa) : base.pa,
-            rotation: t.probable && !(base.rotation || []).some((r) => normName(r.name) === normName(t.probable))
-                ? [...(base.rotation || []), { name: t.probable, xwoba: "", bf: "", ip: "" }]
-                : (base.rotation || []),
-        };
-        if (i >= 0)
-            next[i] = merged;
-        else
-            next.push(merged);
-        const spNote = t.probable
-            ? (base.rotation || []).some((r) => normName(r.name) === normName(t.probable))
-                ? `, ${t.probable} already in the rotation with his stats`
-                : `, ${t.probable} added to the rotation with no stats yet — import him from Savant or the projection will refuse to price this game`
-            : "";
-        return { next, kept, estimated, added, lineupLen: lineup.length, spNote };
-    };
+    const mergeLineup = (t, into) => mergeLineupInto(t, into);
     // v3.0 — save every lineup that's actually posted, in one pass. Batting orders
     // appear team by team as first pitch approaches, so this is explicitly a
     // "take what exists now" operation, safe to run repeatedly through the
@@ -7704,6 +7774,7 @@ const MORNING_PLAN = [
     { key: "weather", label: "Weather", hint: "game-time, per park" },
     { key: "bullpen", label: "Bullpen workload", hint: "last 3 days of box scores" },
     { key: "recentform", label: "Recent form (14d)", hint: "outcome wOBA + BB%\u2212K%, MLB Stats API" },
+    { key: "lineups", label: "Batting orders", hint: "usually posted ~3h before first pitch" },
 ];
 // ---- Grading coverage & significance ----------------------------------------
 // Why a game never got a projection. Stored on the board at scan time so the
@@ -8394,6 +8465,27 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
             const left = [...new Set(missing)].length;
             return { state: left ? "warn" : "ok", note: `${applied} team${applied === 1 ? "" : "s"}${left ? `, ${left} unmatched` : ""}` };
         });
+        await run("lineups", async () => {
+            // MLB posts batting orders roughly three hours out, so a morning run
+            // will usually find none. That is reported as a normal outcome, not a
+            // failure, and re-running later in the day picks them up.
+            const board = (await store.get("ingenuity:slate:archive", {}))[todayKey];
+            const gms = board?.games || [];
+            if (!gms.some((g) => g.gamePk))
+                return { state: "skip", note: "no board with game ids yet" };
+            if (!workingTeams.length)
+                return { state: "skip", note: "database empty" };
+            const lu = await pullLineupsForBoard(gms, workingTeams);
+            if (!lu.got.length)
+                return { state: "warn", note: `none posted yet${lu.failed ? `, ${lu.failed} lookup${lu.failed === 1 ? "" : "s"} failed` : ""} \u2014 normal this early; re-run closer to first pitch` };
+            workingTeams = lu.teams;
+            setTeams(lu.teams);
+            const saved = await store.set("ingenuity:teams", lu.teams);
+            if (!saved)
+                return { state: "fail", note: store.lastError || "save refused" };
+            const left = [...new Set(lu.notPosted)].length;
+            return { state: left ? "warn" : "ok", note: `${lu.got.length} team${lu.got.length === 1 ? "" : "s"}${left ? `, ${left} not posted yet` : ""}` };
+        });
         // Refresh the on-screen board from what actually persisted.
         const finalArch = await store.get("ingenuity:slate:archive", {});
         if (finalArch[todayKey])
@@ -8610,7 +8702,8 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
                 resolved = num(hit.xwoba) != null;
             }
         }
-        return { off: num(t.off) ?? CFG.LEAGUE_WOBA, xoff: num(t.xoff), pa: num(t.pa) ?? 600, recent: num(t.recent), recentPA: num(t.recentPA), recentBbk: num(t.recentBbk), sp, spBf, spIp, spEra, pen: num(t.pen) ?? 0.318, penBf: num(t.penBf) ?? 800, penBarrel: num(t.penBarrel), penHardHit: num(t.penHardHit), oaa: num(t.oaa), framing: num(t.framing), penFatigue: teamPenFatigue(t), resolved };
+        const lu = offenseFor(t, todayKey);
+        return { lu, off: lu.off ?? CFG.LEAGUE_WOBA, xoff: num(t.xoff), pa: lu.pa ?? 600, recent: num(t.recent), recentPA: num(t.recentPA), recentBbk: num(t.recentBbk), sp, spBf, spIp, spEra, pen: num(t.pen) ?? 0.318, penBf: num(t.penBf) ?? 800, penBarrel: num(t.penBarrel), penHardHit: num(t.penHardHit), oaa: num(t.oaa), framing: num(t.framing), penFatigue: teamPenFatigue(t), resolved };
     };
     const scan = async () => {
         setBusy("scan");
@@ -8631,6 +8724,35 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
         }
     };
     const scanInner = async () => {
+        // Pull today's batting orders only when they aren't already loaded for
+        // today, and only for today's board — re-pulling a past board would
+        // overwrite that day's teams with tonight's nine.
+        if (viewDate === todayKey) {
+            const stale = teams.some((t) => !t.lineupAsOf || t.lineupAsOf !== todayKey);
+            if (stale && slate.games.some((g) => g.gamePk)) {
+                setMsg("Checking for posted lineups\u2026");
+                try {
+                    const lu = await pullLineupsForBoard(slate.games, teams);
+                    if (lu.got.length) {
+                        // SlateHub has no saveTeams helper; persist and update the
+                        // local copy directly, and only claim success if the write
+                        // actually stuck.
+                        const wrote = await store.set("ingenuity:teams", lu.teams);
+                        setTeams(lu.teams);
+                        if (!wrote)
+                            setMsg("Loaded lineups but couldn't save them \u2014 this scan uses them, the next one won't. Scanning\u2026");
+                        setMsg(`Loaded lineups for ${lu.got.length} team${lu.got.length === 1 ? "" : "s"}. Scanning\u2026`);
+                    }
+                    else {
+                        setMsg("No lineups posted yet \u2014 pricing on season numbers. Scanning\u2026");
+                    }
+                }
+                catch (e) {
+                    // A lineup pull failing must never block the scan.
+                    setMsg("Couldn't reach lineups \u2014 pricing on season numbers. Scanning\u2026");
+                }
+            }
+        }
         const out = [];
         for (const g of slate.games) {
             const line = parseFloat(g.line);
@@ -8638,7 +8760,7 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
                 out.push({ ...g, status: "skip", code: "no_line", err: "no total set" });
                 continue;
             }
-            const A = matchTeamDb(g.away, teams), H = matchTeamDb(g.home, teams);
+            const A = matchTeamDb(g.away, liveTeams), H = matchTeamDb(g.home, liveTeams);
             if (!A || !H) {
                 out.push({ ...g, status: "skip", code: "no_team", err: `no DB match for ${!A ? g.away : g.home}` });
                 continue;
@@ -8667,6 +8789,7 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
             const evOver = r.pOver * (dO - 1) * 100 - r.pUnder * 100;
             const evUnder = r.pUnder * (dU - 1) * 100 - r.pOver * 100;
             out.push({ ...g, status: "ok", awayName: A.name, homeName: H.name, model: r.mean, pW, edge, evOver, evUnder,
+                lu: { a: a.lu, h: h.lu },
                 // The snapshot. Without this a past miss can only be described, never
                 // attributed: the model's spread and its per-side expectation are what
                 // separate "we were wrong" from "this landed in the tail we predicted".
@@ -8681,6 +8804,11 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
                     aRec: a.recent ?? null, hRec: h.recent ?? null,
                     aPen: a.pen ?? null, hPen: h.pen ?? null,
                     aOaa: a.oaa ?? null, hOaa: h.oaa ?? null,
+                    // Was this priced on today's posted nine or on season numbers?
+                    // The miss lab can then test whether misses cluster in games
+                    // priced without lineups, which is a real and testable question.
+                    aLu: a.lu ? a.lu.source : null, hLu: h.lu ? h.lu.source : null,
+                    aLuEst: a.lu ? a.lu.est : null, hLuEst: h.lu ? h.lu.est : null,
                     aFat: a.penFatigue ?? null, hFat: h.penFatigue ?? null,
                 },
             });
@@ -9104,6 +9232,22 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
                         "no gap \u00B7 ",
                         Math.abs(scanned.edge).toFixed(1),
                         " pts"),
+                    scanned && scanned.lu && (() => {
+                        // Say plainly which offense number priced this game. A season
+                        // fallback is legitimate; a silent one is not.
+                        const a = scanned.lu.a, h = scanned.lu.h;
+                        const both = [a, h].filter(Boolean);
+                        if (!both.length)
+                            return null;
+                        const onLineup = both.filter((x) => x.source === "lineup").length;
+                        const est = both.reduce((n2, x) => n2 + (x.est || 0), 0);
+                        if (onLineup === both.length)
+                            return React.createElement("span", { className: "sr-lu on", title: "Priced on today's posted batting orders" },
+                                "lineups" + (est ? ` \u00B7 ${est} est` : ""));
+                        if (onLineup === 0)
+                            return React.createElement("span", { className: "sr-lu off", title: both.some((x) => x.source === "season-stale") ? "No lineup posted today; priced on season numbers (an older lineup is on file but was not used)" : "No lineup posted; priced on season numbers" }, "season numbers");
+                        return React.createElement("span", { className: "sr-lu half", title: "One side has a posted lineup, the other is on season numbers" }, "half lineups");
+                    })(),
                     skipped && React.createElement("span", { className: "sr-err" }, skipped.err))),
                 g.final != null && (() => {
                     const lineVal = g.line !== "" && g.line != null ? parseFloat(g.line) : null;
@@ -11139,6 +11283,9 @@ const CSS = `
 .ing-slatenote { font-size: 12px; color: var(--cyan); margin-bottom: 12px; padding: 9px 12px; background: rgba(95,217,232,0.07); border-left: 3px solid var(--cyan); border-radius: 7px; }
 .slate-chips { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
 .slate-chip.stamp { color: var(--ink-dim); }
+.sr-lu { font-family: 'Archivo'; font-size: 9px; letter-spacing: 0.07em; text-transform: uppercase; padding: 2px 6px; border-radius: 4px; border: 1px solid var(--line); color: var(--ink-dim); white-space: nowrap; }
+.sr-lu.on { color: var(--phos); border-color: rgba(52,230,168,0.35); }
+.sr-lu.half { color: var(--amber); border-color: rgba(245,196,81,0.35); }
 .slate-chip.stamp.warn { color: var(--amber); border-color: rgba(245,196,81,0.4); }
 .slate-chip { font-family: 'Archivo'; font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; padding: 5px 11px; border-radius: 999px; border: 1px solid var(--line); color: var(--ink-dim); }
 .slate-chip.good { color: var(--phos); border-color: var(--phos-dim); }
