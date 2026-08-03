@@ -7199,7 +7199,7 @@ function detectMissPatterns(log, boards) {
     add("High totals (line 9+)", (r) => r.line >= 9, "If the model misses differently on high-scoring games, its run-scaling is off at one end.");
     add("Low totals (line under 8)", (r) => r.line < 8, "The other end of the same question.");
     add("Model called OVER", (r) => r.model > r.line, "A lean that misses in one direction more than the other is a calibration signal, not luck.");
-    add("Snapshot: hot park (1.02+)", (r) => r.snap && r.snap.park != null && r.snap.park >= 1.02, "Park factors are applied multiplicatively; an error here shows up only in hitter parks.");
+    add("Snapshot: hot park (1.02+)", (r) => r.snap && r.snap.parkF != null && r.snap.parkF >= 1.02, "Park factors are applied multiplicatively; an error here shows up only in hitter parks.");
     add("Snapshot: wind blowing out", (r) => r.snap && r.snap.windOut === true, "The weather boost is capped at +/-6%; this tests whether the cap is right.");
     add("Snapshot: tired pen (fatigue 0.5+)", (r) => r.snap && (parseFloat(r.snap.aFat) >= 0.5 || parseFloat(r.snap.hFat) >= 0.5), "Fatigue is one of the newest inputs and the least validated.");
     const withSnap = rows.filter((r) => r.snap).length;
@@ -7339,6 +7339,24 @@ function windowOf(g) {
     const base = new Date(g.firstPitch || g.sched);
     const end = clockOf(new Date(base.getTime() + g.durationMin * 60000).toISOString());
     return end ? `${start} \u2192 ~${end}` : start;
+}
+// "12 min ago" / "3h ago" — and past two hours it is called out, because a
+// board priced this morning is not the board the book is showing now.
+function agoOf(iso) {
+    if (!iso)
+        return null;
+    const ms = Date.now() - new Date(iso).getTime();
+    if (!isFinite(ms) || ms < 0)
+        return null;
+    const min = Math.floor(ms / 60000);
+    if (min < 1)
+        return { text: "just now", min };
+    if (min < 60)
+        return { text: `${min} min ago`, min };
+    const h = Math.floor(min / 60);
+    if (h < 24)
+        return { text: `${h}h ${min % 60}m ago`, min };
+    return { text: `${Math.floor(h / 24)}d ago`, min };
 }
 function dayLabelShort(day) {
     const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(day || ""));
@@ -7570,7 +7588,7 @@ function MissLab({ log }) {
                                 a.big && a.big.runs >= 4 && React.createElement("p", { className: "miss-fact" }, `${a.big.runs} of the ${r.final} runs came in a single inning (the ${a.big.inning}${a.big.inning === 1 ? "st" : a.big.inning === 2 ? "nd" : a.big.inning === 3 ? "rd" : "th"}). The model prices an expected rate across nine innings, not one blow-up, so a game decided by one frame tells you little about the inputs.`),
                                 a.split && React.createElement("p", { className: "miss-fact" }, `Starters: ${inningsFromOuts(a.split.spOuts)} ip, ${a.split.spEr} er. Bullpens: ${inningsFromOuts(a.split.penOuts)} ip, ${a.split.penEr} er.${a.split.penEr > a.split.spEr ? " Most of the damage was on the bullpens \u2014 the input with the widest error bars." : ""}`),
                                 (a.hr != null || a.unearned != null) && React.createElement("p", { className: "miss-fact" }, `${a.hr || 0} home run${a.hr === 1 ? "" : "s"}${a.unearned ? `, ${a.unearned} unearned run${a.unearned === 1 ? "" : "s"} \u2014 unearned runs come from defence the run model doesn't simulate` : ""}.`),
-                                r.snap && React.createElement("p", { className: "miss-fact snap" }, `Model expected ${r.snap.aMean} \u2013 ${r.snap.hMean} (${r.away} \u2013 ${r.home}), park ${r.snap.park ?? "\u2014"}${r.snap.temp != null ? `, ${r.snap.temp}\u00B0` : ""}${r.snap.windOut ? ", wind out" : ""}. Starters priced: ${r.snap.aSP || "?"} / ${r.snap.hSP || "?"}.`))));
+                                r.snap && React.createElement("p", { className: "miss-fact snap" }, `Model expected ${r.snap.aMean} \u2013 ${r.snap.hMean} (${r.away} \u2013 ${r.home}), park ${r.snap.park || "\u2014"}${r.snap.parkF != null ? ` (${r.snap.parkF})` : ""}${r.snap.temp != null ? `, ${r.snap.temp}\u00B0` : ""}${r.snap.windOut ? ", wind out" : ""}. Starters priced: ${r.snap.aSP || "?"} / ${r.snap.hSP || "?"}.`))));
                 }),
                 React.createElement("h4", null, "Patterns across all graded games"),
                 React.createElement("p", { className: "dbf-note" }, "One miss is an anecdote. A lean that holds across dozens of games is the only thing worth changing a parameter for."),
@@ -7841,6 +7859,22 @@ function SlateHub({ onOpenInTerminal }) {
     const [acc, setAcc] = useState(null);
     const [cov, setCov] = useState(null);
     const [gradeOpen, setGradeOpen] = useState(false); // diagnostics are weekly reading; the board is the daily job
+    const [scanAt, setScanAt] = useState(null);
+    const [morningAt, setMorningAt] = useState(null);
+    useEffect(() => {
+        let live = true;
+        (async () => {
+            const a = await store.get("ingenuity:stamp:scan", null);
+            const b = await store.get("ingenuity:stamp:morning", null);
+            if (!live)
+                return;
+            if (a && a.at)
+                setScanAt(a.at);
+            if (b && b.at)
+                setMorningAt(b.at);
+        })();
+        return () => { live = false; };
+    }, []);
     const [detailGame, setDetailGame] = useState(null);
     const [morning, setMorning] = useState(null); // one-tap refresh: per-step progress
     const [stepsOpen, setStepsOpen] = useState(false); // individual-step drawer
@@ -8365,6 +8399,8 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
         if (finalArch[todayKey])
             setSlate(finalArch[todayKey]);
         setArchDates(Object.keys(finalArch).sort().reverse());
+        await store.set("ingenuity:stamp:morning", { at: new Date().toISOString(), day: viewDate });
+        setMorningAt(new Date().toISOString());
         setMorning((m) => {
             if (!m)
                 return m;
@@ -8582,6 +8618,19 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
         setRows(null);
         setLean(null);
         await new Promise((res) => setTimeout(res, 30));
+        try {
+            await scanInner();
+        }
+        catch (e) {
+            // Without this the button sits on "Scanning the board..." forever and
+            // never says why. A visible failure beats a silent hang every time.
+            setMsg(`Scan failed: ${e && e.message ? e.message : e}. Nothing was saved. If this repeats, the Debrief tab's snapshot capture is the newest moving part.`);
+        }
+        finally {
+            setBusy("");
+        }
+    };
+    const scanInner = async () => {
         const out = [];
         for (const g of slate.games) {
             const line = parseFloat(g.line);
@@ -8624,7 +8673,7 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
                 snap: {
                     aMean: +r.awayMean.toFixed(2), hMean: +r.homeMean.toFixed(2),
                     p10: +r.p10.toFixed(1), p90: +r.p90.toFixed(1),
-                    park: homePark ? +homePark.toFixed(3) : null,
+                    park: homePark || null, parkF: PARKS[homePark] != null ? +PARKS[homePark].toFixed(3) : null,
                     temp: g.wx ? g.wx.temp : null, windOut: g.wx ? g.wx.windOut : null,
                     aSP: g.awayP || null, hSP: g.homeP || null,
                     aSPx: a.sp ?? null, hSPx: h.sp ?? null,
@@ -8659,6 +8708,10 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
                     return { ...g, skip: r.code };
                 return g;
             }) });
+        // Lines move. Knowing when the board was last priced is the difference
+        // between a current read and a stale one worn as a current one.
+        await store.set("ingenuity:stamp:scan", { at: new Date().toISOString(), day: viewDate, n: scored.length });
+        setScanAt(new Date().toISOString());
         // A scan of a past board is research — it must not overwrite today's read.
         if (viewDate === todayKey) {
             await store.set("ingenuity:brain:slateScan", {
@@ -8666,7 +8719,7 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
                 lean: call ? { matchup: `${call.awayName} @ ${call.homeName}`, side: call.edge > 0 ? "Over" : "Under", line: call.line, edge: +call.edge.toFixed(1), model: +call.model.toFixed(2) } : null,
             });
         }
-        setBusy("");
+        // busy is cleared by the caller's finally, so a throw can't strand it
     };
     // How wrong was the model, measured against games that had already been
     // projected before they were played? Only counts boards carrying a frozen
@@ -8874,6 +8927,19 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
         games.length > 0 && (rows || games.some((g) => g.proj)) && (React.createElement(BoardChart, { games: games, rows: rows, onOpen: (g) => (onOpenInTerminal ? onOpenInTerminal(g) : setDetailGame(g)) })),
         detailGame && (React.createElement(GameDetail, { g: detailGame, teams: teams, dateKey: viewDate, isToday: isToday, onClose: () => setDetailGame(null) })),
         games.length > 0 && (React.createElement("div", { className: "slate-chips" },
+            (() => {
+                const sa = agoOf(scanAt), ma = agoOf(morningAt);
+                if (!sa && !ma)
+                    return null;
+                // Two hours is the point where a morning line and a current line
+                // routinely differ, so the chip turns amber rather than staying quiet.
+                const stale = sa && sa.min >= 120;
+                return React.createElement(React.Fragment, null,
+                    sa && React.createElement("span", { className: "slate-chip stamp" + (stale ? " warn" : ""), title: `Board last scanned ${new Date(scanAt).toLocaleString()}` },
+                        stale ? "\u26A0 " : "",
+                        `scanned ${sa.text}`),
+                    ma && React.createElement("span", { className: "slate-chip stamp", title: `Morning refresh completed ${new Date(morningAt).toLocaleString()}` }, `refreshed ${ma.text}`));
+            })(),
             React.createElement("span", { className: "slate-chip" },
                 games.length,
                 " games"),
@@ -11072,6 +11138,8 @@ const CSS = `
 .ing-staged-name { font-size: 12.5px; color: var(--ink); flex: 1; min-width: 120px; word-break: break-all; }
 .ing-slatenote { font-size: 12px; color: var(--cyan); margin-bottom: 12px; padding: 9px 12px; background: rgba(95,217,232,0.07); border-left: 3px solid var(--cyan); border-radius: 7px; }
 .slate-chips { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+.slate-chip.stamp { color: var(--ink-dim); }
+.slate-chip.stamp.warn { color: var(--amber); border-color: rgba(245,196,81,0.4); }
 .slate-chip { font-family: 'Archivo'; font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; padding: 5px 11px; border-radius: 999px; border: 1px solid var(--line); color: var(--ink-dim); }
 .slate-chip.good { color: var(--phos); border-color: var(--phos-dim); }
 .slate-filebtn { font-family: 'Archivo'; font-weight: 600; font-size: 13px; letter-spacing: 0.12em; text-transform: uppercase; background: transparent; color: var(--cyan); border: 1px solid var(--cyan); padding: 11px 18px; border-radius: 9px; cursor: pointer; display: inline-flex; align-items: center; }
