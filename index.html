@@ -8724,6 +8724,10 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
         }
     };
     const scanInner = async () => {
+        // setTeams doesn't update this closure's `teams`, so the scan prices on
+        // whatever array this variable holds. It starts as the loaded teams and is
+        // replaced in place when a lineup pull succeeds.
+        let liveTeams = teams;
         // Pull today's batting orders only when they aren't already loaded for
         // today, and only for today's board — re-pulling a past board would
         // overwrite that day's teams with tonight's nine.
@@ -8737,11 +8741,15 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
                         // SlateHub has no saveTeams helper; persist and update the
                         // local copy directly, and only claim success if the write
                         // actually stuck.
+                        liveTeams = lu.teams; // this scan must price on what we just pulled
                         const wrote = await store.set("ingenuity:teams", lu.teams);
                         setTeams(lu.teams);
-                        if (!wrote)
-                            setMsg("Loaded lineups but couldn't save them \u2014 this scan uses them, the next one won't. Scanning\u2026");
-                        setMsg(`Loaded lineups for ${lu.got.length} team${lu.got.length === 1 ? "" : "s"}. Scanning\u2026`);
+                        // The save-failure warning used to be overwritten by the
+                        // success line on the very next statement, so a failed write
+                        // reported success.
+                        setMsg(wrote
+                            ? `Loaded lineups for ${lu.got.length} team${lu.got.length === 1 ? "" : "s"}. Scanning\u2026`
+                            : `Loaded lineups for ${lu.got.length} team${lu.got.length === 1 ? "" : "s"} but couldn't save them \u2014 this scan uses them, the next one won't. Scanning\u2026`);
                     }
                     else {
                         setMsg("No lineups posted yet \u2014 pricing on season numbers. Scanning\u2026");
