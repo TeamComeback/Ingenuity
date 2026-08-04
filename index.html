@@ -352,7 +352,7 @@ function detectTimeframe(rows) {
 // duplicate of season talent wearing today's date.
 function recentIsDuplicate(t) {
     const r = parseFloat(t.recent), o = parseFloat(t.off);
-    if (!isFinite(r) || !isFinite(o))
+    if (!Number.isFinite(r) || !Number.isFinite(o))
         return false;
     return Math.abs(r - o) < 0.0015;
 }
@@ -1216,16 +1216,208 @@ async function pullLineupsForBoard(games, teams) {
     out.teams = working;
     return out;
 }
+// Find a probable starter in a rotation. Exact name first; otherwise surname
+// AND first initial. Surname alone is not enough — it hands "Robert Garcia" the
+// numbers of "Luis Garcia" and reports success, which is a wrong arm rather than
+// a missing one, and the arm is the single biggest input in this model.
+function findRotationArm(rotation, pitcherName) {
+    if (!pitcherName || !rotation || !rotation.length)
+        return null;
+    const pn = normName(pitcherName);
+    const exact = rotation.find((r) => normName(r.name) === pn);
+    if (exact)
+        return exact;
+    const pp = pn.split(" ");
+    const pLast = pp[pp.length - 1], pFirst = pp[0] || "";
+    return rotation.find((r) => {
+        const rp = normName(r.name).split(" ");
+        const rLast = rp[rp.length - 1], rFirst = rp[0] || "";
+        return rLast && rLast === pLast && rFirst[0] && pFirst[0] && rFirst[0] === pFirst[0];
+    }) || null;
+}
+// ---- Roster reconciliation (trade deadline) ---------------------------------
+// Nothing in this app ever moved a player between teams: the roster sync built a
+// name->team lookup for routing imports but never touched team.players or
+// team.rotation. After a deadline that leaves traded arms in their old rotation
+// and missing from their new one, which is why a probable starter goes unfound.
+// This only ever changes CURRENT team records. Archived boards and the results
+// log are untouched: a projection frozen in July used July's roster, and that is
+// the correct record of what the model actually knew.
+function isReliever(p) {
+    return !((parseFloat(p.bf) || 0) >= 250 || (parseFloat(p.ip) || 0) >= 3.5);
+}
+// Compare the database against MLB's current rosters. Reports only; the caller
+// decides whether to apply.
+async function planRosterReconcile(teams) {
+    const out = { moves: [], inactive: [], unknownTeams: [], missingFromDb: 0, checked: 0, err: null };
+    try {
+        const r = await mlbFetch(`https://statsapi.mlb.com/api/v1/sports/1/players?season=${new Date().getFullYear()}`);
+        if (!r.ok)
+            throw new Error("MLB roster feed unavailable");
+        const j = await r.json();
+        const people = (j.people || []).filter((p) => p.fullName);
+        if (!people.length)
+            throw new Error("roster feed came back empty");
+        const byName = new Map();
+        const byId = new Map();
+        for (const p of people) {
+            const team = p.currentTeam?.name ? (resolveTeamName(p.currentTeam.name) || p.currentTeam.name) : null;
+            const rec = { id: p.id != null ? String(p.id) : null, name: p.fullName, team,
+                pitcher: !!(p.primaryPosition && (p.primaryPosition.abbreviation === "P" || p.primaryPosition.code === "1" || p.primaryPosition.type === "Pitcher")) };
+            byName.set(normName(p.fullName), rec);
+            if (rec.id)
+                byId.set(rec.id, rec);
+        }
+        const dbTeamNames = new Set(teams.map((t) => normName(t.name)));
+        const seen = new Set();
+        for (const t of teams) {
+            for (const bucket of ["players", "rotation"]) {
+                for (const pl of (t[bucket] || [])) {
+                    if (!pl || !pl.name)
+                        continue;
+                    out.checked++;
+                    const key = normName(pl.name);
+                    seen.add(key);
+                    const rec = (pl.mlbId && byId.get(String(pl.mlbId))) || byName.get(key);
+                    if (!rec || !rec.team) {
+                        // Not on any MLB roster today. Kept, with their stats, but
+                        // flagged so they stop counting toward a current-roster figure.
+                        if (!pl.inactive)
+                            out.inactive.push({ team: t.name, bucket, name: pl.name });
+                        continue;
+                    }
+                    if (normName(rec.team) === normName(t.name)) {
+                        if (pl.inactive)
+                            out.moves.push({ name: pl.name, from: t.name, to: t.name, bucket, id: rec.id, reactivate: true });
+                        continue;
+                    }
+                    if (!dbTeamNames.has(normName(rec.team))) {
+                        out.unknownTeams.push(rec.team);
+                        continue;
+                    }
+                    out.moves.push({ name: pl.name, from: t.name, to: rec.team, bucket,
+                        toBucket: rec.pitcher ? "rotation" : "players", id: rec.id });
+                }
+            }
+        }
+        // Players on an MLB roster this app has never heard of. Reported, not
+        // added: a name with no stats can't be projected, so the fix is a stats
+        // import, not a placeholder row that looks like data.
+        for (const [k, rec] of byName)
+            if (rec.team && !seen.has(k) && dbTeamNames.has(normName(rec.team)))
+                out.missingFromDb++;
+        out.unknownTeams = [...new Set(out.unknownTeams)];
+        // A truncated or partial feed would mark most of the database inactive and
+        // then offer to apply it. Real churn on any single day is a handful of
+        // players; a quarter of the league is a bad response, not a bad roster.
+        if (out.checked > 0 && out.inactive.length / out.checked > 0.25) {
+            out.err = `MLB listed only ${people.length} players and ${out.inactive.length} of your ${out.checked} roster entries came back unmatched (${Math.round(out.inactive.length / out.checked * 100)}%). That looks like an incomplete feed rather than that many players changing status, so nothing is being proposed. Try again in a few minutes.`;
+            out.moves = [];
+            out.inactive = [];
+        }
+    }
+    catch (e) {
+        out.err = String(e && e.message ? e.message : e);
+    }
+    return out;
+}
+// Apply the plan. Stats travel with the player — a hitter's wOBA is his own.
+function applyRosterReconcile(teams, plan) {
+    const next = teams.map((t) => ({ ...t, players: [...(t.players || [])], rotation: [...(t.rotation || [])] }));
+    const at = new Map(next.map((t, i) => [normName(t.name), i]));
+    let moved = 0, flagged = 0, reactivated = 0;
+    for (const mv of plan.moves) {
+        const fi = at.get(normName(mv.from));
+        if (fi == null)
+            continue;
+        if (mv.reactivate) {
+            const arr = next[fi][mv.bucket];
+            const k = arr.findIndex((p) => normName(p.name) === normName(mv.name));
+            if (k >= 0) {
+                arr[k] = { ...arr[k], inactive: undefined, mlbId: mv.id || arr[k].mlbId };
+                reactivated++;
+            }
+            continue;
+        }
+        const ti = at.get(normName(mv.to));
+        if (ti == null)
+            continue;
+        const from = next[fi][mv.bucket];
+        const k = from.findIndex((p) => normName(p.name) === normName(mv.name));
+        if (k < 0)
+            continue;
+        const [pl] = from.splice(k, 1);
+        const destKey = mv.toBucket || mv.bucket;
+        const dest = next[ti][destKey];
+        if (!dest.some((p) => normName(p.name) === normName(pl.name)))
+            dest.push({ ...pl, inactive: undefined, mlbId: mv.id || pl.mlbId });
+        moved++;
+    }
+    for (const inact of plan.inactive) {
+        const i = at.get(normName(inact.team));
+        if (i == null)
+            continue;
+        const arr = next[i][inact.bucket];
+        const k = arr.findIndex((p) => normName(p.name) === normName(inact.name));
+        if (k >= 0) {
+            arr[k] = { ...arr[k], inactive: true };
+            flagged++;
+        }
+    }
+    const stamp = etDayKey();
+    return { next: next.map((t) => ({ ...recomputeFromRoster(t), rosterAsOf: stamp })), moved, flagged, reactivated };
+}
+// Team offense and bullpen from who is actually on the club now. Season imports
+// are backward-looking by construction: a club that sold its best bat still
+// shows the offense that bat produced. Stored in their own fields so nothing
+// overwrites the imported season figures.
+function recomputeFromRoster(t) {
+    const active = (t.players || []).filter((p) => !p.inactive);
+    const { off, pa } = lineupToTeamOffense(active);
+    const pen = (t.rotation || []).filter((p) => !p.inactive && isReliever(p));
+    let pw = 0, pbf = 0;
+    for (const p of pen) {
+        const x = parseFloat(p.xwoba), bf = parseFloat(p.bf) || 0;
+        if (Number.isFinite(x) && bf > 0) {
+            pw += x * bf;
+            pbf += bf;
+        }
+    }
+    return { ...t,
+        rosterOff: off != null ? String(off) : t.rosterOff,
+        rosterPA: pa != null ? String(pa) : t.rosterPA,
+        rosterPen: pbf > 0 ? (pw / pbf).toFixed(3) : t.rosterPen,
+        rosterPenBf: pbf > 0 ? String(Math.round(pbf)) : t.rosterPenBf };
+}
+// Same precedence for the pen: a roster-derived rating beats a season import
+// that still includes arms who were traded away.
+function penFor(t) {
+    const rp = t.rosterPen === "" || t.rosterPen == null ? null : parseFloat(t.rosterPen);
+    const rbf = t.rosterPenBf === "" || t.rosterPenBf == null ? null : parseFloat(t.rosterPenBf);
+    const sp = t.pen === "" || t.pen == null ? null : parseFloat(t.pen);
+    const sbf = t.penBf === "" || t.penBf == null ? null : parseFloat(t.penBf);
+    if (Number.isFinite(rp))
+        return { pen: rp, penBf: Number.isFinite(rbf) ? rbf : sbf, source: "roster" };
+    return { pen: Number.isFinite(sp) ? sp : null, penBf: sbf, source: "season" };
+}
 function offenseFor(t, today) {
     const seasonOff = t.off === "" || t.off == null ? null : parseFloat(t.off);
     const seasonPA = t.pa === "" || t.pa == null ? null : parseFloat(t.pa);
     const lo = t.lineupOff === "" || t.lineupOff == null ? null : parseFloat(t.lineupOff);
     const lpa = t.lineupPA === "" || t.lineupPA == null ? null : parseFloat(t.lineupPA);
     const fresh = !!(t.lineupAsOf && today && t.lineupAsOf === today);
-    if (fresh && isFinite(lo))
-        return { off: lo, pa: isFinite(lpa) ? lpa : seasonPA, source: "lineup",
+    if (fresh && Number.isFinite(lo))
+        return { off: lo, pa: Number.isFinite(lpa) ? lpa : seasonPA, source: "lineup",
             real: t.lineupReal || 0, est: t.lineupEst || 0, asOf: t.lineupAsOf };
-    return { off: isFinite(seasonOff) ? seasonOff : null, pa: seasonPA,
+    // Roster offense sits between the two: it is not today's nine, but it does
+    // reflect who is actually on the club, which a season import cannot after a
+    // trade. Preferred over the season figure once rosters have been reconciled.
+    const ro = t.rosterOff === "" || t.rosterOff == null ? null : parseFloat(t.rosterOff);
+    const rpa = t.rosterPA === "" || t.rosterPA == null ? null : parseFloat(t.rosterPA);
+    if (Number.isFinite(ro))
+        return { off: ro, pa: Number.isFinite(rpa) ? rpa : seasonPA, source: "roster",
+            real: 0, est: 0, asOf: t.rosterAsOf || null };
+    return { off: Number.isFinite(seasonOff) ? seasonOff : null, pa: seasonPA,
         source: t.lineupAsOf ? "season-stale" : "season",
         real: 0, est: 0, asOf: t.lineupAsOf || null };
 }
@@ -2091,7 +2283,7 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
         if (!pName || !t?.rotation)
             return null;
         const pn = normName(pName);
-        return t.rotation.find((x) => normName(x.name) === pn) || t.rotation.find((x) => pn.includes(normName(x.name).split(" ").pop())) || null;
+        return findRotationArm(t.rotation, pName);
     };
     const aArm = findArm(A, g.awayP), hArm = findArm(H, g.homeP);
     useEffect(() => {
@@ -2123,7 +2315,7 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
                 off: offenseFor(t, etDayKey()).off ?? CFG.LEAGUE_WOBA, xoff: num(t.xoff), pa: offenseFor(t, etDayKey()).pa ?? 600,
                 recent: num(t.recent), recentPA: num(t.recentPA), recentBbk: num(t.recentBbk),
                 sp: num(arm.xwoba) ?? 0.32, spBf: num(arm.bf) ?? 200, spIp: num(arm.ip) ?? 5, spEra: num(arm.era), spHand: (arm.hand === "L" || arm.hand === "R") ? arm.hand : null,
-                pen: num(t.pen) ?? 0.318, penBf: num(t.penBf) ?? 800, penBarrel: num(t.penBarrel), penHardHit: num(t.penHardHit),
+                pen: penFor(t).pen ?? 0.318, penBf: penFor(t).penBf ?? 800, penBarrel: num(t.penBarrel), penHardHit: num(t.penHardHit),
                 penFatigue: teamPenFatigue(t),
                 oaa: num(t.oaa), framing: num(t.framing),
             });
@@ -2668,7 +2860,7 @@ function Terminal({ onHome, pendingGame, onPendingConsumed }) {
                 if (!pname || !teamObj.rotation)
                     return null;
                 const pn = normName(pname);
-                const hit = teamObj.rotation.find((r) => normName(r.name) === pn) || teamObj.rotation.find((r) => pn.includes(normName(r.name).split(" ").pop()));
+                const hit = findRotationArm(teamObj.rotation, pname);
                 if (hit) {
                     setter((prev) => ({ ...prev, starter: hit.name, sp: hit.xwoba || prev.sp, spBf: hit.bf || prev.spBf, spIp: hit.ip || prev.spIp, spEra: hit.era || prev.spEra }));
                     return hit.name;
@@ -2734,7 +2926,7 @@ function Terminal({ onHome, pendingGame, onPendingConsumed }) {
             const t = { ...EMPTY_TEAM, ...withLineupOffense(dbTeam) };
             if (pName && dbTeam.rotation) {
                 const pn = normName(pName);
-                const hit = dbTeam.rotation.find((r) => normName(r.name) === pn) || dbTeam.rotation.find((r) => pn.includes(normName(r.name).split(" ").pop()));
+                const hit = findRotationArm(dbTeam.rotation, pName);
                 if (hit) {
                     t.starter = hit.name;
                     t.sp = hit.xwoba || t.sp;
@@ -2785,7 +2977,7 @@ function Terminal({ onHome, pendingGame, onPendingConsumed }) {
             const t = { ...EMPTY_TEAM, ...withLineupOffense(dbTeam) };
             if (pName && dbTeam.rotation) {
                 const pn = normName(pName);
-                const hit = dbTeam.rotation.find((r) => normName(r.name) === pn) || dbTeam.rotation.find((r) => pn.includes(normName(r.name).split(" ").pop()));
+                const hit = findRotationArm(dbTeam.rotation, pName);
                 if (hit) {
                     t.starter = hit.name;
                     t.sp = hit.xwoba || t.sp;
@@ -3065,6 +3257,57 @@ function MisfiledPitchers({ teams, posMap, onRepair }) {
             armed ? `Confirm ` + "\u2014" + ` move ${hits.length} to the pitching staff` : "Move them to the pitching staff"),
         armed && React.createElement("button", { className: "ing-ghost", onClick: () => setArmed(false) }, "Cancel"));
 }
+function RosterReconcile({ teams, onApply }) {
+    const [plan, setPlan] = useState(null);
+    const [busy, setBusy] = useState(false);
+    const [armed, setArmed] = useState(false);
+    const [msg, setMsg] = useState("");
+    const run = async () => {
+        setBusy(true);
+        setMsg("");
+        setArmed(false);
+        const p2 = await planRosterReconcile(teams);
+        setPlan(p2);
+        setBusy(false);
+        if (p2.err)
+            setMsg(`Couldn't check rosters: ${p2.err}. Nothing was changed.`);
+    };
+    const apply = () => {
+        const { next, moved, flagged, reactivated } = applyRosterReconcile(teams, plan);
+        onApply(next, `Moved ${moved} player${moved === 1 ? "" : "s"}, flagged ${flagged} inactive${reactivated ? `, reactivated ${reactivated}` : ""}. Team offense and bullpen ratings recomputed from the current rosters.`);
+        setArmed(false);
+        setPlan(null);
+    };
+    const moves = plan ? plan.moves.filter((m) => !m.reactivate) : [];
+    const reacts = plan ? plan.moves.filter((m) => m.reactivate) : [];
+    return React.createElement("section", { className: "fresh-repair recon" },
+        React.createElement("div", { className: "rla-head" },
+            React.createElement("span", { className: "bc-title" }, "Roster reconcile \u00B7 trade deadline"),
+            React.createElement("button", { className: "ing-ghost", onClick: run, disabled: busy || !teams.length }, busy ? "Checking\u2026" : plan ? "Re-check" : "Check rosters")),
+        !plan && React.createElement("p", { className: "grade-note" }, "Compares every player in your database against MLB's current rosters and shows who moved. Nothing changes until you confirm. Archived boards and the results log are never touched \u2014 a projection frozen in July used July's roster, and that is the honest record of what the model knew."),
+        msg && React.createElement("p", { className: "ing-hint" }, msg),
+        plan && !plan.err && React.createElement(React.Fragment, null,
+            React.createElement("p", { className: "rla-sum" }, `Checked ${plan.checked} roster entr${plan.checked === 1 ? "y" : "ies"}.`),
+            moves.length === 0 && plan.inactive.length === 0 && reacts.length === 0
+                ? React.createElement("p", { className: "grade-note ok" }, "Every player is already on the right team. Nothing to do.")
+                : React.createElement(React.Fragment, null,
+                    moves.length > 0 && React.createElement("div", { className: "rla-group" },
+                        React.createElement("h5", null, `${moves.length} player${moves.length === 1 ? "" : "s"} on a different team now`),
+                        React.createElement("div", { className: "rla-list" }, moves.slice(0, 12).map((m, i) => React.createElement("div", { key: i, className: "rla-row" },
+                            React.createElement("span", null, m.name),
+                            React.createElement("i", null, `${m.from} \u2192 ${m.to}`)))),
+                        moves.length > 12 && React.createElement("p", { className: "grade-note" }, `+${moves.length - 12} more`)),
+                    plan.inactive.length > 0 && React.createElement("div", { className: "rla-group" },
+                        React.createElement("h5", null, `${plan.inactive.length} not on any MLB roster today`),
+                        React.createElement("p", { className: "grade-note" }, "Optioned, released, or on the injured list. Their stats are kept \u2014 they are only flagged so they stop counting toward a current-roster figure, and they come back automatically if they return."),
+                        React.createElement("p", { className: "dbf-inline" }, plan.inactive.slice(0, 10).map((x) => `${x.name} (${x.team})`).join(" \u00B7 "), plan.inactive.length > 10 ? ` \u00B7 +${plan.inactive.length - 10}` : "")),
+                    reacts.length > 0 && React.createElement("p", { className: "grade-note" }, `${reacts.length} previously-inactive player${reacts.length === 1 ? " is" : "s are"} back on a roster and will be reactivated.`),
+                    plan.missingFromDb > 0 && React.createElement("p", { className: "grade-note" }, `${plan.missingFromDb} player${plan.missingFromDb === 1 ? "" : "s"} on MLB rosters aren't in your database at all. They aren't added here \u2014 a name with no stats can't be projected, so the fix is a stats import rather than a placeholder that looks like data.`),
+                    plan.unknownTeams.length > 0 && React.createElement("p", { className: "grade-note" }, `Skipped players moving to clubs not in your database: ${plan.unknownTeams.join(", ")}.`),
+                    React.createElement("button", { className: "ing-ghost", onClick: () => (armed ? apply() : setArmed(true)) },
+                        armed ? `Confirm \u2014 apply ${moves.length} move${moves.length === 1 ? "" : "s"} and ${plan.inactive.length} flag${plan.inactive.length === 1 ? "" : "s"}` : "Apply these changes"),
+                    armed && React.createElement("button", { className: "ing-ghost", onClick: () => setArmed(false) }, "Cancel"))));
+}
 // Freshness strip: what this team carries and when each piece was last loaded.
 function TeamFreshness({ t }) {
     const held = DATA_CLASSES.filter((c) => teamHasClass(t, c.key));
@@ -3189,6 +3432,7 @@ function Database({ teams, saveTeams, loaded }) {
         .map((g) => ({ g, items: teams.map((t, i) => ({ t, i })).filter(({ t }) => leagueOf(t.name) === g) }))
         .filter(({ items }) => items.length > 0);
     return (React.createElement("main", { className: "ing-db" },
+        teams.length > 0 && React.createElement(RosterReconcile, { teams: teams, onApply: (next, note) => { saveTeams(next); setFixNote(note); } }),
         teams.length > 0 && React.createElement(MisfiledPitchers, { teams: teams, posMap: posMap, onRepair: () => {
             const { next, moved, merged } = repairMisfiledPitchers(teams, posMap);
             saveTeams(next);
@@ -8707,7 +8951,7 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
         let resolved = false;
         if (pitcherName && t.rotation) {
             const pn = normName(pitcherName);
-            const hit = t.rotation.find((r) => normName(r.name) === pn) || t.rotation.find((r) => pn.includes(normName(r.name).split(" ").pop()));
+            const hit = findRotationArm(t.rotation, pitcherName);
             if (hit) {
                 sp = num(hit.xwoba) ?? sp;
                 spBf = num(hit.bf) ?? spBf;
@@ -8717,7 +8961,7 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
             }
         }
         const lu = offenseFor(t, todayKey);
-        return { lu, off: lu.off ?? CFG.LEAGUE_WOBA, xoff: num(t.xoff), pa: lu.pa ?? 600, recent: num(t.recent), recentPA: num(t.recentPA), recentBbk: num(t.recentBbk), sp, spBf, spIp, spEra, pen: num(t.pen) ?? 0.318, penBf: num(t.penBf) ?? 800, penBarrel: num(t.penBarrel), penHardHit: num(t.penHardHit), oaa: num(t.oaa), framing: num(t.framing), penFatigue: teamPenFatigue(t), resolved };
+        return { lu, off: lu.off ?? CFG.LEAGUE_WOBA, xoff: num(t.xoff), pa: lu.pa ?? 600, recent: num(t.recent), recentPA: num(t.recentPA), recentBbk: num(t.recentBbk), sp, spBf, spIp, spEra, pen: penFor(t).pen ?? 0.318, penBf: penFor(t).penBf ?? 800, penBarrel: num(t.penBarrel), penHardHit: num(t.penHardHit), oaa: num(t.oaa), framing: num(t.framing), penFatigue: teamPenFatigue(t), resolved };
     };
     const scan = async () => {
         setBusy("scan");
@@ -8793,7 +9037,16 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
             }
             const a = buildSide(A, g.awayP), h = buildSide(H, g.homeP);
             if (!a.resolved || !h.resolved) {
-                const why = (!g.awayP || !g.homeP) ? "probable starter not posted" : "starter not in your database";
+                // Naming the arm matters: an unnamed "starter not in your database"
+                // on a two-pitcher game sends you checking the one that was fine.
+                const missing = [];
+                if (!a.resolved)
+                    missing.push(g.awayP ? `${g.awayP} (${A.name})` : `${A.name} \u2014 none posted`);
+                if (!h.resolved)
+                    missing.push(g.homeP ? `${g.homeP} (${H.name})` : `${H.name} \u2014 none posted`);
+                const why = (!g.awayP || !g.homeP)
+                    ? `probable starter not posted: ${missing.join(" \u00B7 ")}`
+                    : `not in your database: ${missing.join(" \u00B7 ")}`;
                 out.push({ ...g, status: "skip", code: (!g.awayP || !g.homeP) ? "no_sp_posted" : "no_sp_db", err: why + " — the arm is the biggest input; won't guess it" });
                 continue;
             }
@@ -9364,7 +9617,7 @@ function BetOfTheDay() {
                 let resolved = false;
                 if (pName && t.rotation) {
                     const pn = normName(pName);
-                    const hit = t.rotation.find((r) => normName(r.name) === pn) || t.rotation.find((r) => pn.includes(normName(r.name).split(" ").pop()));
+                    const hit = findRotationArm(t.rotation, pName);
                     if (hit) {
                         sp = num(hit.xwoba) ?? sp;
                         spBf = num(hit.bf) ?? spBf;
@@ -9374,7 +9627,7 @@ function BetOfTheDay() {
                     }
                 }
                 const lu = offenseFor(t, todayKey);
-                return { off: lu.off ?? CFG.LEAGUE_WOBA, xoff: num(t.xoff), pa: lu.pa ?? 600, recent: num(t.recent), recentPA: num(t.recentPA), recentBbk: num(t.recentBbk), sp, spBf, spIp, spEra, pen: num(t.pen) ?? 0.318, penBf: num(t.penBf) ?? 800, penBarrel: num(t.penBarrel), penHardHit: num(t.penHardHit), oaa: num(t.oaa), framing: num(t.framing), penFatigue: teamPenFatigue(t), resolved };
+                return { off: lu.off ?? CFG.LEAGUE_WOBA, xoff: num(t.xoff), pa: lu.pa ?? 600, recent: num(t.recent), recentPA: num(t.recentPA), recentBbk: num(t.recentBbk), sp, spBf, spIp, spEra, pen: penFor(t).pen ?? 0.318, penBf: penFor(t).penBf ?? 800, penBarrel: num(t.penBarrel), penHardHit: num(t.penHardHit), oaa: num(t.oaa), framing: num(t.framing), penFatigue: teamPenFatigue(t), resolved };
             };
             if (g.inPlay || (g.start && new Date(g.start).getTime() <= Date.now()))
                 continue; // underway — not a pregame question
@@ -10869,6 +11122,8 @@ const CSS = `
 .fresh-repair b { color: var(--rust); }
 .fresh-repair button { margin-right: 8px; }
 .fresh-repair.misfiled { margin-bottom: 14px; }
+.fresh-repair.recon { margin-bottom: 14px; border-color: rgba(52,230,168,0.3); background: rgba(52,230,168,0.05); }
+.fresh-repair.recon h5 { color: var(--phos); }
 .misfiled-list { font-size: 11px; color: var(--ink-dim); line-height: 1.5; margin: 0 0 10px; }
 .misfiled-note { font-size: 11px; color: var(--amber); margin: 0 0 10px; line-height: 1.5; }
 .fixnote { color: var(--phos); margin-bottom: 12px; }
