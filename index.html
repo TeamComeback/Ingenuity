@@ -2120,7 +2120,7 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
                 return;
             const num = (v) => (v === "" || v == null ? null : parseFloat(v));
             const side = (t, arm) => ({
-                off: num(t.off) ?? CFG.LEAGUE_WOBA, xoff: num(t.xoff), pa: num(t.pa) ?? 600,
+                off: offenseFor(t, etDayKey()).off ?? CFG.LEAGUE_WOBA, xoff: num(t.xoff), pa: offenseFor(t, etDayKey()).pa ?? 600,
                 recent: num(t.recent), recentPA: num(t.recentPA), recentBbk: num(t.recentBbk),
                 sp: num(arm.xwoba) ?? 0.32, spBf: num(arm.bf) ?? 200, spIp: num(arm.ip) ?? 5, spEra: num(arm.era), spHand: (arm.hand === "L" || arm.hand === "R") ? arm.hand : null,
                 pen: num(t.pen) ?? 0.318, penBf: num(t.penBf) ?? 800, penBarrel: num(t.penBarrel), penHardHit: num(t.penHardHit),
@@ -2698,11 +2698,21 @@ function Terminal({ onHome, pendingGame, onPendingConsumed }) {
         })();
     }, [away.name, home.name]);
     const num = (v) => (v === "" || v == null ? null : parseFloat(v));
+    // A team loaded into the Terminal must carry today's lineup offense, or the
+    // form shows season numbers and the simulation silently ignores the lineup.
+    // Before offense was split into season/lineup fields, `off` WAS the lineup
+    // number, so this restores the old behaviour on the new storage.
+    const withLineupOffense = (t) => {
+        const lu = offenseFor(t, etDayKey());
+        return lu.source === "lineup" && lu.off != null
+            ? { ...t, off: String(lu.off), pa: lu.pa != null ? String(lu.pa) : t.pa, offSource: "lineup" }
+            : { ...t, offSource: lu.source };
+    };
     const loadTeamInto = (slot, teamName) => {
         const t = teams.find((x) => x.name === teamName);
         if (!t)
             return;
-        (slot === "away" ? setAway : setHome)({ ...EMPTY_TEAM, ...t });
+        (slot === "away" ? setAway : setHome)({ ...EMPTY_TEAM, ...withLineupOffense(t) });
     };
     // Auto-fill the whole projection from a pasted game line, e.g.
     // "Phillies (Zack Wheeler) @ Tigers (Tarik Skubal) | 7.5 | +102 | -122".
@@ -2721,7 +2731,7 @@ function Terminal({ onHome, pendingGame, onPendingConsumed }) {
             return;
         }
         const build = (dbTeam, pName) => {
-            const t = { ...EMPTY_TEAM, ...dbTeam };
+            const t = { ...EMPTY_TEAM, ...withLineupOffense(dbTeam) };
             if (pName && dbTeam.rotation) {
                 const pn = normName(pName);
                 const hit = dbTeam.rotation.find((r) => normName(r.name) === pn) || dbTeam.rotation.find((r) => pn.includes(normName(r.name).split(" ").pop()));
@@ -2772,7 +2782,7 @@ function Terminal({ onHome, pendingGame, onPendingConsumed }) {
         if (!A || !H)
             return { ok: false, miss: !A ? g.away : g.home };
         const build = (dbTeam, pName) => {
-            const t = { ...EMPTY_TEAM, ...dbTeam };
+            const t = { ...EMPTY_TEAM, ...withLineupOffense(dbTeam) };
             if (pName && dbTeam.rotation) {
                 const pn = normName(pName);
                 const hit = dbTeam.rotation.find((r) => normName(r.name) === pn) || dbTeam.rotation.find((r) => pn.includes(normName(r.name).split(" ").pop()));
@@ -8128,6 +8138,10 @@ function SlateHub({ onOpenInTerminal }) {
                 const old = prev.find((x) => normName(x.away).includes(normName(matchTeamDb(away, teams)?.name || away)) || normName(away).includes(normName(x.away)));
                 return {
                     away, home,
+                    // gamePk is what every box-score lookup keys on. Without it the
+                    // lineup step has no way to reach a game and skips the whole board.
+                    gamePk: g.gamePk ?? old?.gamePk ?? null,
+                    start: g.gameDate || old?.start || null,
                     awayP: g.teams.away.probablePitcher?.fullName || "",
                     homeP: g.teams.home.probablePitcher?.fullName || "",
                     line: old?.line ?? "", over: old?.over ?? "", under: old?.under ?? "",
@@ -9359,7 +9373,8 @@ function BetOfTheDay() {
                         resolved = num(hit.xwoba) != null;
                     }
                 }
-                return { off: num(t.off) ?? CFG.LEAGUE_WOBA, xoff: num(t.xoff), pa: num(t.pa) ?? 600, recent: num(t.recent), recentPA: num(t.recentPA), recentBbk: num(t.recentBbk), sp, spBf, spIp, spEra, pen: num(t.pen) ?? 0.318, penBf: num(t.penBf) ?? 800, penBarrel: num(t.penBarrel), penHardHit: num(t.penHardHit), oaa: num(t.oaa), framing: num(t.framing), penFatigue: teamPenFatigue(t), resolved };
+                const lu = offenseFor(t, todayKey);
+                return { off: lu.off ?? CFG.LEAGUE_WOBA, xoff: num(t.xoff), pa: lu.pa ?? 600, recent: num(t.recent), recentPA: num(t.recentPA), recentBbk: num(t.recentBbk), sp, spBf, spIp, spEra, pen: num(t.pen) ?? 0.318, penBf: num(t.penBf) ?? 800, penBarrel: num(t.penBarrel), penHardHit: num(t.penHardHit), oaa: num(t.oaa), framing: num(t.framing), penFatigue: teamPenFatigue(t), resolved };
             };
             if (g.inPlay || (g.start && new Date(g.start).getTime() <= Date.now()))
                 continue; // underway — not a pregame question
