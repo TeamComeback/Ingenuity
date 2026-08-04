@@ -1249,7 +1249,7 @@ function isReliever(p) {
 // Compare the database against MLB's current rosters. Reports only; the caller
 // decides whether to apply.
 async function planRosterReconcile(teams) {
-    const out = { moves: [], inactive: [], unknownTeams: [], missingFromDb: 0, checked: 0, err: null };
+    const out = { moves: [], inactive: [], unknown: [], unknownTeams: [], missingFromDb: 0, checked: 0, feedSize: 0, err: null };
     try {
         const r = await mlbFetch(`https://statsapi.mlb.com/api/v1/sports/1/players?season=${new Date().getFullYear()}`);
         if (!r.ok)
@@ -1258,6 +1258,7 @@ async function planRosterReconcile(teams) {
         const people = (j.people || []).filter((p) => p.fullName);
         if (!people.length)
             throw new Error("roster feed came back empty");
+        out.feedSize = people.length;
         const byName = new Map();
         const byId = new Map();
         for (const p of people) {
@@ -1271,17 +1272,32 @@ async function planRosterReconcile(teams) {
         const dbTeamNames = new Set(teams.map((t) => normName(t.name)));
         const seen = new Set();
         for (const t of teams) {
+            const countedHere = new Set();
             for (const bucket of ["players", "rotation"]) {
                 for (const pl of (t[bucket] || [])) {
                     if (!pl || !pl.name)
                         continue;
-                    out.checked++;
                     const key = normName(pl.name);
+                    // The same name can sit in both buckets (that is the misfiled
+                    // pitcher case). Counting it twice inflates every total.
+                    if (countedHere.has(key))
+                        continue;
+                    countedHere.add(key);
+                    out.checked++;
                     seen.add(key);
                     const rec = (pl.mlbId && byId.get(String(pl.mlbId))) || byName.get(key);
-                    if (!rec || !rec.team) {
-                        // Not on any MLB roster today. Kept, with their stats, but
-                        // flagged so they stop counting toward a current-roster figure.
+                    if (!rec) {
+                        // Absent from the feed entirely. This is NOT evidence of a
+                        // roster change — the feed only covers players who appeared
+                        // in the majors this season, so minor leaguers and anyone
+                        // imported from a broader stats export are simply unknown
+                        // to it. Counted, never acted on.
+                        out.unknown.push({ team: t.name, bucket, name: pl.name });
+                        continue;
+                    }
+                    if (!rec.team) {
+                        // In the feed with no current club: released or a free agent.
+                        // That IS a positive statement, so it can be flagged.
                         if (!pl.inactive)
                             out.inactive.push({ team: t.name, bucket, name: pl.name });
                         continue;
@@ -1310,9 +1326,11 @@ async function planRosterReconcile(teams) {
         // A truncated or partial feed would mark most of the database inactive and
         // then offer to apply it. Real churn on any single day is a handful of
         // players; a quarter of the league is a bad response, not a bad roster.
-        if (out.checked > 0 && out.inactive.length / out.checked > 0.25) {
-            out.err = `MLB listed only ${people.length} players and ${out.inactive.length} of your ${out.checked} roster entries came back unmatched (${Math.round(out.inactive.length / out.checked * 100)}%). That looks like an incomplete feed rather than that many players changing status, so nothing is being proposed. Try again in a few minutes.`;
-            out.moves = [];
+        // Only the inactive half is gated. A move is a positive match — MLB says
+        // this player is on that club now — and stays trustworthy even when many
+        // other names are unrecognised.
+        if (out.checked > 0 && out.inactive.length / out.checked > 0.15) {
+            out.inactiveHeld = out.inactive.length;
             out.inactive = [];
         }
     }
@@ -3287,9 +3305,18 @@ function RosterReconcile({ teams, onApply }) {
         !plan && React.createElement("p", { className: "grade-note" }, "Compares every player in your database against MLB's current rosters and shows who moved. Nothing changes until you confirm. Archived boards and the results log are never touched \u2014 a projection frozen in July used July's roster, and that is the honest record of what the model knew."),
         msg && React.createElement("p", { className: "ing-hint" }, msg),
         plan && !plan.err && React.createElement(React.Fragment, null,
-            React.createElement("p", { className: "rla-sum" }, `Checked ${plan.checked} roster entr${plan.checked === 1 ? "y" : "ies"}.`),
+            React.createElement("p", { className: "rla-sum" },
+                `Checked ${plan.checked} player${plan.checked === 1 ? "" : "s"} against MLB's ${plan.feedSize}-player feed. `,
+                React.createElement("b", null, `${plan.checked - plan.unknown.length - plan.inactive.length - (plan.inactiveHeld || 0)} matched a current club`),
+                plan.unknown.length ? `, ${plan.unknown.length} aren't in the feed at all` : "",
+                "."),
+            plan.unknown.length > 0 && React.createElement("div", { className: "rla-group" },
+                React.createElement("h5", null, `${plan.unknown.length} not in MLB's feed`),
+                React.createElement("p", { className: "grade-note" }, "This feed only covers players who have appeared in the majors this season, so minor leaguers and anyone picked up from a broader stats export are simply unknown to it. That is not evidence of a roster change, so these are left completely alone \u2014 listed here only so the numbers add up."),
+                React.createElement("p", { className: "dbf-inline" }, plan.unknown.slice(0, 8).map((x) => `${x.name} (${x.team})`).join(" \u00B7 "), plan.unknown.length > 8 ? ` \u00B7 +${plan.unknown.length - 8}` : "")),
+            plan.inactiveHeld > 0 && React.createElement("p", { className: "grade-note" }, `${plan.inactiveHeld} player${plan.inactiveHeld === 1 ? " is" : "s are"} in the feed with no current club, which is more than expected. Rather than flag that many at once, they are being left alone \u2014 the moves below are unaffected, since each one is a positive match saying where that player is now.`),
             moves.length === 0 && plan.inactive.length === 0 && reacts.length === 0
-                ? React.createElement("p", { className: "grade-note ok" }, "Every player is already on the right team. Nothing to do.")
+                ? React.createElement("p", { className: "grade-note ok" }, "Every player MLB recognises is already on the right team. Nothing to move.")
                 : React.createElement(React.Fragment, null,
                     moves.length > 0 && React.createElement("div", { className: "rla-group" },
                         React.createElement("h5", null, `${moves.length} player${moves.length === 1 ? "" : "s"} on a different team now`),
