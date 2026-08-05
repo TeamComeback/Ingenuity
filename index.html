@@ -1248,26 +1248,86 @@ function isReliever(p) {
 }
 // Compare the database against MLB's current rosters. Reports only; the caller
 // decides whether to apply.
+// Full-name key that KEEPS suffixes. normName strips Jr/Sr/II/III/IV, which
+// collapses "Luis Garcia Jr." and "Luis Garcia" onto one key and lets one
+// player inherit the other's team. Suffixes are the only thing distinguishing
+// them, so roster matching must not throw them away.
+function normFull(x) {
+    return (x || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase()
+        .replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+}
+// Pull the 40-man roster for all 30 clubs. This is MLB's own roster page: it is
+// authoritative, carries player ids, and runs team -> players rather than
+// guessing each player's team from a bulk feed whose currentTeam field is
+// mostly empty. IL players stay on their club, which is correct.
+async function fetchAllRosters() {
+    const season = new Date().getFullYear();
+    const tr = await mlbFetch(`https://statsapi.mlb.com/api/v1/teams?sportId=1&season=${season}&activeStatus=Yes`);
+    if (!tr.ok)
+        throw new Error(`team list request failed (${tr.status})`);
+    const teamList = ((await tr.json()).teams || []).filter((t) => t.id);
+    if (teamList.length < 25)
+        throw new Error(`MLB returned only ${teamList.length} clubs; expected 30`);
+    const people = [];
+    const failed = [];
+    for (let i = 0; i < teamList.length; i += 5) {
+        const chunk = teamList.slice(i, i + 5);
+        const results = await Promise.all(chunk.map(async (tm) => {
+            try {
+                const r = await mlbFetch(`https://statsapi.mlb.com/api/v1/teams/${tm.id}/roster/40Man`);
+                if (!r.ok)
+                    return { tm, err: true };
+                return { tm, roster: (await r.json()).roster || [] };
+            }
+            catch (e) {
+                return { tm, err: true };
+            }
+        }));
+        for (const { tm, roster, err } of results) {
+            if (err || !roster) {
+                failed.push(tm.name);
+                continue;
+            }
+            const team = resolveTeamName(tm.name) || tm.name;
+            for (const e of roster) {
+                const pr = e.person || {};
+                if (!pr.fullName)
+                    continue;
+                const ps = e.position || {};
+                people.push({ id: pr.id != null ? String(pr.id) : null, name: pr.fullName, team,
+                    pitcher: ps.abbreviation === "P" || ps.code === "1" || ps.type === "Pitcher" });
+            }
+        }
+    }
+    return { people, failed, clubs: teamList.length };
+}
 async function planRosterReconcile(teams) {
-    const out = { moves: [], inactive: [], unknown: [], unknownTeams: [], missingFromDb: 0, checked: 0, feedSize: 0, err: null };
+    const out = { moves: [], inactive: [], unknown: [], ambiguous: [], idStamps: [],
+        unknownTeams: [], missingFromDb: 0, checked: 0, feedSize: 0, failedClubs: [], err: null };
     try {
-        const r = await mlbFetch(`https://statsapi.mlb.com/api/v1/sports/1/players?season=${new Date().getFullYear()}`);
-        if (!r.ok)
-            throw new Error("MLB roster feed unavailable");
-        const j = await r.json();
-        const people = (j.people || []).filter((p) => p.fullName);
-        if (!people.length)
-            throw new Error("roster feed came back empty");
+        const { people, failed, clubs } = await fetchAllRosters();
         out.feedSize = people.length;
-        const byName = new Map();
+        out.failedClubs = failed;
+        // A partial sweep would read as mass departures. Refuse rather than
+        // propose moves built on clubs that never answered.
+        if (failed.length > 2)
+            throw new Error(`${failed.length} clubs didn't return a roster (${failed.slice(0, 3).join(", ")}...). Nothing is proposed from a partial sweep.`);
+        if (people.length < 800)
+            throw new Error(`only ${people.length} players came back across ${clubs} clubs, well short of the ~1200 on 40-man rosters. Treating that as an incomplete sweep.`);
         const byId = new Map();
-        for (const p of people) {
-            const team = p.currentTeam?.name ? (resolveTeamName(p.currentTeam.name) || p.currentTeam.name) : null;
-            const rec = { id: p.id != null ? String(p.id) : null, name: p.fullName, team,
-                pitcher: !!(p.primaryPosition && (p.primaryPosition.abbreviation === "P" || p.primaryPosition.code === "1" || p.primaryPosition.type === "Pitcher")) };
-            byName.set(normName(p.fullName), rec);
+        const byFull = new Map();
+        const byLoose = new Map();
+        for (const rec of people) {
             if (rec.id)
                 byId.set(rec.id, rec);
+            const f = normFull(rec.name);
+            if (!byFull.has(f))
+                byFull.set(f, []);
+            byFull.get(f).push(rec);
+            const l = normName(rec.name);
+            if (!byLoose.has(l))
+                byLoose.set(l, []);
+            byLoose.get(l).push(rec);
         }
         const dbTeamNames = new Set(teams.map((t) => normName(t.name)));
         const seen = new Set();
@@ -1277,31 +1337,46 @@ async function planRosterReconcile(teams) {
                 for (const pl of (t[bucket] || [])) {
                     if (!pl || !pl.name)
                         continue;
-                    const key = normName(pl.name);
-                    // The same name can sit in both buckets (that is the misfiled
-                    // pitcher case). Counting it twice inflates every total.
-                    if (countedHere.has(key))
+                    const loose = normName(pl.name);
+                    if (countedHere.has(loose))
                         continue;
-                    countedHere.add(key);
+                    countedHere.add(loose);
                     out.checked++;
-                    seen.add(key);
-                    const rec = (pl.mlbId && byId.get(String(pl.mlbId))) || byName.get(key);
+                    seen.add(loose);
+                    // ID first — exact and immune to spelling. Then the full name
+                    // WITH suffix. The loose key is used only when it resolves to
+                    // exactly one player, so a collision can never silently pick one.
+                    let rec = null, ambiguous = false;
+                    if (pl.mlbId && byId.has(String(pl.mlbId)))
+                        rec = byId.get(String(pl.mlbId));
                     if (!rec) {
-                        // Absent from the feed entirely. This is NOT evidence of a
-                        // roster change — the feed only covers players who appeared
-                        // in the majors this season, so minor leaguers and anyone
-                        // imported from a broader stats export are simply unknown
-                        // to it. Counted, never acted on.
+                        const exact = byFull.get(normFull(pl.name)) || [];
+                        if (exact.length === 1)
+                            rec = exact[0];
+                        else if (exact.length > 1)
+                            ambiguous = true;
+                    }
+                    if (!rec && !ambiguous) {
+                        const loosely = byLoose.get(loose) || [];
+                        if (loosely.length === 1)
+                            rec = loosely[0];
+                        else if (loosely.length > 1)
+                            ambiguous = true;
+                    }
+                    if (ambiguous) {
+                        const cands = (byFull.get(normFull(pl.name)) || byLoose.get(loose) || []);
+                        out.ambiguous.push({ team: t.name, bucket, name: pl.name,
+                            options: cands.map((c) => ({ id: c.id, name: c.name, team: c.team })) });
+                        continue;
+                    }
+                    if (!rec) {
                         out.unknown.push({ team: t.name, bucket, name: pl.name });
                         continue;
                     }
-                    if (!rec.team) {
-                        // In the feed with no current club: released or a free agent.
-                        // That IS a positive statement, so it can be flagged.
-                        if (!pl.inactive)
-                            out.inactive.push({ team: t.name, bucket, name: pl.name });
-                        continue;
-                    }
+                    // Record the id so the next run matches exactly, whether or not
+                    // this player is moving.
+                    if (rec.id && String(pl.mlbId || "") !== rec.id)
+                        out.idStamps.push({ team: t.name, bucket, name: pl.name, id: rec.id });
                     if (normName(rec.team) === normName(t.name)) {
                         if (pl.inactive)
                             out.moves.push({ name: pl.name, from: t.name, to: t.name, bucket, id: rec.id, reactivate: true });
@@ -1316,23 +1391,11 @@ async function planRosterReconcile(teams) {
                 }
             }
         }
-        // Players on an MLB roster this app has never heard of. Reported, not
-        // added: a name with no stats can't be projected, so the fix is a stats
-        // import, not a placeholder row that looks like data.
-        for (const [k, rec] of byName)
-            if (rec.team && !seen.has(k) && dbTeamNames.has(normName(rec.team)))
+        // On a 40-man roster today but absent from the database entirely.
+        for (const [k, list] of byLoose)
+            if (!seen.has(k) && list.some((r) => dbTeamNames.has(normName(r.team))))
                 out.missingFromDb++;
         out.unknownTeams = [...new Set(out.unknownTeams)];
-        // A truncated or partial feed would mark most of the database inactive and
-        // then offer to apply it. Real churn on any single day is a handful of
-        // players; a quarter of the league is a bad response, not a bad roster.
-        // Only the inactive half is gated. A move is a positive match — MLB says
-        // this player is on that club now — and stays trustworthy even when many
-        // other names are unrecognised.
-        if (out.checked > 0 && out.inactive.length / out.checked > 0.15) {
-            out.inactiveHeld = out.inactive.length;
-            out.inactive = [];
-        }
     }
     catch (e) {
         out.err = String(e && e.message ? e.message : e);
@@ -1344,6 +1407,21 @@ function applyRosterReconcile(teams, plan) {
     const next = teams.map((t) => ({ ...t, players: [...(t.players || [])], rotation: [...(t.rotation || [])] }));
     const at = new Map(next.map((t, i) => [normName(t.name), i]));
     let moved = 0, flagged = 0, reactivated = 0;
+    // Stamp MLB ids onto every player we positively identified, moving or not.
+    // After one run, matching is by id and the name-collision class of bug is
+    // gone for good.
+    let stamped = 0;
+    for (const st of (plan.idStamps || [])) {
+        const i = at.get(normName(st.team));
+        if (i == null)
+            continue;
+        const arr = next[i][st.bucket];
+        const k = arr.findIndex((pp) => normName(pp.name) === normName(st.name));
+        if (k >= 0 && arr[k].mlbId !== st.id) {
+            arr[k] = { ...arr[k], mlbId: st.id };
+            stamped++;
+        }
+    }
     for (const mv of plan.moves) {
         const fi = at.get(normName(mv.from));
         if (fi == null)
@@ -1383,7 +1461,7 @@ function applyRosterReconcile(teams, plan) {
         }
     }
     const stamp = etDayKey();
-    return { next: next.map((t) => ({ ...recomputeFromRoster(t), rosterAsOf: stamp })), moved, flagged, reactivated };
+    return { next: next.map((t) => ({ ...recomputeFromRoster(t), rosterAsOf: stamp })), moved, flagged, reactivated, stamped };
 }
 // Team offense and bullpen from who is actually on the club now. Season imports
 // are backward-looking by construction: a club that sold its best bat still
@@ -3291,8 +3369,8 @@ function RosterReconcile({ teams, onApply }) {
             setMsg(`Couldn't check rosters: ${p2.err}. Nothing was changed.`);
     };
     const apply = () => {
-        const { next, moved, flagged, reactivated } = applyRosterReconcile(teams, plan);
-        onApply(next, `Moved ${moved} player${moved === 1 ? "" : "s"}, flagged ${flagged} inactive${reactivated ? `, reactivated ${reactivated}` : ""}. Team offense and bullpen ratings recomputed from the current rosters.`);
+        const { next, moved, flagged, reactivated, stamped } = applyRosterReconcile(teams, plan);
+        onApply(next, `Moved ${moved} player${moved === 1 ? "" : "s"}, flagged ${flagged} inactive${reactivated ? `, reactivated ${reactivated}` : ""}, and recorded MLB ids on ${stamped} player${stamped === 1 ? "" : "s"} so future checks match exactly. Team offense and bullpen ratings recomputed from the current rosters.`);
         setArmed(false);
         setPlan(null);
     };
@@ -3307,16 +3385,24 @@ function RosterReconcile({ teams, onApply }) {
         plan && !plan.err && React.createElement(React.Fragment, null,
             React.createElement("p", { className: "rla-sum" },
                 `Checked ${plan.checked} player${plan.checked === 1 ? "" : "s"} against MLB's ${plan.feedSize}-player feed. `,
-                React.createElement("b", null, `${plan.checked - plan.unknown.length - plan.inactive.length - (plan.inactiveHeld || 0)} matched a current club`),
-                plan.unknown.length ? `, ${plan.unknown.length} aren't in the feed at all` : "",
+                React.createElement("b", null, `${plan.checked - plan.unknown.length - plan.ambiguous.length} matched a club by ${plan.idStamps.length ? "name (ids now recorded)" : "id"}`),
+                plan.unknown.length ? `, ${plan.unknown.length} aren't on any 40-man` : "",
+                plan.ambiguous.length ? `, ${plan.ambiguous.length} ambiguous` : "",
                 "."),
+            plan.failedClubs.length > 0 && React.createElement("p", { className: "grade-note" }, `Note: ${plan.failedClubs.join(", ")} didn't return a roster, so their players were not checked.`),
+            plan.ambiguous.length > 0 && React.createElement("div", { className: "rla-group" },
+                React.createElement("h5", null, `${plan.ambiguous.length} ambiguous name${plan.ambiguous.length === 1 ? "" : "s"} \u2014 not moved`),
+                React.createElement("p", { className: "grade-note" }, "More than one player on a 40-man roster shares this name, so there is no safe way to tell which one your record refers to. Nothing is moved. Open the team in the editor and correct the name to match MLB exactly (including any Jr./Sr.), then re-check \u2014 the id gets recorded and it will never be ambiguous again."),
+                React.createElement("div", { className: "rla-list" }, plan.ambiguous.slice(0, 8).map((a, i) => React.createElement("div", { key: i, className: "rla-row bad" },
+                    React.createElement("span", null, `${a.name} (${a.team})`),
+                    React.createElement("i", null, a.options.map((o2) => `${o2.name} \u2013 ${o2.team}`).join(" or ")))))),
             plan.unknown.length > 0 && React.createElement("div", { className: "rla-group" },
-                React.createElement("h5", null, `${plan.unknown.length} not in MLB's feed`),
-                React.createElement("p", { className: "grade-note" }, "This feed only covers players who have appeared in the majors this season, so minor leaguers and anyone picked up from a broader stats export are simply unknown to it. That is not evidence of a roster change, so these are left completely alone \u2014 listed here only so the numbers add up."),
+                React.createElement("h5", null, `${plan.unknown.length} not on any 40-man roster`),
+                React.createElement("p", { className: "grade-note" }, "Checked against all 30 clubs' 40-man rosters, so these are minor leaguers, released players, or names picked up from a broader stats export. They are left completely alone \u2014 their stats stay and they keep counting as they did before."),
                 React.createElement("p", { className: "dbf-inline" }, plan.unknown.slice(0, 8).map((x) => `${x.name} (${x.team})`).join(" \u00B7 "), plan.unknown.length > 8 ? ` \u00B7 +${plan.unknown.length - 8}` : "")),
-            plan.inactiveHeld > 0 && React.createElement("p", { className: "grade-note" }, `${plan.inactiveHeld} player${plan.inactiveHeld === 1 ? " is" : "s are"} in the feed with no current club, which is more than expected. Rather than flag that many at once, they are being left alone \u2014 the moves below are unaffected, since each one is a positive match saying where that player is now.`),
-            moves.length === 0 && plan.inactive.length === 0 && reacts.length === 0
-                ? React.createElement("p", { className: "grade-note ok" }, "Every player MLB recognises is already on the right team. Nothing to move.")
+
+            moves.length === 0 && plan.inactive.length === 0 && reacts.length === 0 && plan.idStamps.length === 0
+                ? React.createElement("p", { className: "grade-note ok" }, "Every player on a 40-man is already on the right team, and all ids are recorded. Nothing to do.")
                 : React.createElement(React.Fragment, null,
                     moves.length > 0 && React.createElement("div", { className: "rla-group" },
                         React.createElement("h5", null, `${moves.length} player${moves.length === 1 ? "" : "s"} on a different team now`),
@@ -3332,7 +3418,7 @@ function RosterReconcile({ teams, onApply }) {
                     plan.missingFromDb > 0 && React.createElement("p", { className: "grade-note" }, `${plan.missingFromDb} player${plan.missingFromDb === 1 ? "" : "s"} on MLB rosters aren't in your database at all. They aren't added here \u2014 a name with no stats can't be projected, so the fix is a stats import rather than a placeholder that looks like data.`),
                     plan.unknownTeams.length > 0 && React.createElement("p", { className: "grade-note" }, `Skipped players moving to clubs not in your database: ${plan.unknownTeams.join(", ")}.`),
                     React.createElement("button", { className: "ing-ghost", onClick: () => (armed ? apply() : setArmed(true)) },
-                        armed ? `Confirm \u2014 apply ${moves.length} move${moves.length === 1 ? "" : "s"} and ${plan.inactive.length} flag${plan.inactive.length === 1 ? "" : "s"}` : "Apply these changes"),
+                        armed ? `Confirm \u2014 ${moves.length} move${moves.length === 1 ? "" : "s"}, ${plan.inactive.length} flag${plan.inactive.length === 1 ? "" : "s"}, ${plan.idStamps.length} id${plan.idStamps.length === 1 ? "" : "s"}` : "Apply these changes"),
                     armed && React.createElement("button", { className: "ing-ghost", onClick: () => setArmed(false) }, "Cancel"))));
 }
 // Freshness strip: what this team carries and when each piece was last loaded.
