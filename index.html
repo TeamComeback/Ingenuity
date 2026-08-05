@@ -955,7 +955,24 @@ const DESK = {
     // model claiming 25% against a market this liquid is not finding value, it is
     // reporting a broken input — a stale line, the wrong starter, a bad import.
     // Every large "edge" this app has produced so far has been exactly that.
-    MAX_EV: 0.15,
+    // The implausibility test is in RUNS, not in EV. Expressed as EV it was
+    // catching ordinary 1.5-run disagreements, and it also has to stay fixed as
+    // the model earns weight or a better-proven model would get more of its bets
+    // rejected. The natural yardstick is the model's own typical miss: if it
+    // disagrees with the market by more than it is usually wrong by, the
+    // disagreement is not insight, it is a broken input.
+    MAX_EDGE_RUNS: 3.5,
+    MAX_EV: 0.12, // loose backstop on the blended number actually being bet
+    // The model does not yet get to outvote the market. Its weight starts low and
+    // grows only as graded bets accumulate — never past 0.70, because a market
+    // this liquid is a strong estimate and this engine has not beaten it yet.
+    W_FLOOR: 0.25, W_GAIN: 0.45, W_HALF: 150,
+    // Simulations capture game-to-game variance but not INPUT error: a wrong
+    // lineup, a stale pen state, a line that moved. True uncertainty is wider
+    // than simulated, which pushes every reported probability too far from 50%.
+    SIGMA_INFLATE: 1.15,
+    FLAT_UNTIL: 50, // graded bets before Kelly sizing is allowed to vary the stake
+    UNPROVEN_UNITS: 1,
     MIN_EDGE: 1.0, // runs between model and line
     KELLY: 0.25, // quarter Kelly; full Kelly on a model this young would be reckless
     MAX_UNITS: 2,
@@ -963,6 +980,28 @@ const DESK = {
     MAX_PER_DAY: 3,
 };
 // Break-even probability implied by an American price, vig included.
+// Normal CDF, Abramowitz-Stegun. Used to re-derive a probability from a widened
+// spread rather than trusting the raw simulation count.
+function normCdf(z) {
+    const t = 1 / (1 + 0.2316419 * Math.abs(z));
+    const d = 0.3989423 * Math.exp(-z * z / 2);
+    const p = d * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))));
+    return z > 0 ? 1 - p : p;
+}
+// Strip the vig: a two-way market's implied probabilities sum above 1, and the
+// fair anchor is each side's share of that total.
+function noVig(overAm, underAm) {
+    const a = impliedProb(overAm), b = impliedProb(underAm);
+    if (a == null || b == null || a + b <= 0)
+        return null;
+    return { over: a / (a + b), under: b / (a + b) };
+}
+// How much the model is allowed to disagree with the market, given how much it
+// has proven. Grows with graded sample, capped well short of full confidence.
+function deskModelWeight(gradedN) {
+    const n = Math.max(0, gradedN || 0);
+    return Math.min(0.70, DESK.W_FLOOR + DESK.W_GAIN * (n / (n + DESK.W_HALF)));
+}
 function impliedProb(am) {
     const n = parseFloat(am);
     if (!Number.isFinite(n) || (n > -100 && n < 100))
@@ -990,8 +1029,10 @@ function kellyUnits(p, am) {
 }
 // Evaluate one already-scanned board. Uses the projection frozen at scan time,
 // so the desk can never quietly re-price a game after seeing more.
-function deskEvaluate(games, day) {
+function deskEvaluate(games, day, gradedN) {
     const cands = [], skipped = [];
+    const w = deskModelWeight(gradedN);
+    const flat = (gradedN || 0) < DESK.FLAT_UNTIL;
     for (const g of (games || [])) {
         const pr = g.proj;
         const line = parseFloat(g.line);
@@ -1012,13 +1053,26 @@ function deskEvaluate(games, day) {
             continue;
         }
         const snap = pr.snap || null;
+        // Re-derive the model's probability from a WIDENED spread where a saved
+        // range exists. The raw simulation count assumes the inputs were right.
+        let pOverAdj = pOver;
+        if (snap && Number.isFinite(snap.p10) && Number.isFinite(snap.p90) && snap.p90 > snap.p10) {
+            const sigma = ((snap.p90 - snap.p10) / 2.563) * DESK.SIGMA_INFLATE;
+            if (sigma > 0)
+                pOverAdj = 1 - normCdf((line - pr.model) / sigma);
+        }
+        const fair = noVig(g.over, g.under);
         for (const side of ["Over", "Under"]) {
             const price = side === "Over" ? g.over : g.under;
             if (price === "" || price == null) {
                 skipped.push({ label, why: `no ${side.toLowerCase()} price` });
                 continue;
             }
-            const p = side === "Over" ? pOver : 1 - pOver;
+            const pRaw = side === "Over" ? pOverAdj : 1 - pOverAdj;
+            // Shrink toward the market. An unproven model does not get to outvote
+            // a liquid line; it gets a minority vote that grows as it earns one.
+            const pMkt = fair ? (side === "Over" ? fair.over : fair.under) : null;
+            const p = pMkt != null ? w * pRaw + (1 - w) * pMkt : pRaw;
             const ev = evPerDollar(p, price);
             if (ev == null) {
                 skipped.push({ label, why: `unreadable ${side.toLowerCase()} price` });
@@ -1033,12 +1087,17 @@ function deskEvaluate(games, day) {
             if (snap && Number.isFinite(snap.p10) && Number.isFinite(snap.p90))
                 tail = side === "Over" ? line <= snap.p10 + (snap.p90 - snap.p10) * 0.35
                     : line >= snap.p10 + (snap.p90 - snap.p10) * 0.65;
-            const units = kellyUnits(p, price);
-            const tooGood = ev > DESK.MAX_EV;
+            // Kelly needs a probability you trust. Until the desk has a record,
+            // a flat stake is the honest expression of not knowing.
+            const units = flat ? (evPerDollar(p, price) > 0 ? DESK.UNPROVEN_UNITS : 0) : kellyUnits(p, price);
+            const rawEv = evPerDollar(pRaw, price);
+            const tooGood = Math.abs(edge) > DESK.MAX_EDGE_RUNS;
             cands.push({ day, label, away: g.away, home: g.home, side, line, price,
-                model: pr.model, p: +p.toFixed(4), ev: +ev.toFixed(4), edge: +edge.toFixed(2),
+                model: pr.model, p: +p.toFixed(4), pRaw: +pRaw.toFixed(4), pMkt: pMkt != null ? +pMkt.toFixed(4) : null,
+                w: +w.toFixed(2), flat, ev: +ev.toFixed(4), edge: +edge.toFixed(2),
                 units, tail, snap: !!snap, tooGood,
-                pass: !(dirOk && ev >= DESK.MIN_EV && ev <= DESK.MAX_EV && Math.abs(edge) >= DESK.MIN_EDGE && units > 0 && tail !== false) });
+                rawEv: rawEv != null ? +rawEv.toFixed(4) : null,
+                pass: !(dirOk && ev >= DESK.MIN_EV && ev <= DESK.MAX_EV && !tooGood && Math.abs(edge) >= DESK.MIN_EDGE && units > 0 && tail !== false) });
         }
     }
     const live = cands.filter((c) => !c.pass).sort((a, b) => b.ev - a.ev);
@@ -1062,6 +1121,10 @@ function deskEvaluate(games, day) {
 // re-picked, or the desk could quietly re-choose after seeing results.
 async function deskCommit(day, taken) {
     const log = await store.get(DESK_KEY, {});
+    // The head-to-head starts when the desk starts. Bets you logged before it
+    // existed are not part of this comparison.
+    if (!(await store.get("ingenuity:desk:since", null)))
+        await store.set("ingenuity:desk:since", day);
     if (Object.values(log).some((b) => b.day === day))
         return { log, added: 0, already: true };
     let added = 0;
@@ -8358,15 +8421,21 @@ function DeskTab() {
     const [busy, setBusy] = useState("");
     const [msg, setMsg] = useState("");
     const [mine, setMine] = useState(null);
+    const [start, setStart] = useState(null);
     const today = etDayKey();
     const load = async () => {
         const l = await store.get(DESK_KEY, {});
         setLog(l || {});
+        const rec0 = deskRecord(l || {});
         const arch = await store.get("ingenuity:slate:archive", {});
         const board = arch[today];
-        setEv(board ? deskEvaluate(board.games || [], today) : null);
+        setEv(board ? deskEvaluate(board.games || [], today, rec0.n) : null);
+        const since = await store.get("ingenuity:desk:since", null);
+        setStart(since);
         const myBets = await store.get("ingenuity:ledger:bets", []);
-        const done = (myBets || []).filter((b) => b.result === "W" || b.result === "L");
+        // Only bets placed since the desk started count toward the head-to-head.
+        const done = (myBets || []).filter((b) => (b.result === "W" || b.result === "L")
+            && (!since || String(b.date || b.day || "") >= since));
         setMine({ w: done.filter((b) => b.result === "W").length, l: done.filter((b) => b.result === "L").length,
             profit: done.reduce((t, b) => t + (parseFloat(b.profit) || 0), 0) });
     };
@@ -8398,7 +8467,7 @@ function DeskTab() {
             React.createElement("div", { className: "dbf-head" },
                 React.createElement("h2", null, "Paper desk"),
                 React.createElement("button", { className: "ing-ghost", onClick: grade, disabled: !!busy }, busy === "grade" ? "\u2026" : "Grade")),
-            React.createElement("p", { className: "dbf-lede" }, `Picks totals off the frozen board projection, stakes ${DESK_UNIT} a unit at quarter Kelly, and is graded against real finals. Paper only \u2014 nothing here is placed anywhere, and it is allowed to pass. Totals are the one market this engine is calibrated for.`),
+            React.createElement("p", { className: "dbf-lede" }, `Picks totals off the frozen board projection and is graded against real finals. Paper only \u2014 nothing here is placed anywhere, and it is allowed to pass. The model's probability is blended toward the market price rather than trusted outright, because it hasn't yet shown it beats that price; its weight rises as graded bets accumulate. Stakes are a flat $${DESK_UNIT} until ${DESK.FLAT_UNTIL} graded bets, then Kelly-scaled.`),
             msg && React.createElement("p", { className: "ing-hint" }, msg)),
         React.createElement("section", { className: "ing-card dbf-research" },
             React.createElement("h3", null, "Record"),
@@ -8407,7 +8476,9 @@ function DeskTab() {
                 React.createElement("div", null, React.createElement("em", null, "Units"), React.createElement("strong", { className: rec.units > 0 ? "pos" : rec.units < 0 ? "neg" : "" }, `${rec.units > 0 ? "+" : ""}${rec.units}`)),
                 React.createElement("div", null, React.createElement("em", null, "Profit"), React.createElement("strong", { className: rec.profit > 0 ? "pos" : rec.profit < 0 ? "neg" : "" }, `${rec.profit < 0 ? "-" : ""}$${Math.abs(rec.profit)}`)),
                 React.createElement("div", null, React.createElement("em", null, "Passes"), React.createElement("strong", null, rec.passes))),
-            mine && React.createElement("p", { className: "dbf-note" }, `You: ${mine.w}\u2013${mine.l}, ${mine.profit < 0 ? "-" : "+"}$${Math.abs(mine.profit).toFixed(2)}. Desk: ${rec.w}\u2013${rec.l}, ${rec.profit < 0 ? "-" : "+"}$${Math.abs(rec.profit).toFixed(2)}.`),
+            mine && React.createElement("p", { className: "dbf-note" },
+                start ? `Head to head since ${start} \u2014 ` : "Head to head \u2014 ",
+                `you ${mine.w}\u2013${mine.l} (${mine.profit < 0 ? "-" : "+"}$${Math.abs(mine.profit).toFixed(2)}), desk ${rec.w}\u2013${rec.l} (${rec.profit < 0 ? "-" : "+"}$${Math.abs(rec.profit).toFixed(2)}). Anything you logged before the desk started is excluded.`),
             React.createElement("p", { className: "dbf-note" }, rec.n < 30
                 ? `${rec.n} graded bet${rec.n === 1 ? "" : "s"}. A record this short says almost nothing either way \u2014 a 6\u20133 start and a 3\u20136 start are both ordinary luck at this sample. Treat it as a log, not a verdict.`
                 : `${rec.n} graded bets${rec.roi != null ? `, ${(rec.roi * 100).toFixed(1)}% ROI on $${rec.staked} staked` : ""}. Still a small sample by betting standards, where a few hundred is where signal starts to separate from noise.`)),
@@ -8431,12 +8502,15 @@ function DeskTab() {
                             : ev.taken.map((c, i) => React.createElement("div", { key: i, className: "desk-bet live" },
                                 React.createElement("span", { className: "db-side" }, `${c.side} ${c.line}`),
                                 React.createElement("span", { className: "db-game" }, c.label),
-                                React.createElement("span", { className: "db-meta" }, `${c.price} \u00B7 ${c.units}u ($${(c.units * DESK_UNIT).toFixed(0)}) \u00B7 model ${c.model.toFixed(1)} \u00B7 EV ${(c.ev * 100).toFixed(1)}%${c.snap ? "" : " \u00B7 no saved range"}`))),
+                                React.createElement("span", { className: "db-meta" }, `${c.price} \u00B7 ${c.units}u ($${(c.units * DESK_UNIT).toFixed(0)}) \u00B7 model ${c.model.toFixed(1)} \u00B7 EV ${(c.ev * 100).toFixed(1)}%${c.snap ? "" : " \u00B7 no saved range"}`),
+                                React.createElement("span", { className: "db-why" }, c.pMkt != null
+                                    ? `model ${(c.pRaw * 100).toFixed(0)}% blended with market ${(c.pMkt * 100).toFixed(0)}% at ${(c.w * 100).toFixed(0)}% model weight \u2192 ${(c.p * 100).toFixed(1)}%${c.flat ? " \u00B7 flat stake until the desk has a record" : ""}`
+                                    : `model ${(c.p * 100).toFixed(1)}% \u2014 no two-way price to blend against`))),
                         React.createElement("button", { className: "ing-primary", onClick: commit, disabled: !!busy },
                             busy === "commit" ? "\u2026" : ev.taken.length ? `Commit ${ev.taken.length} paper bet${ev.taken.length === 1 ? "" : "s"}` : "Record today as a pass")),
             ev && ev.flagged && ev.flagged.length > 0 && React.createElement("p", { className: "dbf-warn" },
-                React.createElement("b", null, `${ev.flagged.length} side${ev.flagged.length === 1 ? "" : "s"} showed an edge too large to be real `),
-                `(${ev.flagged.slice(0, 3).map((c) => `${c.label} ${c.side} ${(c.ev * 100).toFixed(0)}%`).join(", ")}). Totals edges live at a few percent; ${(DESK.MAX_EV * 100).toFixed(0)}%+ against a liquid market means an input is wrong \u2014 a stale line, the wrong starter, a bad import. Not bet, and worth checking.`),
+                React.createElement("b", null, `${ev.flagged.length} game${ev.flagged.length === 1 ? "" : "s"} disagree with the market too far to be real `),
+                `(${ev.flagged.slice(0, 3).map((c) => `${c.label} ${c.side} by ${Math.abs(c.edge).toFixed(1)} runs`).join(", ")}). The model disagrees with the market by more than the ${DESK.MAX_EDGE_RUNS} runs it is typically wrong by, so the gap is more likely a broken input than an edge \u2014 a stale price, the wrong starter, a bad import. Not bet, and worth checking.`),
             ev && ev.skipped.length > 0 && React.createElement("p", { className: "dbf-note" }, `Not priced: ${ev.skipped.slice(0, 4).map((x) => `${x.label} (${x.why})`).join(" \u00B7 ")}${ev.skipped.length > 4 ? ` \u00B7 +${ev.skipped.length - 4}` : ""}`)),
         openBets.length > 0 && React.createElement("section", { className: "ing-card" },
             React.createElement("h3", null, "Open"),
@@ -11647,6 +11721,7 @@ const CSS = `
 .db-game { font-size: 12px; color: var(--ink); flex: 1; min-width: 130px; }
 .db-meta { font-size: 10.5px; color: var(--ink-dim); font-family: 'Archivo'; }
 .db-pass { font-size: 12px; color: var(--ink-dim); }
+.db-why { flex-basis: 100%; font-size: 10.5px; color: var(--ink-dim); line-height: 1.5; }
 @media (max-width: 560px) { .desk-stats { grid-template-columns: repeat(2, 1fr); } }
 .dbf-warn { font-size: 11.5px; line-height: 1.6; color: var(--ink); background: rgba(245,196,81,0.07); border-left: 2px solid var(--amber); padding: 9px 11px; border-radius: 6px; margin: 0 0 12px; }
 .fresh-audit-note { margin: 10px 0 0; font-size: 11px; color: var(--ink-dim); line-height: 1.55; }
