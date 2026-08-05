@@ -938,6 +938,222 @@ function projectGame(g, nOverride) {
 // ---------------------------------------------------------------------------
 // odds math (straight + parlay)
 // ---------------------------------------------------------------------------
+// ---- Paper desk -------------------------------------------------------------
+// A second opinion that commits to a number before the game and is graded on it.
+// Paper stakes only: nothing here tells anyone to place a bet. Its job is to
+// answer one question honestly — does this model beat the price it was offered?
+//
+// Totals only. The engine simulates a run distribution, so a total is the one
+// market it is calibrated for; a moneyline or run line derived from the same
+// sims would launch with zero graded history and no stored price to price it
+// against. It is allowed to pass, and passing is a result, not a failure.
+const DESK_KEY = "ingenuity:desk:bets";
+const DESK_UNIT = 25;
+const DESK = {
+    MIN_EV: 0.02, // 2 cents on the dollar after vig — below this the edge is inside the model's own error
+    // A ceiling matters as much as a floor. Real totals edges live at 1-4%; a
+    // model claiming 25% against a market this liquid is not finding value, it is
+    // reporting a broken input — a stale line, the wrong starter, a bad import.
+    // Every large "edge" this app has produced so far has been exactly that.
+    MAX_EV: 0.15,
+    MIN_EDGE: 1.0, // runs between model and line
+    KELLY: 0.25, // quarter Kelly; full Kelly on a model this young would be reckless
+    MAX_UNITS: 2,
+    MIN_UNITS: 0.5,
+    MAX_PER_DAY: 3,
+};
+// Break-even probability implied by an American price, vig included.
+function impliedProb(am) {
+    const n = parseFloat(am);
+    if (!Number.isFinite(n) || (n > -100 && n < 100))
+        return null;
+    return n > 0 ? 100 / (n + 100) : -n / (-n + 100);
+}
+// Expected profit per $1 staked.
+function evPerDollar(p, am) {
+    const n = parseFloat(am);
+    if (!Number.isFinite(p) || !Number.isFinite(n) || (n > -100 && n < 100))
+        return null;
+    const win = n > 0 ? n / 100 : 100 / -n;
+    return p * win - (1 - p);
+}
+function kellyUnits(p, am) {
+    const n = parseFloat(am);
+    if (!Number.isFinite(p) || !Number.isFinite(n))
+        return 0;
+    const b = n > 0 ? n / 100 : 100 / -n;
+    const f = (p * b - (1 - p)) / b;
+    if (!(f > 0))
+        return 0;
+    const u = f * DESK.KELLY / 0.02; // express quarter-Kelly as units of 2% bankroll
+    return Math.max(DESK.MIN_UNITS, Math.min(DESK.MAX_UNITS, Math.round(u * 2) / 2));
+}
+// Evaluate one already-scanned board. Uses the projection frozen at scan time,
+// so the desk can never quietly re-price a game after seeing more.
+function deskEvaluate(games, day) {
+    const cands = [], skipped = [];
+    for (const g of (games || [])) {
+        const pr = g.proj;
+        const line = parseFloat(g.line);
+        const label = `${g.away} @ ${g.home}`;
+        if (!pr || pr.model == null || !Number.isFinite(line)) {
+            skipped.push({ label, why: "no projection or no line" });
+            continue;
+        }
+        if (pr.atLine != null && Number.isFinite(parseFloat(pr.atLine)) && parseFloat(pr.atLine) !== line) {
+            // The book moved after the scan. The frozen probability belongs to the
+            // old number, so it cannot be applied to this one.
+            skipped.push({ label, why: `line moved ${pr.atLine} \u2192 ${line} since the scan; re-scan to price it` });
+            continue;
+        }
+        const pOver = pr.pOver;
+        if (!Number.isFinite(pOver)) {
+            skipped.push({ label, why: "no win probability stored" });
+            continue;
+        }
+        const snap = pr.snap || null;
+        for (const side of ["Over", "Under"]) {
+            const price = side === "Over" ? g.over : g.under;
+            if (price === "" || price == null) {
+                skipped.push({ label, why: `no ${side.toLowerCase()} price` });
+                continue;
+            }
+            const p = side === "Over" ? pOver : 1 - pOver;
+            const ev = evPerDollar(p, price);
+            if (ev == null) {
+                skipped.push({ label, why: `unreadable ${side.toLowerCase()} price` });
+                continue;
+            }
+            const edge = pr.model - line;
+            const dirOk = side === "Over" ? edge > 0 : edge < 0;
+            // Distributional support: the line must sit outside the middle of the
+            // model's own range, not merely on the wrong side of its mean. A mean
+            // 1.5 runs away with a 9-run spread is not a disagreement worth money.
+            let tail = null;
+            if (snap && Number.isFinite(snap.p10) && Number.isFinite(snap.p90))
+                tail = side === "Over" ? line <= snap.p10 + (snap.p90 - snap.p10) * 0.35
+                    : line >= snap.p10 + (snap.p90 - snap.p10) * 0.65;
+            const units = kellyUnits(p, price);
+            const tooGood = ev > DESK.MAX_EV;
+            cands.push({ day, label, away: g.away, home: g.home, side, line, price,
+                model: pr.model, p: +p.toFixed(4), ev: +ev.toFixed(4), edge: +edge.toFixed(2),
+                units, tail, snap: !!snap, tooGood,
+                pass: !(dirOk && ev >= DESK.MIN_EV && ev <= DESK.MAX_EV && Math.abs(edge) >= DESK.MIN_EDGE && units > 0 && tail !== false) });
+        }
+    }
+    const live = cands.filter((c) => !c.pass).sort((a, b) => b.ev - a.ev);
+    // One position per team: two bets on the same club are one opinion twice.
+    const taken = [], used = new Set();
+    for (const c of live) {
+        if (taken.length >= DESK.MAX_PER_DAY)
+            break;
+        if (used.has(normName(c.away)) || used.has(normName(c.home)))
+            continue;
+        used.add(normName(c.away));
+        used.add(normName(c.home));
+        taken.push(c);
+    }
+    // Surfaced rather than buried: an implausible edge is the most useful thing
+    // on the board, because it points at a data problem worth fixing.
+    const flagged = cands.filter((c) => c.tooGood);
+    return { taken, considered: cands, skipped, flagged };
+}
+// Commit today's picks. Idempotent per day: a day already committed is never
+// re-picked, or the desk could quietly re-choose after seeing results.
+async function deskCommit(day, taken) {
+    const log = await store.get(DESK_KEY, {});
+    if (Object.values(log).some((b) => b.day === day))
+        return { log, added: 0, already: true };
+    let added = 0;
+    for (const c of taken) {
+        const key = `${day}|${normName(c.away)}@${normName(c.home)}|${c.side}`;
+        if (log[key])
+            continue;
+        log[key] = { day, away: c.away, home: c.home, side: c.side, line: c.line, price: c.price,
+            model: c.model, p: c.p, ev: c.ev, edge: c.edge, units: c.units,
+            stake: +(c.units * DESK_UNIT).toFixed(2), placedAt: new Date().toISOString(),
+            result: null, final: null, profit: null };
+        added++;
+    }
+    // A day with no qualifying bet is recorded as a deliberate pass, so the
+    // record shows restraint rather than a gap that looks like inactivity.
+    if (!added && !taken.length)
+        log[`${day}|pass`] = { day, pass: true, placedAt: new Date().toISOString() };
+    await store.set(DESK_KEY, log);
+    return { log, added, already: false };
+}
+// Grade against real finals. Push returns the stake.
+async function deskGrade() {
+    const log = await store.get(DESK_KEY, {});
+    const open = Object.entries(log).filter(([, b]) => !b.pass && b.result == null);
+    if (!open.length)
+        return { log, graded: 0 };
+    const days = [...new Set(open.map(([, b]) => b.day))];
+    let graded = 0;
+    for (const d of days) {
+        let finals = null;
+        try {
+            const r = await mlbFetch(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${d}`);
+            if (!r.ok)
+                continue;
+            const j = await r.json();
+            finals = [];
+            for (const dt of (j.dates || []))
+                for (const gm of (dt.games || [])) {
+                    if (gm.status?.abstractGameState !== "Final")
+                        continue;
+                    const a = gm.teams?.away, h = gm.teams?.home;
+                    if (typeof a?.score !== "number" || typeof h?.score !== "number")
+                        continue;
+                    finals.push({ away: resolveTeamName(a.team?.name) || a.team?.name,
+                        home: resolveTeamName(h.team?.name) || h.team?.name, total: a.score + h.score });
+                }
+        }
+        catch (e) {
+            continue;
+        }
+        if (!finals || !finals.length)
+            continue;
+        for (const [k, b] of open) {
+            if (b.day !== d)
+                continue;
+            const hit = finals.find((f) => normName(f.away) === normName(b.away) && normName(f.home) === normName(b.home));
+            if (!hit)
+                continue;
+            const total = hit.total;
+            let result, profit;
+            if (total === b.line) {
+                result = "P";
+                profit = 0;
+            }
+            else {
+                const won = b.side === "Over" ? total > b.line : total < b.line;
+                result = won ? "W" : "L";
+                const n = parseFloat(b.price);
+                profit = won ? b.stake * (n > 0 ? n / 100 : 100 / -n) : -b.stake;
+            }
+            log[k] = { ...b, result, final: total, profit: +profit.toFixed(2) };
+            graded++;
+        }
+    }
+    if (graded)
+        await store.set(DESK_KEY, log);
+    return { log, graded };
+}
+function deskRecord(log) {
+    const bets = Object.values(log || {}).filter((b) => !b.pass);
+    const done = bets.filter((b) => b.result === "W" || b.result === "L" || b.result === "P");
+    const w = done.filter((b) => b.result === "W").length;
+    const l = done.filter((b) => b.result === "L").length;
+    const push = done.filter((b) => b.result === "P").length;
+    const profit = done.reduce((t, b) => t + (b.profit || 0), 0);
+    const staked = done.reduce((t, b) => t + (b.stake || 0), 0);
+    const passes = Object.values(log || {}).filter((b) => b.pass).length;
+    return { w, l, push, n: done.length, open: bets.length - done.length, passes,
+        profit: +profit.toFixed(2), staked: +staked.toFixed(2),
+        roi: staked > 0 ? profit / staked : null,
+        units: +(profit / DESK_UNIT).toFixed(2) };
+}
 function americanOdds(p) {
     if (p <= 0 || p >= 1)
         return "—";
@@ -3261,7 +3477,8 @@ function Terminal({ onHome, pendingGame, onPendingConsumed }) {
                 React.createElement("button", { className: tab === "database" ? "on" : "", onClick: () => setTab("database") }, "Database"),
                 React.createElement("button", { className: tab === "lineups" ? "on" : "", onClick: () => setTab("lineups") }, "Lineups"),
                 React.createElement("button", { className: tab === "bullpens" ? "on" : "", onClick: () => setTab("bullpens") }, "Bullpens"),
-                React.createElement("button", { className: tab === "debrief" ? "on" : "", onClick: () => setTab("debrief") }, "Debrief"))),
+                React.createElement("button", { className: tab === "debrief" ? "on" : "", onClick: () => setTab("debrief") }, "Debrief"),
+                React.createElement("button", { className: tab === "desk" ? "on" : "", onClick: () => setTab("desk") }, "Desk"))),
         tab === "project" && (React.createElement("main", { className: "ing-main" },
             React.createElement("section", { className: "ing-inputs" },
                 React.createElement(SmartImport, { teams: teams, saveTeams: saveTeams, onGameLine: loadGameLine }),
@@ -3325,6 +3542,7 @@ function Terminal({ onHome, pendingGame, onPendingConsumed }) {
         tab === "lineups" && React.createElement(LineupFetcher, { teams: teams, saveTeams: saveTeams }),
         tab === "bullpens" && React.createElement(BullpenTab, { teams: teams }),
         tab === "debrief" && React.createElement(DebriefTab, { teams: teams }),
+        tab === "desk" && React.createElement(DeskTab, null),
         React.createElement("footer", { className: "ing-foot" }, "Research instrument. Projections are estimates from the inputs you provide \u2014 only as good as the data entered. Not betting advice.")));
 }
 // ---------------------------------------------------------------------------
@@ -8134,6 +8352,105 @@ function MissLab({ log }) {
                         React.createElement("p", null, `${sp.a.mean > 0 ? "+" : ""}${sp.a.mean.toFixed(2)} runs over ${sp.a.n} game${sp.a.n === 1 ? "" : "s"} vs ${sp.b.mean != null ? `${sp.b.mean > 0 ? "+" : ""}${sp.b.mean.toFixed(2)} over ${sp.b.n}` : "\u2014"} elsewhere${sp.gap != null ? `, a gap of ${Math.abs(sp.gap).toFixed(2)} runs` : ""}. ${sp.a.n < 30 ? `Only ${sp.a.n} games \u2014 far too few; roughly 30 before this means anything.` : sp.a.real ? "Clears its own noise band. Worth investigating the underlying input." : "Inside the noise band."}`),
                         React.createElement("em", null, sp.why)))));
 }
+function DeskTab() {
+    const [log, setLog] = useState({});
+    const [ev, setEv] = useState(null);
+    const [busy, setBusy] = useState("");
+    const [msg, setMsg] = useState("");
+    const [mine, setMine] = useState(null);
+    const today = etDayKey();
+    const load = async () => {
+        const l = await store.get(DESK_KEY, {});
+        setLog(l || {});
+        const arch = await store.get("ingenuity:slate:archive", {});
+        const board = arch[today];
+        setEv(board ? deskEvaluate(board.games || [], today) : null);
+        const myBets = await store.get("ingenuity:ledger:bets", []);
+        const done = (myBets || []).filter((b) => b.result === "W" || b.result === "L");
+        setMine({ w: done.filter((b) => b.result === "W").length, l: done.filter((b) => b.result === "L").length,
+            profit: done.reduce((t, b) => t + (parseFloat(b.profit) || 0), 0) });
+    };
+    useEffect(() => { load(); }, []);
+    const commit = async () => {
+        setBusy("commit");
+        setMsg("");
+        const { added, already } = await deskCommit(today, ev ? ev.taken : []);
+        setMsg(already ? "Today is already committed \u2014 the desk doesn't get to pick twice."
+            : added ? `Committed ${added} paper bet${added === 1 ? "" : "s"} for ${today}.`
+                : "No bet today. Nothing on the board cleared the bar, and that is recorded as a pass.");
+        await load();
+        setBusy("");
+    };
+    const grade = async () => {
+        setBusy("grade");
+        setMsg("");
+        const { graded } = await deskGrade();
+        setMsg(graded ? `Graded ${graded} bet${graded === 1 ? "" : "s"}.` : "Nothing new to grade yet.");
+        await load();
+        setBusy("");
+    };
+    const rec = deskRecord(log);
+    const committedToday = Object.values(log).some((b) => b.day === today);
+    const openBets = Object.values(log).filter((b) => !b.pass && b.result == null).sort((a, b) => (a.day < b.day ? 1 : -1));
+    const settled = Object.values(log).filter((b) => b.result).sort((a, b) => (a.day < b.day ? 1 : -1)).slice(0, 12);
+    return React.createElement("main", { className: "ing-main dbf desk" },
+        React.createElement("section", { className: "ing-card" },
+            React.createElement("div", { className: "dbf-head" },
+                React.createElement("h2", null, "Paper desk"),
+                React.createElement("button", { className: "ing-ghost", onClick: grade, disabled: !!busy }, busy === "grade" ? "\u2026" : "Grade")),
+            React.createElement("p", { className: "dbf-lede" }, `Picks totals off the frozen board projection, stakes ${DESK_UNIT} a unit at quarter Kelly, and is graded against real finals. Paper only \u2014 nothing here is placed anywhere, and it is allowed to pass. Totals are the one market this engine is calibrated for.`),
+            msg && React.createElement("p", { className: "ing-hint" }, msg)),
+        React.createElement("section", { className: "ing-card dbf-research" },
+            React.createElement("h3", null, "Record"),
+            React.createElement("div", { className: "desk-stats" },
+                React.createElement("div", null, React.createElement("em", null, "Desk"), React.createElement("strong", null, `${rec.w}\u2013${rec.l}${rec.push ? `\u2013${rec.push}` : ""}`)),
+                React.createElement("div", null, React.createElement("em", null, "Units"), React.createElement("strong", { className: rec.units > 0 ? "pos" : rec.units < 0 ? "neg" : "" }, `${rec.units > 0 ? "+" : ""}${rec.units}`)),
+                React.createElement("div", null, React.createElement("em", null, "Profit"), React.createElement("strong", { className: rec.profit > 0 ? "pos" : rec.profit < 0 ? "neg" : "" }, `${rec.profit < 0 ? "-" : ""}$${Math.abs(rec.profit)}`)),
+                React.createElement("div", null, React.createElement("em", null, "Passes"), React.createElement("strong", null, rec.passes))),
+            mine && React.createElement("p", { className: "dbf-note" }, `You: ${mine.w}\u2013${mine.l}, ${mine.profit < 0 ? "-" : "+"}$${Math.abs(mine.profit).toFixed(2)}. Desk: ${rec.w}\u2013${rec.l}, ${rec.profit < 0 ? "-" : "+"}$${Math.abs(rec.profit).toFixed(2)}.`),
+            React.createElement("p", { className: "dbf-note" }, rec.n < 30
+                ? `${rec.n} graded bet${rec.n === 1 ? "" : "s"}. A record this short says almost nothing either way \u2014 a 6\u20133 start and a 3\u20136 start are both ordinary luck at this sample. Treat it as a log, not a verdict.`
+                : `${rec.n} graded bets${rec.roi != null ? `, ${(rec.roi * 100).toFixed(1)}% ROI on $${rec.staked} staked` : ""}. Still a small sample by betting standards, where a few hundred is where signal starts to separate from noise.`)),
+        React.createElement("section", { className: "ing-card" },
+            React.createElement("h3", null, `Today \u00B7 ${today}`),
+            !ev
+                ? React.createElement("p", { className: "dbf-note" }, "No board saved for today. Run the morning refresh and scan the slate first \u2014 the desk prices off the projection frozen at scan time, never a fresh one.")
+                : committedToday
+                    ? React.createElement(React.Fragment, null,
+                        React.createElement("p", { className: "dbf-note" }, "Today is committed. The desk gets one look at a board and lives with it."),
+                        Object.values(log).filter((b) => b.day === today).map((b, i) => React.createElement("div", { key: i, className: "desk-bet" },
+                            b.pass
+                                ? React.createElement("span", { className: "db-pass" }, "Passed \u2014 nothing cleared the bar")
+                                : React.createElement(React.Fragment, null,
+                                    React.createElement("span", { className: "db-side" }, `${b.side} ${b.line}`),
+                                    React.createElement("span", { className: "db-game" }, `${b.away} @ ${b.home}`),
+                                    React.createElement("span", { className: "db-meta" }, `${b.price} \u00B7 ${b.units}u ($${b.stake}) \u00B7 model ${b.model}`)))))
+                    : React.createElement(React.Fragment, null,
+                        ev.taken.length === 0
+                            ? React.createElement("p", { className: "dbf-note" }, `Nothing clears the bar today: it needs ${(DESK.MIN_EV * 100).toFixed(0)}% expected value after vig, at least ${DESK.MIN_EDGE} run of disagreement, and the line sitting outside the middle of the model's own range. ${ev.considered.length} side${ev.considered.length === 1 ? "" : "s"} were priced.`)
+                            : ev.taken.map((c, i) => React.createElement("div", { key: i, className: "desk-bet live" },
+                                React.createElement("span", { className: "db-side" }, `${c.side} ${c.line}`),
+                                React.createElement("span", { className: "db-game" }, c.label),
+                                React.createElement("span", { className: "db-meta" }, `${c.price} \u00B7 ${c.units}u ($${(c.units * DESK_UNIT).toFixed(0)}) \u00B7 model ${c.model.toFixed(1)} \u00B7 EV ${(c.ev * 100).toFixed(1)}%${c.snap ? "" : " \u00B7 no saved range"}`))),
+                        React.createElement("button", { className: "ing-primary", onClick: commit, disabled: !!busy },
+                            busy === "commit" ? "\u2026" : ev.taken.length ? `Commit ${ev.taken.length} paper bet${ev.taken.length === 1 ? "" : "s"}` : "Record today as a pass")),
+            ev && ev.flagged && ev.flagged.length > 0 && React.createElement("p", { className: "dbf-warn" },
+                React.createElement("b", null, `${ev.flagged.length} side${ev.flagged.length === 1 ? "" : "s"} showed an edge too large to be real `),
+                `(${ev.flagged.slice(0, 3).map((c) => `${c.label} ${c.side} ${(c.ev * 100).toFixed(0)}%`).join(", ")}). Totals edges live at a few percent; ${(DESK.MAX_EV * 100).toFixed(0)}%+ against a liquid market means an input is wrong \u2014 a stale line, the wrong starter, a bad import. Not bet, and worth checking.`),
+            ev && ev.skipped.length > 0 && React.createElement("p", { className: "dbf-note" }, `Not priced: ${ev.skipped.slice(0, 4).map((x) => `${x.label} (${x.why})`).join(" \u00B7 ")}${ev.skipped.length > 4 ? ` \u00B7 +${ev.skipped.length - 4}` : ""}`)),
+        openBets.length > 0 && React.createElement("section", { className: "ing-card" },
+            React.createElement("h3", null, "Open"),
+            openBets.map((b, i) => React.createElement("div", { key: i, className: "desk-bet" },
+                React.createElement("span", { className: "db-side" }, `${b.side} ${b.line}`),
+                React.createElement("span", { className: "db-game" }, `${b.away} @ ${b.home}`),
+                React.createElement("span", { className: "db-meta" }, `${b.day} \u00B7 ${b.units}u`)))),
+        settled.length > 0 && React.createElement("section", { className: "ing-card" },
+            React.createElement("h3", null, "Settled"),
+            settled.map((b, i) => React.createElement("div", { key: i, className: "desk-bet " + (b.result === "W" ? "won" : b.result === "L" ? "lost" : "") },
+                React.createElement("span", { className: "db-side" }, `${b.result} \u00B7 ${b.side} ${b.line}`),
+                React.createElement("span", { className: "db-game" }, `${b.away} @ ${b.home}`),
+                React.createElement("span", { className: "db-meta" }, `final ${b.final} \u00B7 ${b.profit > 0 ? "+" : ""}$${b.profit}`)))));
+}
 function DebriefTab({ teams }) {
     const [db, setDb] = useState(null);
     const [log, setLog] = useState({});
@@ -11316,6 +11633,21 @@ const CSS = `
 .miss-split em { font-style: normal; font-size: 10.5px; color: var(--ink-dim); opacity: 0.8; line-height: 1.5; }
 .dbf-research { border-left: 2px solid var(--phos); }
 .dbf-color { border-left: 2px solid var(--line); opacity: 0.92; }
+.desk-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 10px; }
+.desk-stats div { background: var(--field); border: 1px solid var(--line); border-radius: 8px; padding: 9px 8px; display: flex; flex-direction: column; gap: 3px; }
+.desk-stats em { font-style: normal; font-family: 'Archivo'; font-size: 8.5px; letter-spacing: 0.11em; text-transform: uppercase; color: var(--ink-dim); }
+.desk-stats strong { font-family: 'Archivo'; font-size: 15px; color: var(--ink); }
+.desk-stats strong.pos { color: var(--phos); }
+.desk-stats strong.neg { color: var(--rust); }
+.desk-bet { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; padding: 9px 11px; background: var(--field); border: 1px solid var(--line); border-left-width: 2px; border-radius: 8px; margin-bottom: 6px; }
+.desk-bet.live { border-left-color: var(--phos); }
+.desk-bet.won { border-left-color: var(--phos); }
+.desk-bet.lost { border-left-color: var(--rust); }
+.db-side { font-family: 'Archivo'; font-weight: 700; font-size: 12.5px; color: var(--ink); }
+.db-game { font-size: 12px; color: var(--ink); flex: 1; min-width: 130px; }
+.db-meta { font-size: 10.5px; color: var(--ink-dim); font-family: 'Archivo'; }
+.db-pass { font-size: 12px; color: var(--ink-dim); }
+@media (max-width: 560px) { .desk-stats { grid-template-columns: repeat(2, 1fr); } }
 .dbf-warn { font-size: 11.5px; line-height: 1.6; color: var(--ink); background: rgba(245,196,81,0.07); border-left: 2px solid var(--amber); padding: 9px 11px; border-radius: 6px; margin: 0 0 12px; }
 .fresh-audit-note { margin: 10px 0 0; font-size: 11px; color: var(--ink-dim); line-height: 1.55; }
 .stamp.unknown { border-left-color: var(--ink-dim); }
