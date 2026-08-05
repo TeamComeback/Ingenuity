@@ -3701,6 +3701,8 @@ function RosterReconcile({ teams, onApply }) {
     };
     const apply = () => {
         const { next, moved, flagged, reactivated, stamped } = applyRosterReconcile(teams, plan);
+        logActivity("roster", `Roster reconcile applied \u2014 ${moved} player${moved === 1 ? "" : "s"} moved`,
+            `${flagged} flagged inactive, ${stamped} MLB ids recorded; offense and bullpen recomputed from current rosters`);
         onApply(next, `Moved ${moved} player${moved === 1 ? "" : "s"}, flagged ${flagged} inactive${reactivated ? `, reactivated ${reactivated}` : ""}, and recorded MLB ids on ${stamped} player${stamped === 1 ? "" : "s"} so future checks match exactly. Team offense and bullpen ratings recomputed from the current rosters.`);
         setArmed(false);
         setPlan(null);
@@ -3805,6 +3807,8 @@ function MisplacedPlayers({ teams, onApply }) {
                     total > 0 && React.createElement("button", { className: "ing-ghost", onClick: () => {
                             if (!armed) { setArmed(true); return; }
                             const { next, moved, merged } = repairMisplaced(teams, found);
+                            logActivity("buckets", `Moved ${moved} player${moved === 1 ? "" : "s"} into the right bucket`,
+                                `${found.toRotation.length} pitchers out of the lineup pool, ${found.toPlayers.length} hitters out of rotations`);
                             onApply(next, `Moved ${moved} player${moved === 1 ? "" : "s"} into the right bucket${merged ? `, removed ${merged} duplicate${merged === 1 ? "" : "s"}` : ""}. Offense and bullpen ratings recomputed.`);
                             setArmed(false);
                             setFound(null);
@@ -5752,6 +5756,38 @@ function GameCard({ g, onGrade, onDelete }) {
 // cause of the "vision call unavailable" failures.
 // File Interpreter's memory: every conversion attempt (paste, CSV, image)
 // gets logged so failure patterns surface in the Brain instead of vanishing.
+// ---- Activity log -----------------------------------------------------------
+// Records what an action DID to the model's inputs, not merely that a button was
+// pressed. "Bullpen refreshed" tells you nothing; "30 pens scored, 4 teams
+// changed" tells you whether the next simulation will differ. Append-only,
+// capped, and never allowed to throw — a logging failure must not break the
+// action it was logging.
+const ACTIVITY_KEY = "ingenuity:activity";
+const ACTIVITY_CAP = 300;
+async function logActivity(kind, summary, effect) {
+    try {
+        const log = await store.get(ACTIVITY_KEY, []);
+        const row = { ts: new Date().toISOString(), kind,
+            summary: String(summary || "").slice(0, 220),
+            effect: effect == null ? null : String(effect).slice(0, 220) };
+        await store.set(ACTIVITY_KEY, [row, ...log].slice(0, ACTIVITY_CAP));
+    }
+    catch (e) { /* logging must never break the thing it logs */ }
+}
+const ACTIVITY_LABELS = {
+    lineups: ["Lineups", "\u25CF"],
+    scan: ["Board scan", "\u03A3"],
+    bullpen: ["Bullpen workload", "\u25D1"],
+    recent: ["14-day form", "\u25D4"],
+    stats: ["Stats import", "\u2193"],
+    roster: ["Roster reconcile", "\u21C4"],
+    buckets: ["Player buckets", "\u2261"],
+    desk: ["Paper desk", "\u25C6"],
+    morning: ["Morning refresh", "\u2600"],
+    weather: ["Weather", "\u2601"],
+    calibration: ["Calibration", "\u25CE"],
+    grade: ["Grading", "\u2713"],
+};
 async function logInterp(kind, ok, detail) {
     try {
         const log = await store.get("ingenuity:brain:interpLog", []);
@@ -6937,6 +6973,8 @@ function SmartImport({ teams, saveTeams, onGameLine, statsFocus }) {
         }
         const hadTeamCol = rows.some((r) => r.team);
         const { next, hitters, pitchers, teamsTouched, seeded, unroutable } = applyStatRows(rows, teams, timeframe, rosterMap, rosterPos);
+        logActivity("stats", `${label}: imported as ${timeframe === "recent" ? "14-day form" : "season stats"}`,
+            `${hitters} hitters, ${pitchers} starters across ${teamsTouched.length} team${teamsTouched.length === 1 ? "" : "s"}${seeded ? `, ${seeded} new players added` : ""}`);
         await saveTeams(next);
         setLastImport({ ts: new Date().toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" }), mode: timeframe, teams: teamsTouched || [], seeded: seeded || 0 });
         const touched = teamsTouched || [];
@@ -8444,6 +8482,8 @@ function DeskTab() {
         setBusy("commit");
         setMsg("");
         const { added, already } = await deskCommit(today, ev ? ev.taken : []);
+        logActivity("desk", already ? "Desk: today already committed" : added ? `Desk committed ${added} paper bet${added === 1 ? "" : "s"}` : "Desk passed \u2014 nothing cleared the bar",
+            ((ev && ev.taken) || []).map((c) => `${c.side} ${c.line} ${c.label} ${c.units}u`).join(" \u00B7 ") || null);
         setMsg(already ? "Today is already committed \u2014 the desk doesn't get to pick twice."
             : added ? `Committed ${added} paper bet${added === 1 ? "" : "s"} for ${today}.`
                 : "No bet today. Nothing on the board cleared the bar, and that is recorded as a pass.");
@@ -8454,6 +8494,8 @@ function DeskTab() {
         setBusy("grade");
         setMsg("");
         const { graded } = await deskGrade();
+        if (graded)
+            logActivity("grade", `Desk graded ${graded} bet${graded === 1 ? "" : "s"} against real finals`, null);
         setMsg(graded ? `Graded ${graded} bet${graded === 1 ? "" : "s"}.` : "Nothing new to grade yet.");
         await load();
         setBusy("");
@@ -9202,16 +9244,25 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
         setMorning({ running: true, steps, summary: "" });
         setMsg("");
         const mark = (key, state, note) => setMorning((m) => (m ? { ...m, steps: { ...m.steps, [key]: { state, note } } } : m));
+        // Every morning step logs its own outcome, so the feed shows what each
+        // one actually did rather than that the button was pressed.
+        const logStep = (key, state, note) => {
+            const label = (MORNING_PLAN.find((x) => x.key === key) || {}).label || key;
+            const kindMap = { lineups: "lineups", bullpen: "bullpen", recentform: "recent", weather: "weather", odds: "scan", board: "scan" };
+            logActivity(kindMap[key] || "morning", `${label}: ${state === "ok" ? "updated" : state}`, note || null);
+        };
         const run = async (key, fn) => {
             mark(key, "run", "");
             try {
                 const r = await fn();
                 mark(key, r.state, r.note);
+                logStep(key, r.state, r.note);
                 return r;
             }
             catch (e) {
                 const note = String(e && e.message ? e.message : e);
                 mark(key, "fail", note);
+                logStep(key, "fail", note);
                 return { state: "fail", note };
             }
         };
@@ -9599,6 +9650,9 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
                         // local copy directly, and only claim success if the write
                         // actually stuck.
                         liveTeams = lu.teams; // this scan must price on what we just pulled
+                        const changed = lu.teams.filter((t2, i2) => t2.lineupOff !== (teams[i2] || {}).lineupOff).length;
+                        await logActivity("lineups", `Pulled batting orders for ${lu.got.length} team${lu.got.length === 1 ? "" : "s"} before scanning`,
+                            `${changed} team${changed === 1 ? "" : "s"} had their offense figure change; ${lu.notPosted.length} not posted yet`);
                         const wrote = await store.set("ingenuity:teams", lu.teams);
                         setTeams(lu.teams);
                         // The save-failure warning used to be overwritten by the
@@ -9713,6 +9767,11 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
         // Lines move. Knowing when the board was last priced is the difference
         // between a current read and a stale one worn as a current one.
         await store.set("ingenuity:stamp:scan", { at: new Date().toISOString(), day: viewDate, n: scored.length });
+        // What the projections were actually built from is the thing worth logging.
+        const onLineups = scored.filter((r) => r.lu && r.lu.a && r.lu.h && r.lu.a.source === "lineup" && r.lu.h.source === "lineup").length;
+        const onSeason = scored.filter((r) => r.lu && r.lu.a && r.lu.h && r.lu.a.source !== "lineup" && r.lu.h.source !== "lineup").length;
+        await logActivity("scan", `Scanned ${viewDate} \u2014 ${scored.length} of ${slate.games.length} games priced`,
+            `${onLineups} on today's lineups, ${onSeason} on season numbers, ${slate.games.length - scored.length} unpriced`);
         setScanAt(new Date().toISOString());
         // A scan of a past board is research — it must not overwrite today's read.
         if (viewDate === todayKey) {
@@ -10533,6 +10592,49 @@ function HistoryView() {
 // BRAIN — model oversight: health metrics, bounded parameter tuning,
 // AI-assisted recalibration. Every change is human-approved and logged.
 // ===========================================================================
+// What actually happened to the model, newest first. Answers the question the
+// morning refresh cannot: did that action change anything the simulation reads?
+function ActivityFeed() {
+    const [rows, setRows] = useState(null);
+    const [all, setAll] = useState(false);
+    useEffect(() => {
+        let live = true;
+        (async () => {
+            const a = await store.get(ACTIVITY_KEY, []);
+            if (live)
+                setRows(a || []);
+        })();
+        return () => { live = false; };
+    }, []);
+    if (!rows)
+        return null;
+    const shown = all ? rows.slice(0, 120) : rows.slice(0, 15);
+    const dayOf = (iso) => { const d = new Date(iso); return isNaN(d) ? "" : d.toLocaleDateString([], { month: "short", day: "numeric" }); };
+    const timeOf = (iso) => { const d = new Date(iso); return isNaN(d) ? "" : d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }); };
+    let lastDay = null;
+    return React.createElement("section", { className: "br-log act" },
+        React.createElement("h3", null, "Activity"),
+        rows.length === 0
+            ? React.createElement("p", { className: "grade-note" }, "Nothing logged yet. Refreshing lineups, scanning the board, importing stats or applying a roster change will each record what it changed here.")
+            : React.createElement(React.Fragment, null,
+                shown.map((r, i) => {
+                    const [label, glyph] = ACTIVITY_LABELS[r.kind] || [r.kind, "\u00B7"];
+                    const d = dayOf(r.ts);
+                    const head = d !== lastDay ? d : null;
+                    lastDay = d;
+                    return React.createElement(React.Fragment, { key: i },
+                        head && React.createElement("div", { className: "act-day" }, head),
+                        React.createElement("div", { className: "act-row" },
+                            React.createElement("span", { className: "act-glyph" }, glyph),
+                            React.createElement("span", { className: "act-body" },
+                                React.createElement("b", null, r.summary),
+                                r.effect && React.createElement("em", null, r.effect)),
+                            React.createElement("span", { className: "act-time" }, timeOf(r.ts))));
+                }),
+                rows.length > 15 && React.createElement("button", { className: "ing-ghost", onClick: () => setAll(!all) },
+                    all ? "Show recent only" : `Show all ${Math.min(rows.length, 120)}`),
+                React.createElement("p", { className: "grade-note" }, "Each line records what an action changed, not that a button was pressed \u2014 so a scan that priced eight games off season numbers reads differently from one that used today's lineups.")));
+}
 function Brain({ onHome }) {
     const [params, setParams] = useState({});
     const [draft, setDraft] = useState({});
@@ -10983,6 +11085,7 @@ Respond ONLY with JSON, no markdown fences, exactly this shape:
                     React.createElement("button", { className: "ing-run small", onClick: saveDraft }, "Save parameters"),
                     React.createElement("button", { className: "ing-ghost", onClick: resetAll }, "Reset to defaults"),
                     saved && React.createElement("span", { className: "ing-importmsg" }, saved))),
+            React.createElement(ActivityFeed, null),
             log.length > 0 && (React.createElement("section", { className: "br-log" },
                 React.createElement("h2", { className: "lg-formtitle" }, "Change log"),
                 log.map((e, i) => (React.createElement("div", { className: "br-log-row", key: i },
@@ -11721,6 +11824,14 @@ const CSS = `
 .db-game { font-size: 12px; color: var(--ink); flex: 1; min-width: 130px; }
 .db-meta { font-size: 10.5px; color: var(--ink-dim); font-family: 'Archivo'; }
 .db-pass { font-size: 12px; color: var(--ink-dim); }
+.br-log.act h3 { font-family: 'Archivo'; font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink); margin: 0 0 10px; }
+.act-day { font-family: 'Archivo'; font-size: 9px; letter-spacing: 0.13em; text-transform: uppercase; color: var(--ink-dim); margin: 10px 0 5px; }
+.act-row { display: flex; gap: 9px; padding: 7px 9px; background: var(--field); border: 1px solid var(--line); border-radius: 7px; margin-bottom: 4px; align-items: flex-start; }
+.act-glyph { color: var(--phos); font-size: 11px; line-height: 1.5; flex-shrink: 0; }
+.act-body { flex: 1; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.act-body b { font-size: 12px; font-weight: 600; color: var(--ink); line-height: 1.45; }
+.act-body em { font-style: normal; font-size: 11px; color: var(--ink-dim); line-height: 1.45; }
+.act-time { font-family: 'Archivo'; font-size: 9.5px; color: var(--ink-dim); flex-shrink: 0; }
 .db-why { flex-basis: 100%; font-size: 10.5px; color: var(--ink-dim); line-height: 1.5; }
 @media (max-width: 560px) { .desk-stats { grid-template-columns: repeat(2, 1fr); } }
 .dbf-warn { font-size: 11.5px; line-height: 1.6; color: var(--ink); background: rgba(245,196,81,0.07); border-left: 2px solid var(--amber); padding: 9px 11px; border-radius: 6px; margin: 0 0 12px; }
