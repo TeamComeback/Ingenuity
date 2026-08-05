@@ -1180,7 +1180,13 @@ async function deskGrade() {
         for (const [k, b] of open) {
             if (b.day !== d)
                 continue;
-            const hit = finals.find((f) => normName(f.away) === normName(b.away) && normName(f.home) === normName(b.home));
+            // Both sides must go through the same resolver. MLB says "Pittsburgh
+            // Pirates" and the board may have stored "Pirates" or the reverse;
+            // comparing a resolved name to an unresolved one never matches, which
+            // would leave every bet sitting open forever.
+            const bAway = normName(resolveTeamName(b.away) || b.away);
+            const bHome = normName(resolveTeamName(b.home) || b.home);
+            const hit = finals.find((f) => normName(f.away) === bAway && normName(f.home) === bHome);
             if (!hit)
                 continue;
             const total = hit.total;
@@ -8530,7 +8536,7 @@ function DeskTab() {
                 ? React.createElement("p", { className: "dbf-note" }, "No board saved for today. Run the morning refresh and scan the slate first \u2014 the desk prices off the projection frozen at scan time, never a fresh one.")
                 : committedToday
                     ? React.createElement(React.Fragment, null,
-                        React.createElement("p", { className: "dbf-note" }, "Today is committed. The desk gets one look at a board and lives with it."),
+                        React.createElement("p", { className: "dbf-note" }, "Today is committed \u2014 the desk commits itself when you scan the board, and gets one look. Committing only on days you liked the pick would leave the days you skipped out of its record, so it isn't optional."),
                         Object.values(log).filter((b) => b.day === today).map((b, i) => React.createElement("div", { key: i, className: "desk-bet" },
                             b.pass
                                 ? React.createElement("span", { className: "db-pass" }, "Passed \u2014 nothing cleared the bar")
@@ -8548,8 +8554,9 @@ function DeskTab() {
                                 React.createElement("span", { className: "db-why" }, c.pMkt != null
                                     ? `model ${(c.pRaw * 100).toFixed(0)}% blended with market ${(c.pMkt * 100).toFixed(0)}% at ${(c.w * 100).toFixed(0)}% model weight \u2192 ${(c.p * 100).toFixed(1)}%${c.flat ? " \u00B7 flat stake until the desk has a record" : ""}`
                                     : `model ${(c.p * 100).toFixed(1)}% \u2014 no two-way price to blend against`))),
-                        React.createElement("button", { className: "ing-primary", onClick: commit, disabled: !!busy },
-                            busy === "commit" ? "\u2026" : ev.taken.length ? `Commit ${ev.taken.length} paper bet${ev.taken.length === 1 ? "" : "s"}` : "Record today as a pass")),
+                        React.createElement("button", { className: "ing-ghost", onClick: commit, disabled: !!busy },
+                            busy === "commit" ? "\u2026" : ev.taken.length ? `Commit ${ev.taken.length} paper bet${ev.taken.length === 1 ? "" : "s"} manually` : "Record today as a pass"),
+                        React.createElement("p", { className: "dbf-note" }, "Normally this happens by itself when you scan the board. This button is only needed if the board was scanned before the desk existed, or the automatic commit failed.")),
             ev && ev.flagged && ev.flagged.length > 0 && React.createElement("p", { className: "dbf-warn" },
                 React.createElement("b", null, `${ev.flagged.length} game${ev.flagged.length === 1 ? "" : "s"} disagree with the market too far to be real `),
                 `(${ev.flagged.slice(0, 3).map((c) => `${c.label} ${c.side} by ${Math.abs(c.edge).toFixed(1)} runs`).join(", ")}). The model disagrees with the market by more than the ${DESK.MAX_EDGE_RUNS} runs it is typically wrong by, so the gap is more likely a broken input than an edge \u2014 a stale price, the wrong starter, a bad import. Not bet, and worth checking.`),
@@ -8670,6 +8677,7 @@ const MORNING_PLAN = [
     { key: "bullpen", label: "Bullpen workload", hint: "last 3 days of box scores" },
     { key: "recentform", label: "Recent form (14d)", hint: "outcome wOBA + BB%\u2212K%, MLB Stats API" },
     { key: "lineups", label: "Batting orders", hint: "usually posted ~3h before first pitch" },
+    { key: "settle", label: "Settle the desk", hint: "grade yesterday's paper bets against real finals" },
 ];
 // ---- Grading coverage & significance ----------------------------------------
 // Why a game never got a projection. Stored on the board at scan time so the
@@ -9394,6 +9402,16 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
             const left = [...new Set(lu.notPosted)].length;
             return { state: left ? "warn" : "ok", note: `${lu.got.length} team${lu.got.length === 1 ? "" : "s"}${left ? `, ${left} not posted yet` : ""}` };
         });
+        await run("settle", async () => {
+            // Yesterday's bets settle themselves rather than waiting for a visit to
+            // the Desk tab. A record that only updates when you remember to look
+            // is a record you cannot trust.
+            const { graded } = await deskGrade();
+            const rec = deskRecord(await store.get(DESK_KEY, {}));
+            if (!graded)
+                return { state: "skip", note: rec.open ? `${rec.open} still awaiting a final` : "nothing open to settle" };
+            return { state: "ok", note: `${graded} settled \u00B7 desk now ${rec.w}\u2013${rec.l}${rec.push ? `\u2013${rec.push}` : ""}, ${rec.units > 0 ? "+" : ""}${rec.units}u` };
+        });
         // Refresh the on-screen board from what actually persisted.
         const finalArch = await store.get("ingenuity:slate:archive", {});
         if (finalArch[todayKey])
@@ -9772,6 +9790,30 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
         const onSeason = scored.filter((r) => r.lu && r.lu.a && r.lu.h && r.lu.a.source !== "lineup" && r.lu.h.source !== "lineup").length;
         await logActivity("scan", `Scanned ${viewDate} \u2014 ${scored.length} of ${slate.games.length} games priced`,
             `${onLineups} on today's lineups, ${onSeason} on season numbers, ${slate.games.length - scored.length} unpriced`);
+        // The desk commits itself the moment a board is priced, and only for today.
+        // This is an integrity requirement, not a convenience: if committing were
+        // a choice made after seeing the pick, the days you chose to skip would be
+        // missing from the record, and the desk's numbers would flatter it. It has
+        // to live with every board it is shown.
+        if (viewDate === todayKey) {
+            try {
+                const boardNow = (await store.get("ingenuity:slate:archive", {}))[todayKey];
+                if (boardNow && boardNow.games) {
+                    const priorN = deskRecord(await store.get(DESK_KEY, {})).n;
+                    const dv = deskEvaluate(boardNow.games, todayKey, priorN);
+                    const { added, already } = await deskCommit(todayKey, dv.taken);
+                    if (!already)
+                        await logActivity("desk", added
+                            ? `Desk committed ${added} paper bet${added === 1 ? "" : "s"} off this scan`
+                            : "Desk passed on today \u2014 nothing cleared the bar",
+                            dv.taken.map((c) => `${c.side} ${c.line} ${c.label} ${c.units}u`).join(" \u00B7 ") || null);
+                }
+            }
+            catch (e) {
+                // The desk failing must never take the scan down with it.
+                await logActivity("desk", "Desk couldn't commit off this scan", String(e && e.message ? e.message : e));
+            }
+        }
         setScanAt(new Date().toISOString());
         // A scan of a past board is research — it must not overwrite today's read.
         if (viewDate === todayKey) {
