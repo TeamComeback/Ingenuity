@@ -1301,11 +1301,64 @@ async function fetchAllRosters() {
     }
     return { people, failed, clubs: teamList.length };
 }
+// One identity source for the whole app, cached for the day. The 40-man sweep
+// is 31 requests; every consumer after the first should be free. Position comes
+// from MLB rather than being inferred from column shapes or name spelling.
+const IDENTITY_KEY = "ingenuity:mlb:identity";
+async function buildIdentityIndex(force) {
+    if (!force) {
+        const cached = await store.get(IDENTITY_KEY, null);
+        if (cached && cached.asOf === etDayKey() && cached.people && cached.people.length)
+            return { ...cached, fromCache: true };
+    }
+    const { people, failed, clubs } = await fetchAllRosters();
+    const idx = { asOf: etDayKey(), people, failed, clubs, fromCache: false };
+    await store.set(IDENTITY_KEY, idx);
+    return idx;
+}
+// Resolve one stored player against MLB. Id first, then full name WITH suffix,
+// then the loose key only when it is unique. Ambiguity is reported, never
+// guessed — a wrong identity is worse than an unknown one.
+function resolveIdentity(pl, idx) {
+    if (!pl || !pl.name || !idx || !idx.people)
+        return { rec: null, how: "none" };
+    if (!idx._byId) {
+        idx._byId = new Map();
+        idx._byFull = new Map();
+        idx._byLoose = new Map();
+        for (const r of idx.people) {
+            if (r.id)
+                idx._byId.set(String(r.id), r);
+            const f = normFull(r.name), l = normName(r.name);
+            if (!idx._byFull.has(f))
+                idx._byFull.set(f, []);
+            idx._byFull.get(f).push(r);
+            if (!idx._byLoose.has(l))
+                idx._byLoose.set(l, []);
+            idx._byLoose.get(l).push(r);
+        }
+    }
+    if (pl.mlbId && idx._byId.has(String(pl.mlbId)))
+        return { rec: idx._byId.get(String(pl.mlbId)), how: "id" };
+    const exact = idx._byFull.get(normFull(pl.name)) || [];
+    if (exact.length === 1)
+        return { rec: exact[0], how: "name" };
+    if (exact.length > 1)
+        return { rec: null, how: "ambiguous", options: exact };
+    const loose = idx._byLoose.get(normName(pl.name)) || [];
+    if (loose.length === 1)
+        return { rec: loose[0], how: "loose" };
+    if (loose.length > 1)
+        return { rec: null, how: "ambiguous", options: loose };
+    return { rec: null, how: "unknown" };
+}
 async function planRosterReconcile(teams) {
     const out = { moves: [], inactive: [], unknown: [], ambiguous: [], idStamps: [],
         unknownTeams: [], missingFromDb: 0, checked: 0, feedSize: 0, failedClubs: [], err: null };
     try {
-        const { people, failed, clubs } = await fetchAllRosters();
+        // Share the day's cached index with the misplaced-players check rather
+        // than sweeping all 30 clubs twice.
+        const { people, failed, clubs } = await buildIdentityIndex(false);
         out.feedSize = people.length;
         out.failedClubs = failed;
         // A partial sweep would read as mass departures. Refuse rather than
@@ -3281,77 +3334,74 @@ function Terminal({ onHome, pendingGame, onPendingConsumed }) {
 // which needs the file that put them there: MLB's own position, and the fact
 // that the same name already appears on some rotation in this database (a
 // pitcher listed in both buckets is self-evidently misfiled).
-function findMisfiledPitchers(teams, posMap) {
-    const known = new Set();
-    for (const t of teams)
-        for (const pl of (t.rotation || []))
-            if (pl && pl.name)
-                known.add(normName(pl.name));
-    const out = [];
+// Players in the wrong bucket, checked BOTH directions against MLB's own
+// position. The old version keyed position by normName, which strips Jr/Sr and
+// let an infielder inherit a pitcher's position; and its second detector — "this
+// name is already on some rotation" — was circular, confirming one collision
+// with another. Both are gone.
+//
+// The reverse direction is checked too: a hitter sitting in a rotation is worse
+// than a pitcher sitting among hitters, because the projection can price him as
+// an arm. It also finds damage from any earlier bad move.
+function findMisplaced(teams, idx) {
+    const out = { toRotation: [], toPlayers: [], ambiguous: [], unknown: 0, checked: 0 };
+    if (!idx || !idx.people || !idx.people.length)
+        return out;
     for (const t of teams) {
-        for (const pl of (t.players || [])) {
-            if (!pl || !pl.name)
-                continue;
-            const k = normName(pl.name);
-            const byPos = posMap && posMap[k] === "P";
-            const byRoster = known.has(k);
-            if (byPos || byRoster)
-                out.push({ team: t.name, name: pl.name, why: byPos ? "position" : "rotation" });
+        for (const bucket of ["players", "rotation"]) {
+            for (const pl of (t[bucket] || [])) {
+                if (!pl || !pl.name)
+                    continue;
+                out.checked++;
+                const { rec, how, options } = resolveIdentity(pl, idx);
+                if (how === "ambiguous") {
+                    out.ambiguous.push({ team: t.name, bucket, name: pl.name,
+                        options: (options || []).map((o) => `${o.name} (${o.team}, ${o.pitcher ? "P" : "position"})`) });
+                    continue;
+                }
+                if (!rec) {
+                    out.unknown++;
+                    continue;
+                }
+                if (bucket === "players" && rec.pitcher)
+                    out.toRotation.push({ team: t.name, name: pl.name, id: rec.id, how });
+                else if (bucket === "rotation" && !rec.pitcher)
+                    out.toPlayers.push({ team: t.name, name: pl.name, id: rec.id, how });
+            }
         }
     }
     return out;
 }
-// Move them across. A pitcher's wOBA figure is xwOBA ALLOWED, which is exactly
-// what a rotation entry stores, so the number carries over rather than being
-// thrown away. Anyone already on the rotation is just removed from the hitters.
-function repairMisfiledPitchers(teams, posMap) {
-    const hits = findMisfiledPitchers(teams, posMap);
-    if (!hits.length)
-        return { next: teams, moved: 0, merged: 0 };
-    const byTeam = new Map();
-    for (const h of hits)
-        byTeam.set(h.team, (byTeam.get(h.team) || new Set()).add(normName(h.name)));
+// Move them, carrying stats. A pitcher's wOBA figure is xwOBA allowed, which is
+// what a rotation entry stores; a hitter's is offence, which is what a players
+// entry stores. Each direction maps to the right field.
+function repairMisplaced(teams, found) {
+    const next = teams.map((t) => ({ ...t, players: [...(t.players || [])], rotation: [...(t.rotation || [])] }));
+    const at = new Map(next.map((t, i) => [normName(t.name), i]));
     let moved = 0, merged = 0;
-    const next = teams.map((t) => {
-        const drop = byTeam.get(t.name);
-        if (!drop)
-            return t;
-        const rot = [...(t.rotation || [])];
-        const onRot = new Set(rot.map((p) => normName(p.name)));
-        const players = [];
-        for (const pl of (t.players || [])) {
-            const k = normName(pl.name || "");
-            if (!drop.has(k)) {
-                players.push(pl);
+    const shift = (list, fromKey, toKey, mapFn) => {
+        for (const item of list) {
+            const i = at.get(normName(item.team));
+            if (i == null)
+                continue;
+            const from = next[i][fromKey], to = next[i][toKey];
+            const k = from.findIndex((p) => normName(p.name) === normName(item.name));
+            if (k < 0)
+                continue;
+            const [pl] = from.splice(k, 1);
+            if (to.some((p) => normName(p.name) === normName(pl.name))) {
+                merged++;
                 continue;
             }
-            if (onRot.has(k)) {
-                merged++; // already a pitcher here; just stop listing him as a hitter
-                continue;
-            }
-            rot.push({ name: pl.name, xwoba: pl.woba || "", bf: pl.pa || "", ip: "", era: "" });
-            onRot.add(k);
+            to.push({ ...mapFn(pl), mlbId: item.id || pl.mlbId });
             moved++;
         }
-        return { ...t, players, rotation: rot };
-    });
-    return { next, moved, merged };
-}
-function MisfiledPitchers({ teams, posMap, onRepair }) {
-    const [armed, setArmed] = useState(false);
-    const hits = findMisfiledPitchers(teams, posMap);
-    if (!hits.length)
-        return null;
-    const byPos = hits.filter((h) => h.why === "position").length;
-    return React.createElement("section", { className: "fresh-repair misfiled" },
-        React.createElement("p", null,
-            React.createElement("b", null, `${hits.length} pitcher${hits.length === 1 ? " is" : "s are"} filed as hitters. `),
-            `Savant's pitcher export uses the same columns as its hitter export ` + "\u2014" + ` pa, woba, est_woba, no ERA ` + "\u2014" + ` so an import had no way to tell them apart from the file alone. Their wOBA figures are runs ALLOWED, and while they sit in the lineup pool the engine reads them as offence. ${byPos ? `${byPos} confirmed by MLB position` : ""}${byPos && byPos < hits.length ? ", " : ""}${hits.length - byPos ? `${hits.length - byPos} already on a rotation here` : ""}.`),
-        React.createElement("p", { className: "misfiled-list" }, hits.slice(0, 12).map((h) => `${h.name} (${h.team})`).join(" \u00B7 "), hits.length > 12 ? ` \u00B7 +${hits.length - 12} more` : ""),
-        !posMap && React.createElement("p", { className: "misfiled-note" }, "MLB positions aren't cached, so this is only catching names already on a rotation. Sync MLB rosters in the Database import box to catch the rest."),
-        React.createElement("button", { className: "ing-ghost", onClick: () => { if (!armed) { setArmed(true); return; } onRepair(); setArmed(false); } },
-            armed ? `Confirm ` + "\u2014" + ` move ${hits.length} to the pitching staff` : "Move them to the pitching staff"),
-        armed && React.createElement("button", { className: "ing-ghost", onClick: () => setArmed(false) }, "Cancel"));
+    };
+    shift(found.toRotation, "players", "rotation", (pl) => ({
+        name: pl.name, xwoba: pl.woba || "", bf: pl.pa || "", ip: "", era: "" }));
+    shift(found.toPlayers, "rotation", "players", (pl) => ({
+        name: pl.name, woba: pl.xwoba || "", pa: pl.bf || "" }));
+    return { next: next.map((t) => recomputeFromRoster(t)), moved, merged };
 }
 function RosterReconcile({ teams, onApply }) {
     const [plan, setPlan] = useState(null);
@@ -3366,7 +3416,7 @@ function RosterReconcile({ teams, onApply }) {
         setPlan(p2);
         setBusy(false);
         if (p2.err)
-            setMsg(`Couldn't check rosters: ${p2.err}. Nothing was changed.`);
+            setMsg(`Couldn't check rosters: ${p2.err} Nothing was changed.`);
     };
     const apply = () => {
         const { next, moved, flagged, reactivated, stamped } = applyRosterReconcile(teams, plan);
@@ -3380,27 +3430,26 @@ function RosterReconcile({ teams, onApply }) {
         React.createElement("div", { className: "rla-head" },
             React.createElement("span", { className: "bc-title" }, "Roster reconcile \u00B7 trade deadline"),
             React.createElement("button", { className: "ing-ghost", onClick: run, disabled: busy || !teams.length }, busy ? "Checking\u2026" : plan ? "Re-check" : "Check rosters")),
-        !plan && React.createElement("p", { className: "grade-note" }, "Compares every player in your database against MLB's current rosters and shows who moved. Nothing changes until you confirm. Archived boards and the results log are never touched \u2014 a projection frozen in July used July's roster, and that is the honest record of what the model knew."),
+        !plan && React.createElement("p", { className: "grade-note" }, "Reads all 30 clubs' 40-man rosters from MLB and shows who moved, matched by player id. Nothing changes until you confirm. Archived boards and the results log are never touched \u2014 a projection frozen in July used July's roster, and that is the honest record of what the model knew."),
         msg && React.createElement("p", { className: "ing-hint" }, msg),
         plan && !plan.err && React.createElement(React.Fragment, null,
             React.createElement("p", { className: "rla-sum" },
-                `Checked ${plan.checked} player${plan.checked === 1 ? "" : "s"} against MLB's ${plan.feedSize}-player feed. `,
-                React.createElement("b", null, `${plan.checked - plan.unknown.length - plan.ambiguous.length} matched a club by ${plan.idStamps.length ? "name (ids now recorded)" : "id"}`),
+                `Checked ${plan.checked} player${plan.checked === 1 ? "" : "s"} against ${plan.feedSize} on 40-man rosters. `,
+                React.createElement("b", null, `${plan.checked - plan.unknown.length - plan.ambiguous.length} matched a club`),
                 plan.unknown.length ? `, ${plan.unknown.length} aren't on any 40-man` : "",
                 plan.ambiguous.length ? `, ${plan.ambiguous.length} ambiguous` : "",
                 "."),
             plan.failedClubs.length > 0 && React.createElement("p", { className: "grade-note" }, `Note: ${plan.failedClubs.join(", ")} didn't return a roster, so their players were not checked.`),
             plan.ambiguous.length > 0 && React.createElement("div", { className: "rla-group" },
                 React.createElement("h5", null, `${plan.ambiguous.length} ambiguous name${plan.ambiguous.length === 1 ? "" : "s"} \u2014 not moved`),
-                React.createElement("p", { className: "grade-note" }, "More than one player on a 40-man roster shares this name, so there is no safe way to tell which one your record refers to. Nothing is moved. Open the team in the editor and correct the name to match MLB exactly (including any Jr./Sr.), then re-check \u2014 the id gets recorded and it will never be ambiguous again."),
+                React.createElement("p", { className: "grade-note" }, "More than one player on a 40-man shares this name, so there is no safe way to tell which one your record refers to. Correct the name to match MLB exactly (including any Jr./Sr.), then re-check \u2014 the id gets recorded and it will never be ambiguous again."),
                 React.createElement("div", { className: "rla-list" }, plan.ambiguous.slice(0, 8).map((a, i) => React.createElement("div", { key: i, className: "rla-row bad" },
                     React.createElement("span", null, `${a.name} (${a.team})`),
                     React.createElement("i", null, a.options.map((o2) => `${o2.name} \u2013 ${o2.team}`).join(" or ")))))),
             plan.unknown.length > 0 && React.createElement("div", { className: "rla-group" },
                 React.createElement("h5", null, `${plan.unknown.length} not on any 40-man roster`),
-                React.createElement("p", { className: "grade-note" }, "Checked against all 30 clubs' 40-man rosters, so these are minor leaguers, released players, or names picked up from a broader stats export. They are left completely alone \u2014 their stats stay and they keep counting as they did before."),
+                React.createElement("p", { className: "grade-note" }, "Checked against all 30 clubs, so these are minor leaguers, released players, or names picked up from a broader stats export. They are left completely alone \u2014 their stats stay and they keep counting as they did before."),
                 React.createElement("p", { className: "dbf-inline" }, plan.unknown.slice(0, 8).map((x) => `${x.name} (${x.team})`).join(" \u00B7 "), plan.unknown.length > 8 ? ` \u00B7 +${plan.unknown.length - 8}` : "")),
-
             moves.length === 0 && plan.inactive.length === 0 && reacts.length === 0 && plan.idStamps.length === 0
                 ? React.createElement("p", { className: "grade-note ok" }, "Every player on a 40-man is already on the right team, and all ids are recorded. Nothing to do.")
                 : React.createElement(React.Fragment, null,
@@ -3411,14 +3460,74 @@ function RosterReconcile({ teams, onApply }) {
                             React.createElement("i", null, `${m.from} \u2192 ${m.to}`)))),
                         moves.length > 12 && React.createElement("p", { className: "grade-note" }, `+${moves.length - 12} more`)),
                     plan.inactive.length > 0 && React.createElement("div", { className: "rla-group" },
-                        React.createElement("h5", null, `${plan.inactive.length} not on any MLB roster today`),
-                        React.createElement("p", { className: "grade-note" }, "Optioned, released, or on the injured list. Their stats are kept \u2014 they are only flagged so they stop counting toward a current-roster figure, and they come back automatically if they return."),
+                        React.createElement("h5", null, `${plan.inactive.length} no longer on a 40-man`),
+                        React.createElement("p", { className: "grade-note" }, "Their stats are kept \u2014 they are only flagged so they stop counting toward a current-roster figure, and they come back automatically if they return."),
                         React.createElement("p", { className: "dbf-inline" }, plan.inactive.slice(0, 10).map((x) => `${x.name} (${x.team})`).join(" \u00B7 "), plan.inactive.length > 10 ? ` \u00B7 +${plan.inactive.length - 10}` : "")),
                     reacts.length > 0 && React.createElement("p", { className: "grade-note" }, `${reacts.length} previously-inactive player${reacts.length === 1 ? " is" : "s are"} back on a roster and will be reactivated.`),
-                    plan.missingFromDb > 0 && React.createElement("p", { className: "grade-note" }, `${plan.missingFromDb} player${plan.missingFromDb === 1 ? "" : "s"} on MLB rosters aren't in your database at all. They aren't added here \u2014 a name with no stats can't be projected, so the fix is a stats import rather than a placeholder that looks like data.`),
+                    plan.missingFromDb > 0 && React.createElement("p", { className: "grade-note" }, `${plan.missingFromDb} player${plan.missingFromDb === 1 ? "" : "s"} on 40-man rosters aren't in your database at all. They aren't added here \u2014 a name with no stats can't be projected, so the fix is a stats import rather than a placeholder that looks like data.`),
                     plan.unknownTeams.length > 0 && React.createElement("p", { className: "grade-note" }, `Skipped players moving to clubs not in your database: ${plan.unknownTeams.join(", ")}.`),
                     React.createElement("button", { className: "ing-ghost", onClick: () => (armed ? apply() : setArmed(true)) },
                         armed ? `Confirm \u2014 ${moves.length} move${moves.length === 1 ? "" : "s"}, ${plan.inactive.length} flag${plan.inactive.length === 1 ? "" : "s"}, ${plan.idStamps.length} id${plan.idStamps.length === 1 ? "" : "s"}` : "Apply these changes"),
+                    armed && React.createElement("button", { className: "ing-ghost", onClick: () => setArmed(false) }, "Cancel"))));
+}
+function MisplacedPlayers({ teams, onApply }) {
+    const [idx, setIdx] = useState(null);
+    const [found, setFound] = useState(null);
+    const [busy, setBusy] = useState(false);
+    const [armed, setArmed] = useState(false);
+    const [msg, setMsg] = useState("");
+    const check = async () => {
+        setBusy(true);
+        setMsg("");
+        setArmed(false);
+        try {
+            // Cached for the day, so this is usually free after the reconcile.
+            const i2 = await buildIdentityIndex(false);
+            setIdx(i2);
+            setFound(findMisplaced(teams, i2));
+            if (i2.failed && i2.failed.length)
+                setMsg(`${i2.failed.join(", ")} didn't return a roster, so their players weren't checked.`);
+            else if (i2.fromCache)
+                setMsg("Using today's cached roster data \u2014 no requests made.");
+        }
+        catch (e) {
+            setMsg(`Couldn't load MLB rosters: ${e && e.message ? e.message : e}. Nothing was checked or changed.`);
+        }
+        setBusy(false);
+    };
+    const total = found ? found.toRotation.length + found.toPlayers.length : 0;
+    return React.createElement("section", { className: "fresh-repair misfiled" },
+        React.createElement("div", { className: "rla-head" },
+            React.createElement("span", { className: "bc-title" }, "Players in the wrong bucket"),
+            React.createElement("button", { className: "ing-ghost", onClick: check, disabled: busy || !teams.length }, busy ? "Checking\u2026" : found ? "Re-check" : "Check")),
+        !found && React.createElement("p", { className: "grade-note" }, "Savant's pitcher and hitter exports share the same columns, so an import can't tell them apart from the file alone. This checks every player against MLB's own listed position, matched by player id rather than by name."),
+        msg && React.createElement("p", { className: "ing-hint" }, msg),
+        found && React.createElement(React.Fragment, null,
+            React.createElement("p", { className: "rla-sum" }, `Checked ${found.checked} players.`, found.unknown ? ` ${found.unknown} aren't on a 40-man and were skipped.` : ""),
+            total === 0 && found.ambiguous.length === 0
+                ? React.createElement("p", { className: "grade-note ok" }, "Everyone MLB recognises is in the right bucket.")
+                : React.createElement(React.Fragment, null,
+                    found.toRotation.length > 0 && React.createElement("div", { className: "rla-group" },
+                        React.createElement("h5", null, `${found.toRotation.length} pitcher${found.toRotation.length === 1 ? "" : "s"} filed as hitters`),
+                        React.createElement("p", { className: "grade-note" }, "Their wOBA is runs allowed, not offence. While they sit in the lineup pool the engine counts them as bats."),
+                        React.createElement("p", { className: "dbf-inline" }, found.toRotation.map((x) => `${x.name} (${x.team})${x.how === "id" ? "" : " \u00B7 by name"}`).join(" \u00B7 "))),
+                    found.toPlayers.length > 0 && React.createElement("div", { className: "rla-group" },
+                        React.createElement("h5", null, `${found.toPlayers.length} hitter${found.toPlayers.length === 1 ? "" : "s"} filed as pitchers`),
+                        React.createElement("p", { className: "grade-note" }, "This is the more damaging direction: a hitter left in a rotation can be picked up as a probable starter and priced as an arm allowing his batting wOBA, and he drags the bullpen rating with him."),
+                        React.createElement("p", { className: "dbf-inline" }, found.toPlayers.map((x) => `${x.name} (${x.team})${x.how === "id" ? "" : " \u00B7 by name"}`).join(" \u00B7 "))),
+                    found.ambiguous.length > 0 && React.createElement("div", { className: "rla-group" },
+                        React.createElement("h5", null, `${found.ambiguous.length} ambiguous \u2014 not touched`),
+                        React.createElement("p", { className: "grade-note" }, "More than one player shares this name and none matched exactly, so there is no safe way to say which one this record is. Correct the spelling to match MLB (including any Jr./Sr.) and re-run the roster reconcile to record the id."),
+                        React.createElement("div", { className: "rla-list" }, found.ambiguous.slice(0, 6).map((a, i) => React.createElement("div", { key: i, className: "rla-row bad" },
+                            React.createElement("span", null, `${a.name} (${a.team})`),
+                            React.createElement("i", null, a.options.join(" or ")))))),
+                    total > 0 && React.createElement("button", { className: "ing-ghost", onClick: () => {
+                            if (!armed) { setArmed(true); return; }
+                            const { next, moved, merged } = repairMisplaced(teams, found);
+                            onApply(next, `Moved ${moved} player${moved === 1 ? "" : "s"} into the right bucket${merged ? `, removed ${merged} duplicate${merged === 1 ? "" : "s"}` : ""}. Offense and bullpen ratings recomputed.`);
+                            setArmed(false);
+                            setFound(null);
+                        } }, armed ? `Confirm \u2014 move ${total}` : "Move them to the right bucket"),
                     armed && React.createElement("button", { className: "ing-ghost", onClick: () => setArmed(false) }, "Cancel"))));
 }
 // Freshness strip: what this team carries and when each piece was last loaded.
@@ -3491,17 +3600,7 @@ function FreshnessAudit({ teams, onRepair }) {
 }
 function Database({ teams, saveTeams, loaded }) {
     const [editing, setEditing] = useState({ ...EMPTY_TEAM });
-    const [posMap, setPosMap] = useState(null); // MLB primaryPosition, cached by the roster sync
     const [fixNote, setFixNote] = useState("");
-    useEffect(() => {
-        let live = true;
-        (async () => {
-            const rm = await store.get("ingenuity:mlb:rosterMap", null);
-            if (live && rm && rm.pos)
-                setPosMap(rm.pos);
-        })();
-        return () => { live = false; };
-    }, []);
     const [editIndex, setEditIndex] = useState(-1);
     const [openRoster, setOpenRoster] = useState(-1);
     const commitTeam = () => {
@@ -3546,11 +3645,7 @@ function Database({ teams, saveTeams, loaded }) {
         .filter(({ items }) => items.length > 0);
     return (React.createElement("main", { className: "ing-db" },
         teams.length > 0 && React.createElement(RosterReconcile, { teams: teams, onApply: (next, note) => { saveTeams(next); setFixNote(note); } }),
-        teams.length > 0 && React.createElement(MisfiledPitchers, { teams: teams, posMap: posMap, onRepair: () => {
-            const { next, moved, merged } = repairMisfiledPitchers(teams, posMap);
-            saveTeams(next);
-            setFixNote(`Moved ${moved} pitcher${moved === 1 ? "" : "s"} to the pitching staff${merged ? `, and removed ${merged} duplicate${merged === 1 ? "" : "s"} already listed there` : ""}.`);
-        } }),
+        teams.length > 0 && React.createElement(MisplacedPlayers, { teams: teams, onApply: (next, note) => { saveTeams(next); setFixNote(note); } }),
         fixNote && React.createElement("p", { className: "fresh-audit-note fixnote" }, fixNote),
         teams.length > 0 && React.createElement(FreshnessAudit, { teams: teams, onRepair: (names) => {
             const hit = new Set(names);
