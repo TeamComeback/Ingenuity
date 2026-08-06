@@ -8657,12 +8657,12 @@ function DebriefTab({ teams }) {
         React.createElement("section", { className: "ing-card dbf-color" },
             React.createElement("h3", null, "Worth reading, not acting on"),
             React.createElement("p", { className: "dbf-warn" }, "Everything below is one game. A walk-off, a meltdown and a gem are the most memorable things that happened and among the least predictive \u2014 your model already prices these teams from full-season rates. Enjoy it; don't move a number for it."),
-            C.walkoffs.length > 0 && row("Walk-offs", C.walkoffs.map((w) => `${w.home} over ${w.away} ${w.hs}-${w.as}${w.extras ? ` in ${w.innings}` : ""}`).join(" \u00B7 ")),
-            C.extras.length > 0 && row("Longest", C.extras.map((x) => `${x.away} @ ${x.home} ${x.innings} innings, ${x.as}-${x.hs}`).join(" \u00B7 ")),
-            C.gems.length > 0 && row("Gems", C.gems.map((x) => `${x.name} (${x.team}) ${x.ip} ip shutout, ${x.k} K`).join(" \u00B7 ")),
-            C.melt.length > 0 && row("Pen meltdowns", C.melt.map((m) => `${m.team} pen ${m.er} ER in ${m.ip} ip vs ${m.vs}`).join(" \u00B7 ")),
-            C.slugfests.length > 0 && row("Highest scoring", C.slugfests.map((x) => `${x.away} @ ${x.home} ${x.total} runs`).join(" \u00B7 ")),
-            C.pitchers.length > 0 && row("Lowest scoring", C.pitchers.map((x) => `${x.away} @ ${x.home} ${x.total} runs`).join(" \u00B7 ")),
+            C.walkoffs.length > 0 && row("Walk-offs", C.walkoffs.map((w) => `${w.home} over ${w.away} ${w.hs}-${w.as}${w.extras ? ` in ${w.innings}` : ""} — ${dayLabelShort(w.day)}${windowOf(w) ? `, ${windowOf(w)}` : ""}`).join(" \u00B7 ")),
+            C.extras.length > 0 && row("Longest", C.extras.map((x) => `${x.away} @ ${x.home} ${x.innings} innings, ${x.as}-${x.hs} — ${dayLabelShort(x.day)}${windowOf(x) ? `, ${windowOf(x)}` : ""}${x.durationMin ? ` (${Math.floor(x.durationMin / 60)}h ${x.durationMin % 60}m)` : ""}`).join(" \u00B7 ")),
+            C.gems.length > 0 && row("Gems", C.gems.map((x) => `${x.name} (${x.team}) ${x.ip} ip shutout, ${x.k} K — ${dayLabelShort(x.day)}`).join(" \u00B7 ")),
+            C.melt.length > 0 && row("Pen meltdowns", C.melt.map((m) => `${m.team} pen ${m.er} ER in ${m.ip} ip vs ${m.vs} — ${dayLabelShort(m.day)}`).join(" \u00B7 ")),
+            C.slugfests.length > 0 && row("Highest scoring", C.slugfests.map((x) => `${x.away} @ ${x.home} ${x.total} runs — ${dayLabelShort(x.day)}`).join(" \u00B7 ")),
+            C.pitchers.length > 0 && row("Lowest scoring", C.pitchers.map((x) => `${x.away} @ ${x.home} ${x.total} runs — ${dayLabelShort(x.day)}`).join(" \u00B7 ")),
             C.blowouts.length > 0 && row("Biggest margins", C.blowouts.map((x) => `${x.as > x.hs ? x.away : x.home} by ${x.margin} \u2014 ${dayLabelShort(x.day)}`).join(" \u00B7 "))));
 }
 // v2.1 — the morning chore list, in dependency order. Rosters feed name
@@ -11148,6 +11148,12 @@ const CSS = `
   --field: #0a1712; --field2: #0f2019; --line: #1c3329;
   --phos: #34e6a8; --phos-dim: #1a7a5c; --cyan: #5fd9e8;
   --ink: #d8e8e0; --ink-dim: #7a998c; --amber: #f5c451; --rust: #e8734f;
+  /* Benjamin Moore 2066-70 Light Blue paired with a warm gold. Reserved for the
+     reading surfaces — the debrief colour block and the desk record — so the
+     green/amber/rust system keeps its meaning everywhere decisions are made.
+     At 87% lightness the blue is near-white on this background, so it is used
+     for text and hairlines, never as a fill. */
+  --sky: #cae9f1; --sky-dim: rgba(202,233,241,0.55); --gold: #e3bc6a;
   font-family: 'Space Grotesk', system-ui, sans-serif;
   background: radial-gradient(ellipse at 50% -10%, #103026 0%, #08160f 55%, #050d09 100%);
   color: var(--ink); min-height: 100vh; line-height: 1.45;
@@ -11874,6 +11880,18 @@ const CSS = `
 .act-body b { font-size: 12px; font-weight: 600; color: var(--ink); line-height: 1.45; }
 .act-body em { font-style: normal; font-size: 11px; color: var(--ink-dim); line-height: 1.45; }
 .act-time { font-family: 'Archivo'; font-size: 9.5px; color: var(--ink-dim); flex-shrink: 0; }
+/* --- debrief colour block: sky + gold pairing --- */
+.dbf-color { border-left-color: var(--gold) !important; }
+.dbf-color h3 { color: var(--gold); }
+.dbf-color .dbf-lbl { color: var(--gold); opacity: 0.85; }
+.dbf-color .dbf-body { color: var(--sky); }
+.dbf-color .dbf-row { border-bottom-color: rgba(202,233,241,0.10); }
+.dbf-color .dbf-warn { background: rgba(227,188,106,0.07); border-left-color: var(--gold); color: var(--sky-dim); }
+/* --- desk record: same pairing on the headline figures --- */
+.desk-stats em { color: var(--gold); opacity: 0.8; }
+.desk-stats strong { color: var(--sky); }
+.desk .dbf-head h2 { color: var(--sky); }
+
 .db-why { flex-basis: 100%; font-size: 10.5px; color: var(--ink-dim); line-height: 1.5; }
 @media (max-width: 560px) { .desk-stats { grid-template-columns: repeat(2, 1fr); } }
 .dbf-warn { font-size: 11.5px; line-height: 1.6; color: var(--ink); background: rgba(245,196,81,0.07); border-left: 2px solid var(--amber); padding: 9px 11px; border-radius: 6px; margin: 0 0 12px; }
