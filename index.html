@@ -7796,9 +7796,57 @@ function shortTeam(n) {
     const w = String(n || "").trim().split(/\s+/);
     return w[w.length - 1] || "?";
 }
+// Log a research row straight off the board's frozen projection, without a trip
+// through the terminal. Same table and same dedupe rules the terminal uses, with
+// one hard guard: a scan row is 8k sims and a terminal row is 20k, so a scan may
+// fill an empty slot but must never overwrite the deeper number. Shallower data
+// silently replacing deeper data is how a research record quietly gets worse.
+async function logBoardGame(g, model, edge, snap) {
+    const games = await store.get("ingenuity:ledger:games", SEED_GAMES);
+    const line = parseFloat(g.line);
+    const matchup = `${g.away} @ ${g.home}`;
+    const day = g.proj && g.proj.day ? g.proj.day : etDayKey();
+    const gap = Number.isFinite(line) && model != null ? model - line : null;
+    const pOver = g.proj && Number.isFinite(g.proj.pOver) ? g.proj.pOver : null;
+    const strength = pOver != null ? Math.abs(pOver - 0.5) : (gap != null ? Math.min(0.2, Math.abs(gap) / 20) : 0);
+    const side = gap != null && gap > 0 ? "Over" : "Under";
+    const lean = strength < 0.04 ? "Coin flip"
+        : pOver != null ? `${side} ${(Math.max(pOver, 1 - pOver) * 100).toFixed(1)}%` : `${side} lean`;
+    const row = {
+        id: Date.now(),
+        date: day,
+        matchup,
+        park: parkForTeam(g.home),
+        model: model != null ? Math.round(model * 100) / 100 : null,
+        line: Number.isFinite(line) ? line : null,
+        lean,
+        leanSide: strength < 0.04 ? "none" : side.toLowerCase(),
+        decision: strength < 0.07 ? "PASS" : "WATCH",
+        betDetail: null, final: null,
+        outcome: "Pending",
+        source: "scan", sims: 8000,
+        note: `Logged from the board (8k scan). SP: ${g.awayP || "?"} v ${g.homeP || "?"}.`
+            + (snap && Number.isFinite(snap.p10) ? ` 80% range ${snap.p10}\u2013${snap.p90}.` : "")
+            + (edge != null ? ` ${Math.abs(edge).toFixed(1)} pts vs no-vig.` : ""),
+    };
+    const dupe = games.find((x) => x.date === row.date && normName(x.matchup || "") === normName(matchup));
+    if (dupe) {
+        if ((dupe.sims || 20000) > row.sims)
+            return { ok: false, msg: `${matchup} is already in research from a full 20k projection \u2014 keeping that rather than replacing it with the 8k scan.` };
+        const merged = { ...row, id: dupe.id, final: dupe.final, outcome: dupe.outcome };
+        await store.set("ingenuity:ledger:games", games.map((x) => (x.id === dupe.id ? merged : x)));
+        return { ok: true, msg: `Updated the existing ${matchup} research row with this scan.` };
+    }
+    const wrote = await store.set("ingenuity:ledger:games", [row, ...games]);
+    if (!wrote)
+        return { ok: false, msg: "Couldn't save to research \u2014 nothing was written." };
+    return { ok: true, msg: `Logged ${matchup} to research as ${row.decision}.` };
+}
 function BoardChart({ games, rows, onPick, onOpen }) {
     const [sort, setSort] = useState("gap"); // gap | board
     const [sel, setSel] = useState(null);
+    const [logging, setLogging] = useState("");
+    const [logMsg, setLogMsg] = useState("");
     const data = games.map((g, i) => {
         const r = rows?.find((x) => x.away === g.away && x.home === g.home && x.status === "ok");
         const model = r ? r.model : (g.proj ? g.proj.model : null);
@@ -7897,7 +7945,19 @@ function BoardChart({ games, rows, onPick, onOpen }) {
             React.createElement("span", { className: "bc-detail-note" }, Math.abs(selected.edge ?? 0) >= 4
                 ? "Flagged by the scanner — the full 20k-sim deep dive is the only thing that can confirm it."
                 : "No meaningful gap. The board and the model agree here."),
-            onOpen && (React.createElement("button", { className: "bc-open", onClick: () => onOpen(selected.g) }, "Open in Projection Terminal \u2192"))))));
+            React.createElement("div", { className: "bc-actions" },
+                onOpen && React.createElement("button", { className: "bc-open", onClick: () => onOpen(selected.g) }, "Open in Projection Terminal \u2192"),
+                selected.model != null && React.createElement("button", { className: "bc-log", disabled: logging === selected.g.away + selected.g.home,
+                    onClick: async () => {
+                        const key = selected.g.away + selected.g.home;
+                        setLogging(key);
+                        const r = await logBoardGame(selected.g, selected.model, selected.edge, selected.g.proj && selected.g.proj.snap);
+                        setLogMsg(r.msg);
+                        setLogging("");
+                        if (r.ok)
+                            logActivity("stats", `Research: logged ${selected.g.away} @ ${selected.g.home} from the board`, `8k scan \u00B7 model ${selected.model.toFixed(2)} vs line ${selected.g.line}`);
+                    } }, logging === selected.g.away + selected.g.home ? "\u2026" : "+ Add to research")),
+            logMsg && React.createElement("p", { className: "bc-logmsg" }, logMsg)))));
 }
 const SLATE_ARCHIVE_DAYS = 90; // keep a season's worth of full boards; a day is ~3KB
 // Full boards (odds + weather + pitchers) roll off at 90 days, but a graded
@@ -8337,6 +8397,35 @@ async function buildDebrief(days) {
 // Deliberately excludes anything that is just a story. A bullpen that threw
 // five innings yesterday is a real constraint on tomorrow; a bullpen that
 // "blew it again" is a narrative and a bad reason to move a number.
+// Narrow a built debrief to one day. Pure filtering of what is already stored,
+// so switching days costs nothing and never re-hits the API.
+function debriefForDay(db, day) {
+    if (!db || !day || day === "all")
+        return db;
+    const games = (db.games || []).filter((g) => g.day === day);
+    const pens = {};
+    for (const g of games)
+        for (const [team, outs] of Object.entries(g.penOuts || {})) {
+            const rec = (pens[team] = pens[team] || { outs: 0, er: 0, games: 0, arms: [] });
+            rec.outs += outs;
+            rec.er += (g.penEr || {})[team] || 0;
+            rec.games++;
+            for (const a of ((g.arms || {})[team] || []))
+                rec.arms.push({ name: a.name, days: 1, outs: a.outs, pitches: a.pitches });
+        }
+    // Collapse repeat appearances so one arm isn't listed twice in a day.
+    for (const t of Object.keys(pens)) {
+        const byName = new Map();
+        for (const a of pens[t].arms) {
+            const cur = byName.get(a.name) || { name: a.name, days: 1, outs: 0, pitches: 0 };
+            cur.outs += a.outs;
+            cur.pitches += a.pitches;
+            byName.set(a.name, cur);
+        }
+        pens[t].arms = [...byName.values()].sort((x, y) => y.pitches - x.pitches);
+    }
+    return { ...db, games, pens, days: (db.days || []).filter((d) => d.day === day) };
+}
 function debriefResearch(db, teams, log) {
     const games = db.games || [];
     const totals = games.map((g) => g.total).filter((t) => t != null);
@@ -8576,6 +8665,7 @@ function DeskTab() {
 }
 function DebriefTab({ teams }) {
     const [db, setDb] = useState(null);
+    const [day, setDay] = useState("all");
     const [log, setLog] = useState({});
     const [busy, setBusy] = useState(false);
     const [msg, setMsg] = useState("");
@@ -8616,24 +8706,35 @@ function DebriefTab({ teams }) {
                 React.createElement("p", { className: "dbf-lede" }, "What happened around the league over the last three days, split into the part that changes your inputs and the part that is only worth reading. Pulls finals and box scores from the MLB Stats API \u2014 mostly already cached by the bullpen sweep."),
                 React.createElement("button", { className: "ing-primary", onClick: refresh, disabled: busy }, busy ? "Building\u2026" : "Build debrief"),
                 msg && React.createElement("p", { className: "ing-hint" }, msg)));
-    const R = debriefResearch(db, teams, log);
-    const C = debriefColor(db);
+    const view = debriefForDay(db, day);
+    const R = debriefResearch(view, teams, log);
+    const C = debriefColor(view);
+    const built = agoOf(db.asOf ? db.asOf.replace(" ", "T") + ":00Z" : null);
+    const stale = built && built.min >= 240;
+    const dayList = (db.days || []).map((d) => d.day).sort().reverse();
     const row = (label, body, key) => React.createElement("div", { className: "dbf-row", key: key },
         React.createElement("span", { className: "dbf-lbl" }, label),
         React.createElement("span", { className: "dbf-body" }, body));
     return React.createElement("main", { className: "ing-main dbf" },
         React.createElement("section", { className: "ing-card" },
             React.createElement("div", { className: "dbf-head" },
-                React.createElement("h2", null, "Three-day debrief"),
-                React.createElement("button", { className: "ing-ghost", onClick: refresh, disabled: busy }, busy ? "\u2026" : "Refresh")),
-            React.createElement("p", { className: "dbf-meta" }, `${R.n} final${R.n === 1 ? "" : "s"} across ${(db.days || []).length} day${(db.days || []).length === 1 ? "" : "s"} \u00B7 built ${db.asOf}`),
+                React.createElement("h2", null, day === "all" ? "Three-day debrief" : dayLabelShort(day)),
+                React.createElement("button", { className: "ing-ghost" + (stale ? " warn" : ""), onClick: refresh, disabled: busy }, busy ? "\u2026" : stale ? "\u26A0 Refresh" : "Refresh")),
+            React.createElement("p", { className: "dbf-meta" },
+                `${R.n} final${R.n === 1 ? "" : "s"}`,
+                day === "all" ? ` across ${dayList.length} day${dayList.length === 1 ? "" : "s"}` : "",
+                built ? ` \u00B7 built ${built.text}` : ` \u00B7 built ${db.asOf}`,
+                stale ? " \u2014 worth refreshing" : ""),
+            dayList.length > 1 && React.createElement("div", { className: "dbf-days" },
+                React.createElement("button", { className: day === "all" ? "on" : "", onClick: () => setDay("all") }, `All ${dayList.length} days`),
+                dayList.map((d) => React.createElement("button", { key: d, className: day === d ? "on" : "", onClick: () => setDay(d) }, dayLabelShort(d)))),
             msg && React.createElement("p", { className: "ing-hint" }, msg)),
         // ---- research ----
         React.createElement("section", { className: "ing-card dbf-research" },
             React.createElement("h3", null, "Changes your inputs"),
-            R.mean != null && row("Run environment", `${R.mean.toFixed(2)} runs per game across ${R.n} games. Three days is a small sample \u2014 this is context, not a trend.`),
+            R.mean != null && row("Run environment", `${R.mean.toFixed(2)} runs per game across ${R.n} games${day === "all" ? "" : ` on ${dayLabelShort(day)}`}. ${day === "all" ? "Three days" : "A single day"} is a small sample \u2014 this is context, not a trend.`),
             R.burned.length > 0 && React.createElement("div", { className: "dbf-sub" },
-                React.createElement("h4", null, "Bullpens carrying load"),
+                React.createElement("h4", null, day === "all" ? "Bullpens carrying load \u00B7 3 days" : `Bullpen load on ${dayLabelShort(day)}`),
                 R.burned.map((b) => React.createElement("div", { className: "dbf-pen", key: b.team },
                     React.createElement("b", null, b.team),
                     React.createElement("span", null, `${b.ip.toFixed(1)} relief IP, ${b.er} ER over ${b.games} game${b.games === 1 ? "" : "s"}`),
@@ -11880,6 +11981,16 @@ const CSS = `
 .act-body b { font-size: 12px; font-weight: 600; color: var(--ink); line-height: 1.45; }
 .act-body em { font-style: normal; font-size: 11px; color: var(--ink-dim); line-height: 1.45; }
 .act-time { font-family: 'Archivo'; font-size: 9.5px; color: var(--ink-dim); flex-shrink: 0; }
+.bc-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.bc-actions .bc-open { margin-top: 0; flex: 1; min-width: 180px; }
+.bc-log { font-family: 'Archivo'; font-weight: 600; font-size: 11.5px; letter-spacing: 0.08em; text-transform: uppercase; background: transparent; color: var(--sky); border: 1px solid rgba(202,233,241,0.35); border-radius: 9px; padding: 11px 14px; cursor: pointer; }
+.bc-log:hover:not(:disabled) { border-color: var(--sky); background: rgba(202,233,241,0.07); }
+.bc-log:disabled { opacity: 0.5; cursor: default; }
+.bc-logmsg { font-size: 11.5px; color: var(--ink-dim); line-height: 1.55; margin: 8px 0 0; }
+.dbf-days { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.dbf-days button { font-family: 'Archivo'; font-size: 10.5px; letter-spacing: 0.07em; text-transform: uppercase; background: var(--field); border: 1px solid var(--line); color: var(--ink-dim); border-radius: 7px; padding: 7px 11px; cursor: pointer; }
+.dbf-days button.on { background: rgba(202,233,241,0.10); border-color: var(--sky); color: var(--sky); }
+.ing-ghost.warn { border-color: rgba(245,196,81,0.5); color: var(--amber); }
 /* --- debrief colour block: sky + gold pairing --- */
 .dbf-color { border-left-color: var(--gold) !important; }
 .dbf-color h3 { color: var(--gold); }
