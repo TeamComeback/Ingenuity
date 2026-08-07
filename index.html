@@ -3690,6 +3690,50 @@ function repairMisplaced(teams, found) {
         name: pl.name, woba: pl.xwoba || "", pa: pl.bf || "" }));
     return { next: next.map((t) => recomputeFromRoster(t)), moved, merged };
 }
+// Club names sitting in a roster as if they were people. Created when a
+// team-level table was read as player stats; harmless-looking, but each one is
+// a full team's aggregate wOBA weighted by a full team's PA, which swamps the
+// roster-derived offense figure it feeds.
+function findTeamsAsPlayers(teams) {
+    const out = [];
+    for (const t of (teams || []))
+        for (const bucket of ["players", "rotation"])
+            for (const pl of (t[bucket] || [])) {
+                if (!pl || !pl.name)
+                    continue;
+                const asTeam = resolveTeamName(pl.name);
+                const pa = parseFloat(pl.pa || pl.bf);
+                if (asTeam || (Number.isFinite(pa) && pa > 800))
+                    out.push({ team: t.name, bucket, name: pl.name, pa: Number.isFinite(pa) ? pa : null, club: asTeam || null });
+            }
+    return out;
+}
+function removeTeamsAsPlayers(teams, hits) {
+    const kill = new Set(hits.map((h) => `${normName(h.team)}|${h.bucket}|${normName(h.name)}`));
+    return (teams || []).map((t) => {
+        const next = { ...t };
+        for (const bucket of ["players", "rotation"])
+            next[bucket] = (t[bucket] || []).filter((pl) => !kill.has(`${normName(t.name)}|${bucket}|${normName(pl.name || "")}`));
+        return recomputeFromRoster(next);
+    });
+}
+function TeamsAsPlayers({ teams, onApply }) {
+    const [armed, setArmed] = useState(false);
+    const hits = findTeamsAsPlayers(teams);
+    if (!hits.length)
+        return null;
+    return React.createElement("section", { className: "fresh-repair misfiled" },
+        React.createElement("p", null,
+            React.createElement("b", null, `${hits.length} club${hits.length === 1 ? "" : "s"} filed as players. `),
+            "A team-level table was read as a roster, so each club landed in a lineup pool carrying its whole team's wOBA and its whole team's plate appearances. Because roster offense is PA-weighted, one of these outweighs every real hitter on the team combined."),
+        React.createElement("p", { className: "dbf-inline" }, hits.slice(0, 10).map((h) => `${h.name} (${h.team}${h.pa ? `, ${h.pa} PA` : ""})`).join(" \u00B7 "), hits.length > 10 ? ` \u00B7 +${hits.length - 10}` : ""),
+        React.createElement("button", { className: "ing-ghost", onClick: () => {
+                if (!armed) { setArmed(true); return; }
+                onApply(removeTeamsAsPlayers(teams, hits), `Removed ${hits.length} club${hits.length === 1 ? "" : "s"} that had been filed as players. Offense and bullpen recomputed.`);
+                setArmed(false);
+            } }, armed ? `Confirm \u2014 remove ${hits.length}` : "Remove them"),
+        armed && React.createElement("button", { className: "ing-ghost", onClick: () => setArmed(false) }, "Cancel"));
+}
 function RosterReconcile({ teams, onApply }) {
     const [plan, setPlan] = useState(null);
     const [busy, setBusy] = useState(false);
@@ -3935,6 +3979,7 @@ function Database({ teams, saveTeams, loaded }) {
         .map((g) => ({ g, items: teams.map((t, i) => ({ t, i })).filter(({ t }) => leagueOf(t.name) === g) }))
         .filter(({ items }) => items.length > 0);
     return (React.createElement("main", { className: "ing-db" },
+        teams.length > 0 && React.createElement(TeamsAsPlayers, { teams: teams, onApply: (next, note) => { saveTeams(next); setFixNote(note); } }),
         teams.length > 0 && React.createElement(RosterReconcile, { teams: teams, onApply: (next, note) => { saveTeams(next); setFixNote(note); } }),
         teams.length > 0 && React.createElement(MisplacedPlayers, { teams: teams, onApply: (next, note) => { saveTeams(next); setFixNote(note); } }),
         fixNote && React.createElement("p", { className: "fresh-audit-note fixnote" }, fixNote),
@@ -7477,6 +7522,42 @@ function applyCatcherFraming(rows, teams, rosterMap) {
     return { next, applied, matched: rows.length - unrouted.length, total: rows.length,
         unrouted: [...new Set(unrouted)], unknownTeam: [...new Set(unknownTeam)], usedIds: !!ids };
 }
+// Baseball-Reference team batting has no wOBA column — it reports BA/OBP/SLG —
+// so the team parser rejected it and the player fallback then read each CLUB as
+// a hitter. But B-Ref does give every component wOBA is built from, so rather
+// than refusing, compute it. These are standard linear weights; they drift a
+// little year to year, so treat the result as very close rather than exact.
+const WOBA_W = { bb: 0.69, hbp: 0.72, s: 0.89, d: 1.27, t: 1.62, hr: 2.10 };
+function wobaFromComponents(c) {
+    const ab = +c.ab, bb = +c.bb, h = +c.h, d = +c.d, t = +c.t, hr = +c.hr;
+    if (![ab, bb, h, d, t, hr].every(Number.isFinite))
+        return null;
+    const hbp = Number.isFinite(+c.hbp) ? +c.hbp : 0;
+    const sf = Number.isFinite(+c.sf) ? +c.sf : 0;
+    const ibb = Number.isFinite(+c.ibb) ? +c.ibb : 0;
+    const singles = h - d - t - hr;
+    if (singles < 0)
+        return null;
+    const denom = ab + (bb - ibb) + sf + hbp;
+    if (!(denom > 0))
+        return null;
+    const num = WOBA_W.bb * (bb - ibb) + WOBA_W.hbp * hbp + WOBA_W.s * singles
+        + WOBA_W.d * d + WOBA_W.t * t + WOBA_W.hr * hr;
+    return num / denom;
+}
+// Does this look like a per-CLUB table rather than a per-player one? Two
+// independent signals, either of which is conclusive on its own.
+function looksLikeTeamRows(rows) {
+    if (!rows || !rows.length)
+        return { team: false };
+    const named = rows.filter((r) => r && r.name && resolveTeamName(r.name)).length;
+    const pas = rows.map((r) => r && r.pa).filter((x) => Number.isFinite(x) && x > 0);
+    const medPA = pas.length ? pas.slice().sort((a, b) => a - b)[Math.floor(pas.length / 2)] : null;
+    // No hitter reaches 800 PA in a season; a club reaches ~4300.
+    const bulk = medPA != null && medPA > 800;
+    const mostlyClubs = named / rows.length > 0.5;
+    return { team: bulk || mostlyClubs, named, medPA, bulk, mostlyClubs, n: rows.length };
+}
 function parseTeamStats(text) {
     const raw = normalizeFangraphsPaste(String(text || ""));
     const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
@@ -7506,7 +7587,12 @@ function parseTeamStats(text) {
         const hit = TEAM_STAT_COLUMNS.find((c) => c.labels.includes(h));
         return hit ? hit.field : null;
     });
-    if (!colField.some(Boolean))
+    // Baseball-Reference style: no wOBA column, but every ingredient for one.
+    const ix = (names) => head.findIndex((h) => names.includes(h));
+    const comp = { ab: ix(["ab"]), bb: ix(["bb"]), h: ix(["h"]), d: ix(["2b"]), t: ix(["3b"]),
+        hr: ix(["hr"]), hbp: ix(["hbp"]), sf: ix(["sf"]), ibb: ix(["ibb"]), pa: ix(["pa"]) };
+    const canDerive = [comp.ab, comp.bb, comp.h, comp.d, comp.t, comp.hr].every((i) => i !== -1);
+    if (!colField.some(Boolean) && !canDerive)
         return { rows: [], headers: head, err: "no recognised stat columns" };
     const out = [];
     for (let i = 1; i < lines.length; i++) {
@@ -7518,6 +7604,17 @@ function parseTeamStats(text) {
             continue;
         const team = resolveTeamName(rawName) || rawName;
         const fields = {};
+        if (canDerive) {
+            const cell = (i2) => (i2 === -1 || i2 >= cells.length ? null : parseFloat(String(cells[i2]).replace(/[^0-9.\-]/g, "")));
+            const w = wobaFromComponents({ ab: cell(comp.ab), bb: cell(comp.bb), h: cell(comp.h),
+                d: cell(comp.d), t: cell(comp.t), hr: cell(comp.hr),
+                hbp: cell(comp.hbp), sf: cell(comp.sf), ibb: cell(comp.ibb) });
+            if (w != null)
+                fields.off = +w.toFixed(3);
+            const pa = cell(comp.pa);
+            if (Number.isFinite(pa) && pa > 0)
+                fields.pa = pa;
+        }
         colField.forEach((f, ci) => {
             if (!f || ci >= cells.length)
                 return;
@@ -7630,6 +7727,15 @@ function PlatoonImport({ teams, saveTeams }) {
         const parsed = savantCsvToRows(content);
         if (!parsed.rows || !parsed.rows.length)
             return false;
+        // Refuse to read a per-club table as a roster of hitters. This is how
+        // "Detroit Tigers" ended up on a bench with a wOBA next to it: the team
+        // parser didn't recognise the columns, and this fallback happily treated
+        // each club as a player. Either signal alone is conclusive.
+        const tl = looksLikeTeamRows(parsed.rows);
+        if (tl.team) {
+            setMsg(`That looks like TEAM totals, not players \u2014 ${tl.mostlyClubs ? `${tl.named} of ${tl.n} names are MLB clubs` : `the typical row has ${tl.medPA} PA, which no hitter reaches in a season`}. Nothing was imported. Paste it into the team-level stats box instead; it now reads Baseball-Reference team batting and derives wOBA from the components.`);
+            return true;
+        }
         // No timeframe toggle exists in this box, so the date range has to be
         // read off the data. Refusing to guess is the whole point: writing a
         // season file into the 14-day window is the failure this app already had.
