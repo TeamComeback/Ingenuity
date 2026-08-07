@@ -8071,6 +8071,169 @@ function missVerdict(row, snap) {
     return { err, band: [snap.p10, snap.p90], z, verdict: "outlier",
         text: `Finished at ${row.final}, about ${Math.abs(z).toFixed(1)} standard deviations from the projection and well outside the model's own range (${snap.p10}–${snap.p90}). A miss this size is where a real input error would show — but a single game still can't prove one. It is worth reading alongside the pattern panel below.` };
 }
+// ---- Selection analysis -----------------------------------------------------
+// Joins the hand-kept research ledger against the automatically graded board, so
+// the question "are the games I choose to look at different from the rest?" has
+// an answer instead of an impression. Reports only; it never touches a record.
+function analyzeSelections(ledger, boards, log) {
+    // Every graded board game, with its frozen projection and snapshot.
+    const rows = [];
+    for (const r of Object.values(log || {})) {
+        if (!r || r.model == null || r.final == null)
+            continue;
+        let snap = null, proj = null;
+        const b = (boards || {})[r.date];
+        if (b && b.games)
+            for (const g of b.games)
+                if (g.proj && normName(g.away) === normName(r.away) && normName(g.home) === normName(r.home)) {
+                    proj = g.proj;
+                    snap = g.proj.snap || null;
+                }
+        rows.push({ ...r, err: r.final - r.model, snap, proj });
+    }
+    // Which of those you also logged to research, matched on date + matchup.
+    const picked = new Set();
+    const leanBy = new Map();
+    for (const lg of (ledger || [])) {
+        if (!lg || !lg.matchup || !lg.date)
+            continue;
+        const key = `${lg.date}|${normName(lg.matchup)}`;
+        picked.add(key);
+        if (lg.leanSide && lg.leanSide !== "none")
+            leanBy.set(key, lg.leanSide);
+    }
+    const tag = (r) => `${r.date}|${normName(`${r.away} @ ${r.home}`)}`;
+    const mine = rows.filter((r) => picked.has(tag(r)));
+    const rest = rows.filter((r) => !picked.has(tag(r)));
+    // Where your leans agreed with the model and where they overrode it. This is
+    // the question that matters: does disagreeing with the engine pay?
+    const agree = [], override = [];
+    for (const r of mine) {
+        const side = leanBy.get(tag(r));
+        if (!side || r.line == null)
+            continue;
+        const modelSide = r.model > r.line ? "over" : "under";
+        const hit = side === "over" ? r.final > r.line : r.final < r.line;
+        if (r.final === r.line)
+            continue; // push
+        (side === modelSide ? agree : override).push({ ...r, hit });
+    }
+    const rec = (arr) => {
+        const w = arr.filter((x) => x.hit).length;
+        return { n: arr.length, w, l: arr.length - w, pct: arr.length ? w / arr.length : null };
+    };
+    const avg = (arr, f) => {
+        const v = arr.map(f).filter((x) => Number.isFinite(x));
+        return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null;
+    };
+    return {
+        n: rows.length, mineN: mine.length, restN: rest.length,
+        mine: splitSignificance(mine.map((r) => r.err)),
+        rest: splitSignificance(rest.map((r) => r.err)),
+        lineMine: avg(mine, (r) => r.line), lineRest: avg(rest, (r) => r.line),
+        parkMine: avg(mine, (r) => (r.snap ? r.snap.parkF : null)),
+        parkRest: avg(rest, (r) => (r.snap ? r.snap.parkF : null)),
+        edgeMine: avg(mine, (r) => Math.abs(r.model - r.line)),
+        edgeRest: avg(rest, (r) => Math.abs(r.model - r.line)),
+        agree: rec(agree), override: rec(override),
+    };
+}
+// ---- Self-diagnosis ---------------------------------------------------------
+// When the totals are consistently off, the useful question is not "by how much"
+// but "at which stage". Three stages, three separate tests, each answerable from
+// data already stored:
+//   ACCUMULATE - is the model missing more on teams whose stats are thin?
+//   INPUT      - is it missing more when it priced off stale numbers?
+//   SIMULATE   - is its stated uncertainty the right width at all?
+// Nothing here changes a parameter or a record. It points at a stage.
+function selfDiagnose(boards, log, teams) {
+    const rows = [];
+    for (const r of Object.values(log || {})) {
+        if (!r || r.model == null || r.final == null)
+            continue;
+        let proj = null;
+        const b = (boards || {})[r.date];
+        if (b && b.games)
+            for (const g of b.games)
+                if (g.proj && normName(g.away) === normName(r.away) && normName(g.home) === normName(r.home))
+                    proj = g.proj;
+        rows.push({ ...r, err: r.final - r.model, proj, snap: proj && proj.snap });
+    }
+    const out = { n: rows.length, findings: [], checks: [] };
+    const overall = splitSignificance(rows.map((r) => r.err));
+    out.overall = overall;
+
+    // --- SIMULATE: interval coverage -----------------------------------------
+    // The sim states an 80% range. If far fewer than 80% of finals land inside
+    // it, the simulation is claiming more precision than it has, and every
+    // probability it reports is pushed too far from even. That is a simulation
+    // problem, not a data problem, and no amount of better inputs fixes it.
+    const withRange = rows.filter((r) => r.snap && Number.isFinite(r.snap.p10) && Number.isFinite(r.snap.p90));
+    if (withRange.length >= 20) {
+        const inside = withRange.filter((r) => r.final >= r.snap.p10 && r.final <= r.snap.p90).length;
+        const cov = inside / withRange.length;
+        const se = Math.sqrt(0.8 * 0.2 / withRange.length);
+        const off = Math.abs(cov - 0.80) > 1.96 * se;
+        out.checks.push({ stage: "SIMULATE", label: "Interval coverage",
+            value: `${(cov * 100).toFixed(0)}% of finals landed inside the model's own 80% range`,
+            n: withRange.length, flagged: off,
+            detail: !off ? "The stated spread is about the right width. Whatever is wrong is not the simulation's uncertainty."
+                : cov < 0.80
+                    ? `Too narrow. The simulation is overconfident \u2014 it captures game-to-game variance but not input error (a wrong lineup, a stale pen state), so its range understates how wrong it can be. Every probability it reports is pushed too far from 50%, which inflates apparent edges.`
+                    : `Too wide. The simulation is underconfident \u2014 it is hedging more than the outcomes justify, which will suppress real edges and make the model look like it never disagrees with the market.` });
+    }
+    else {
+        out.checks.push({ stage: "SIMULATE", label: "Interval coverage", n: withRange.length, flagged: false,
+            value: `${withRange.length} of ${rows.length} graded games have a saved range`,
+            detail: "Needs 20 games with a stored p10\u2013p90 range. Snapshots only began recording recently, so this fills in as new boards are graded." });
+    }
+
+    // --- INPUT: freshness ----------------------------------------------------
+    const fresh = rows.filter((r) => r.snap && r.snap.aLu === "lineup" && r.snap.hLu === "lineup");
+    const stale = rows.filter((r) => r.snap && r.snap.aLu && r.snap.hLu && !(r.snap.aLu === "lineup" && r.snap.hLu === "lineup"));
+    if (fresh.length >= 10 && stale.length >= 10) {
+        const A = splitSignificance(fresh.map((r) => r.err)), B = splitSignificance(stale.map((r) => r.err));
+        const gap = B.mae - A.mae;
+        const worse = gap > 0.5;
+        out.checks.push({ stage: "INPUT", label: "Priced on lineups vs season numbers",
+            value: `typical miss ${A.mae.toFixed(2)} with lineups (${A.n}) vs ${B.mae.toFixed(2)} without (${B.n})`,
+            n: fresh.length + stale.length, flagged: worse,
+            detail: worse
+                ? `Games priced without today's lineup miss by ${gap.toFixed(2)} runs more. The engine is fine; it is being fed a worse starting point on those days. Scanning closer to first pitch, once orders are posted, is the fix \u2014 not a parameter change.`
+                : "No meaningful difference. Lineup freshness is not what is driving the misses." });
+    }
+    else {
+        out.checks.push({ stage: "INPUT", label: "Priced on lineups vs season numbers", n: fresh.length + stale.length, flagged: false,
+            value: `${fresh.length} priced on lineups, ${stale.length} on season numbers`,
+            detail: "Needs 10 of each before the comparison means anything." });
+    }
+
+    // --- ACCUMULATE: coverage of the underlying stats ------------------------
+    const thin = new Set();
+    for (const t of (teams || [])) {
+        const hp = (t.players || []).filter((x) => !x.inactive), rp = (t.rotation || []).filter((x) => !x.inactive);
+        const done = hp.filter((x) => x.woba).length + rp.filter((x) => x.xwoba).length;
+        const total = hp.length + rp.length;
+        if (total > 0 && done / total < 0.6)
+            thin.add(normName(t.name));
+    }
+    if (thin.size) {
+        const hit = rows.filter((r) => thin.has(normName(r.away)) || thin.has(normName(r.home)));
+        const clean = rows.filter((r) => !thin.has(normName(r.away)) && !thin.has(normName(r.home)));
+        if (hit.length >= 10 && clean.length >= 10) {
+            const A = splitSignificance(hit.map((r) => r.err)), B = splitSignificance(clean.map((r) => r.err));
+            const worse = A.mae - B.mae > 0.5;
+            out.checks.push({ stage: "ACCUMULATE", label: "Teams with thin stats",
+                value: `typical miss ${A.mae.toFixed(2)} involving ${thin.size} under-filled team${thin.size === 1 ? "" : "s"} (${A.n}) vs ${B.mae.toFixed(2)} elsewhere (${B.n})`,
+                n: rows.length, flagged: worse,
+                detail: worse
+                    ? "Games involving teams whose rosters are less than 60% filled miss by more. This is a data-collection gap, not a modelling one \u2014 importing the missing players closes it."
+                    : "Thin rosters are not measurably hurting accuracy right now." });
+        }
+    }
+    out.findings = out.checks.filter((c) => c.flagged);
+    return out;
+}
 // ---- Pattern detection ------------------------------------------------------
 // The actual learning mechanism. A single miss is an anecdote; a lean that
 // survives across dozens of games is evidence. Every split here is reported
@@ -8779,6 +8942,7 @@ const MORNING_PLAN = [
     { key: "recentform", label: "Recent form (14d)", hint: "outcome wOBA + BB%\u2212K%, MLB Stats API" },
     { key: "lineups", label: "Batting orders", hint: "usually posted ~3h before first pitch" },
     { key: "settle", label: "Settle the desk", hint: "grade yesterday's paper bets against real finals" },
+    { key: "diagnose", label: "Self-diagnosis", hint: "grade finished slates, then check where the model is wrong" },
 ];
 // ---- Grading coverage & significance ----------------------------------------
 // Why a game never got a projection. Stored on the board at scan time so the
@@ -9512,6 +9676,28 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
             if (!graded)
                 return { state: "skip", note: rec.open ? `${rec.open} still awaiting a final` : "nothing open to settle" };
             return { state: "ok", note: `${graded} settled \u00B7 desk now ${rec.w}\u2013${rec.l}${rec.push ? `\u2013${rec.push}` : ""}, ${rec.units > 0 ? "+" : ""}${rec.units}u` };
+        });
+        await run("diagnose", async () => {
+            // Grading already ran on open; this re-runs it so a slate that finished
+            // overnight is settled before the checks look at it, then reports any
+            // flagged finding into the activity feed so it surfaces without a trip
+            // to the Brain. It never changes a parameter or a record.
+            await gradeArchive(true);
+            const boards = await store.get("ingenuity:slate:archive", {});
+            const rlog = await store.get("ingenuity:results:log", {});
+            const tms = await store.get("ingenuity:teams", []);
+            const d = selfDiagnose(boards, rlog, tms);
+            await store.set("ingenuity:diagnosis", { at: new Date().toISOString(), n: d.n, checks: d.checks });
+            const flagged = (d.checks || []).filter((c) => c.flagged);
+            for (const c of flagged)
+                await logActivity("calibration", `Self-diagnosis flagged: ${c.label}`, c.value);
+            if (!d.n)
+                return { state: "skip", note: "no graded games yet" };
+            const pending = (d.checks || []).filter((c) => !c.flagged && c.n != null && c.n < 20).length;
+            return { state: flagged.length ? "warn" : "ok",
+                note: flagged.length
+                    ? `${flagged.length} check${flagged.length === 1 ? "" : "s"} flagged \u2014 see the Brain`
+                    : `${d.n} graded \u00B7 nothing flagged${pending ? `, ${pending} check${pending === 1 ? "" : "s"} still short of data` : ""}` };
         });
         // Refresh the on-screen board from what actually persisted.
         const finalArch = await store.get("ingenuity:slate:archive", {});
@@ -10731,12 +10917,6 @@ function HistoryView() {
                     pages),
                 React.createElement("button", { className: "ing-ghost tiny", disabled: page >= pages - 1, onClick: () => setPage(page + 1) }, "older \u2192"))))));
 }
-// ===========================================================================
-// BRAIN — model oversight: health metrics, bounded parameter tuning,
-// AI-assisted recalibration. Every change is human-approved and logged.
-// ===========================================================================
-// What actually happened to the model, newest first. Answers the question the
-// morning refresh cannot: did that action change anything the simulation reads?
 function ActivityFeed() {
     const [rows, setRows] = useState(null);
     const [all, setAll] = useState(false);
@@ -10777,6 +10957,75 @@ function ActivityFeed() {
                 rows.length > 15 && React.createElement("button", { className: "ing-ghost", onClick: () => setAll(!all) },
                     all ? "Show recent only" : `Show all ${Math.min(rows.length, 120)}`),
                 React.createElement("p", { className: "grade-note" }, "Each line records what an action changed, not that a button was pressed \u2014 so a scan that priced eight games off season numbers reads differently from one that used today's lineups.")));
+}
+// Both of these were built but never surfaced. They read stored data only and
+// change nothing — one asks where in the pipeline error enters, the other asks
+// whether the games you choose to research differ from the ones you don't.
+function SelfCheck() {
+    const [d, setD] = useState(null);
+    const [sel, setSel] = useState(null);
+    const [busy, setBusy] = useState(false);
+    const run = async () => {
+        setBusy(true);
+        const boards = await store.get("ingenuity:slate:archive", {});
+        const log = await store.get("ingenuity:results:log", {});
+        const teams = await store.get("ingenuity:teams", []);
+        const ledger = await store.get("ingenuity:ledger:games", []);
+        setD(selfDiagnose(boards, log, teams));
+        setSel(analyzeSelections(ledger, boards, log));
+        setBusy(false);
+    };
+    useEffect(() => { run(); }, []);
+    const stageGlyph = { SIMULATE: "\u25CE", INPUT: "\u2193", ACCUMULATE: "\u25A4" };
+    return React.createElement(React.Fragment, null,
+        React.createElement("section", { className: "br-log act selfcheck" },
+            React.createElement("div", { className: "rla-head" },
+                React.createElement("h3", null, "Self-check"),
+                React.createElement("button", { className: "ing-ghost", onClick: run, disabled: busy }, busy ? "\u2026" : "Re-run")),
+            React.createElement("p", { className: "grade-note" }, "When totals are consistently off, the useful question is not how far but at which stage. Nothing here changes a parameter or a record \u2014 it points at a stage."),
+            !d ? React.createElement("p", { className: "grade-note" }, "Reading stored boards\u2026")
+                : d.checks.length === 0
+                    ? React.createElement("p", { className: "grade-note" }, "Not enough graded games with saved projections yet. These checks need boards scanned after snapshots were added, so they fill in over the next couple of weeks.")
+                    : React.createElement(React.Fragment, null,
+                        d.findings.length === 0 && React.createElement("p", { className: "grade-note ok" }, "No stage is measurably worse than the others right now."),
+                        d.checks.map((c, i) => React.createElement("div", { key: i, className: "sc-row" + (c.flagged ? " flag" : "") },
+                            React.createElement("span", { className: "sc-stage" }, stageGlyph[c.stage] || "\u00B7", " ", c.stage),
+                            React.createElement("div", { className: "sc-body" },
+                                React.createElement("b", null, c.label),
+                                React.createElement("em", null, c.value),
+                                React.createElement("i", null, c.detail)))))),
+        sel && sel.n > 0 && React.createElement("section", { className: "br-log act selfcheck" },
+            React.createElement("h3", null, "Your selections"),
+            React.createElement("p", { className: "grade-note" }, `${sel.mineN} of ${sel.n} graded games were also logged to research.`),
+            sel.mineN < 8
+                ? React.createElement("p", { className: "grade-note" }, "Under 8 researched games with finals \u2014 too few to compare against the rest of the board. This fills in as you log more.")
+                : React.createElement(React.Fragment, null,
+                    React.createElement("div", { className: "sc-row" },
+                        React.createElement("span", { className: "sc-stage" }, "\u25D0 PICKS"),
+                        React.createElement("div", { className: "sc-body" },
+                            React.createElement("b", null, "Model accuracy on your picks vs the rest"),
+                            React.createElement("em", null, `typical miss ${sel.mine.mae.toFixed(2)} on ${sel.mineN} researched vs ${sel.rest.mae.toFixed(2)} on ${sel.restN} others`),
+                            React.createElement("i", null, Math.abs(sel.mine.mae - sel.rest.mae) < 0.4
+                                ? "No real difference \u2014 you aren't drawn to games the model handles differently."
+                                : sel.mine.mae > sel.rest.mae
+                                    ? "The model is less accurate on the games you pick. That can be correct if mispricing lives in hard games, but it also means your leans rest on shakier numbers."
+                                    : "The model is more accurate on the games you pick, so your selection is steering toward cleaner spots."))),
+                    (sel.lineMine != null && sel.lineRest != null) && React.createElement("div", { className: "sc-row" },
+                        React.createElement("span", { className: "sc-stage" }, "\u25D1 SKEW"),
+                        React.createElement("div", { className: "sc-body" },
+                            React.createElement("b", null, "What you tend to pick"),
+                            React.createElement("em", null, `average line ${sel.lineMine.toFixed(1)} vs ${sel.lineRest.toFixed(1)}${sel.parkMine != null && sel.parkRest != null ? ` \u00B7 park ${sel.parkMine.toFixed(2)} vs ${sel.parkRest.toFixed(2)}` : ""}${sel.edgeMine != null ? ` \u00B7 model gap ${sel.edgeMine.toFixed(2)} vs ${sel.edgeRest.toFixed(2)}` : ""}`),
+                            React.createElement("i", null, "Not right or wrong \u2014 but if your picks skew, your lean record isn't a random sample of the board and shouldn't be read as one."))),
+                    (sel.agree.n + sel.override.n) > 0 && React.createElement("div", { className: "sc-row key" },
+                        React.createElement("span", { className: "sc-stage" }, "\u25C6 OVERRIDE"),
+                        React.createElement("div", { className: "sc-body" },
+                            React.createElement("b", null, "When you side with the model, and when you don't"),
+                            React.createElement("em", null, `agreed ${sel.agree.w}\u2013${sel.agree.l} \u00B7 overrode ${sel.override.w}\u2013${sel.override.l}`),
+                            React.createElement("i", null, (sel.agree.n + sel.override.n) < 20
+                                ? "Far too few to read either way. This is the question worth waiting for: if overrides beat agreements once the sample is real, your judgment is adding something the engine lacks. If they don't, that is the strongest case for taking the model's leans as they come."
+                                : sel.override.pct != null && sel.agree.pct != null && sel.override.pct > sel.agree.pct
+                                    ? "Your overrides are outperforming your agreements. Worth understanding what you are seeing that the model isn't."
+                                    : "Your agreements are outperforming your overrides \u2014 evidence for trusting the model's side rather than talking yourself off it."))))));
 }
 function Brain({ onHome }) {
     const [params, setParams] = useState({});
@@ -11228,6 +11477,8 @@ Respond ONLY with JSON, no markdown fences, exactly this shape:
                     React.createElement("button", { className: "ing-run small", onClick: saveDraft }, "Save parameters"),
                     React.createElement("button", { className: "ing-ghost", onClick: resetAll }, "Reset to defaults"),
                     saved && React.createElement("span", { className: "ing-importmsg" }, saved))),
+            React.createElement(SelfCheck, null),
+            React.createElement(SelfCheck, null),
             React.createElement(ActivityFeed, null),
             log.length > 0 && (React.createElement("section", { className: "br-log" },
                 React.createElement("h2", { className: "lg-formtitle" }, "Change log"),
@@ -11981,12 +12232,38 @@ const CSS = `
 .act-body b { font-size: 12px; font-weight: 600; color: var(--ink); line-height: 1.45; }
 .act-body em { font-style: normal; font-size: 11px; color: var(--ink-dim); line-height: 1.45; }
 .act-time { font-family: 'Archivo'; font-size: 9.5px; color: var(--ink-dim); flex-shrink: 0; }
+.selfcheck { margin-bottom: 16px; }
+.sc-row { display: flex; gap: 10px; padding: 10px 11px; background: var(--field); border: 1px solid var(--line); border-left-width: 2px; border-radius: 8px; margin-bottom: 6px; align-items: flex-start; }
+.sc-row.flag { border-left-color: var(--amber); }
+.sc-row.key { border-left-color: var(--sky); }
+.sc-stage { font-family: 'Archivo'; font-size: 8.5px; letter-spacing: 0.11em; color: var(--ink-dim); min-width: 82px; flex-shrink: 0; padding-top: 2px; }
+.sc-row.flag .sc-stage { color: var(--amber); }
+.sc-row.key .sc-stage { color: var(--sky); }
+.sc-body { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.sc-body b { font-size: 12px; font-weight: 600; color: var(--ink); }
+.sc-body em { font-style: normal; font-size: 11.5px; color: var(--sky); font-family: 'Archivo'; }
+.sc-body i { font-style: normal; font-size: 11px; color: var(--ink-dim); line-height: 1.5; }
+@media (max-width: 560px) { .sc-row { flex-direction: column; gap: 5px; } .sc-stage { min-width: 0; } }
 .bc-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
 .bc-actions .bc-open { margin-top: 0; flex: 1; min-width: 180px; }
 .bc-log { font-family: 'Archivo'; font-weight: 600; font-size: 11.5px; letter-spacing: 0.08em; text-transform: uppercase; background: transparent; color: var(--sky); border: 1px solid rgba(202,233,241,0.35); border-radius: 9px; padding: 11px 14px; cursor: pointer; }
 .bc-log:hover:not(:disabled) { border-color: var(--sky); background: rgba(202,233,241,0.07); }
 .bc-log:disabled { opacity: 0.5; cursor: default; }
 .bc-logmsg { font-size: 11.5px; color: var(--ink-dim); line-height: 1.55; margin: 8px 0 0; }
+.sc-row { border: 1px solid var(--line); border-left-width: 2px; border-radius: 8px; padding: 10px 12px; margin-bottom: 7px; background: var(--field); }
+.sc-row.ok { border-left-color: var(--phos); }
+.sc-row.flag { border-left-color: var(--amber); }
+.sc-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 4px; }
+.sc-head b { font-size: 12.5px; color: var(--ink); }
+.sc-area { font-family: 'Archivo'; font-size: 8.5px; letter-spacing: 0.11em; text-transform: uppercase; color: var(--ink-dim); }
+.sc-stat { font-family: 'Archivo'; font-size: 11px; color: var(--sky); margin: 0 0 6px; }
+.sc-says { font-size: 11.5px; color: var(--ink); line-height: 1.55; margin: 0 0 6px; }
+.sc-look { font-size: 11px; color: var(--ink-dim); line-height: 1.5; margin: 0; }
+.sc-look em { font-style: normal; color: var(--amber); }
+.sc-cmp { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin: 8px 0; }
+.sc-cmp div { background: var(--field); border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; display: flex; flex-direction: column; gap: 2px; }
+.sc-cmp em { font-style: normal; font-family: 'Archivo'; font-size: 8.5px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-dim); }
+.sc-cmp b { font-family: 'Archivo'; font-size: 13px; color: var(--ink); }
 .dbf-days { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
 .dbf-days button { font-family: 'Archivo'; font-size: 10.5px; letter-spacing: 0.07em; text-transform: uppercase; background: var(--field); border: 1px solid var(--line); color: var(--ink-dim); border-radius: 7px; padding: 7px 11px; cursor: pointer; }
 .dbf-days button.on { background: rgba(202,233,241,0.10); border-color: var(--sky); color: var(--sky); }
