@@ -2696,7 +2696,6 @@ function App() {
                     React.createElement("span", { className: "home-card-glyph" }, "\u25CE"),
                     React.createElement("h2", null, "Brain"),
                     React.createElement("span", { className: "home-card-meta" }, `${brainTweaks} tuned`))),
-            React.createElement(BetOfTheDay, null),
             React.createElement(SlateHub, { onOpenInTerminal: (g) => { setPendingGame(g); setView("terminal"); } }),
             React.createElement(Backup, null),
             React.createElement(Journal, null),
@@ -3203,7 +3202,7 @@ const BACKUP_KEYS = [
     "ingenuity:teams", "ingenuity:ledger:games", "ingenuity:ledger:bets",
     "ingenuity:slate:day", "ingenuity:slate:archive", "ingenuity:history:bets",
     "ingenuity:brain:params", "ingenuity:brain:log", "ingenuity:brain:interpLog",
-    "ingenuity:brain:slateScan", "ingenuity:brain:slateAccuracy", "ingenuity:botd", "ingenuity:results:log",
+    "ingenuity:brain:slateScan", "ingenuity:brain:slateAccuracy", "ingenuity:results:log",
     "ingenuity:history:version", "ingenuity:seedVersion",
 ];
 function Backup() {
@@ -9715,6 +9714,7 @@ function DeskTab() {
                 React.createElement("b", null, `${ev.flagged.length} game${ev.flagged.length === 1 ? "" : "s"} disagree with the market too far to be real `),
                 `(${ev.flagged.slice(0, 3).map((c) => `${c.label} ${c.side} by ${Math.abs(c.edge).toFixed(1)} runs`).join(", ")}). The model disagrees with the market by more than the ${DESK.MAX_EDGE_RUNS} runs it is typically wrong by, so the gap is more likely a broken input than an edge \u2014 a stale price, the wrong starter, a bad import. Not bet, and worth checking.`),
             ev && ev.skipped.length > 0 && React.createElement("p", { className: "dbf-note" }, `Not priced: ${ev.skipped.slice(0, 4).map((x) => `${x.label} (${x.why})`).join(" \u00B7 ")}${ev.skipped.length > 4 ? ` \u00B7 +${ev.skipped.length - 4}` : ""}`)),
+        React.createElement(PatternMirror, { ev: ev, committedToday: committedToday, log: log }),
         openBets.length > 0 && React.createElement("section", { className: "ing-card" },
             React.createElement("h3", null, "Open"),
             openBets.map((b, i) => React.createElement("div", { key: i, className: "desk-bet" },
@@ -9728,12 +9728,31 @@ function DeskTab() {
                 React.createElement("span", { className: "db-game" }, `${b.away} @ ${b.home}`),
                 React.createElement("span", { className: "db-meta" }, `final ${b.final} \u00B7 ${b.profit > 0 ? "+" : ""}$${b.profit}`)))));
 }
+// The three days this tab is supposed to describe, as of right now.
+function debriefWindow() {
+    return [1, 2, 3].map((i) => etDayKey(new Date(Date.now() - i * 86400000)));
+}
+// Does a cached debrief still describe the current window? A debrief whose days
+// have rolled out of range isn't merely old, it is about different games — and
+// rendering it beside today's board invites reading a July bullpen as a
+// constraint on tonight.
+function debriefExpired(db) {
+    if (!db || !db.days || !db.days.length)
+        return true;
+    const win = new Set(debriefWindow());
+    return !(db.days || []).some((d) => win.has(d.day));
+}
 function DebriefTab({ teams }) {
     const [db, setDb] = useState(null);
     const [day, setDay] = useState("all");
     const [log, setLog] = useState({});
     const [busy, setBusy] = useState(false);
     const [msg, setMsg] = useState("");
+    const [expired, setExpired] = useState(false);
+    const [showColor, setShowColor] = useState(false);
+    const [showLab, setShowLab] = useState(false);
+    const [allPens, setAllPens] = useState(false);
+    const [help, setHelp] = useState(false);
     useEffect(() => {
         let live = true;
         (async () => {
@@ -9742,25 +9761,35 @@ function DebriefTab({ teams }) {
             if (!live)
                 return;
             setLog(lg || {});
-            if (cached)
+            if (!cached)
+                return;
+            // Out of window: rebuild rather than display it. If the rebuild
+            // fails the old data is still shown, but labelled, never silently.
+            if (debriefExpired(cached)) {
+                setExpired(true);
                 setDb(cached);
+                refresh(true);
+                return;
+            }
+            setDb(cached);
         })();
         return () => { live = false; };
     }, []);
-    const refresh = async () => {
+    const refresh = async (auto) => {
         setBusy(true);
         setMsg("");
-        const days = [1, 2, 3].map((i) => etDayKey(new Date(Date.now() - i * 86400000)));
-        const built = await buildDebrief(days);
+        const built = await buildDebrief(debriefWindow());
         if (!built.games.length) {
             setBusy(false);
             setMsg(built.err
-                ? `Couldn't reach MLB: ${built.err}. Nothing was overwritten.`
-                : "No completed games found in the last three days. Nothing was overwritten.");
+                ? `Couldn't reach MLB: ${built.err}. ${auto ? "The figures below are from an older window and are not current." : "Nothing was overwritten."}`
+                : `No completed games in the last three days. ${auto ? "The figures below are from an older window and are not current." : "Nothing was overwritten."}`);
             return;
         }
         const wrote = await store.set(DEBRIEF_KEY, built);
         setDb(built);
+        setExpired(false);
+        setDay("all");
         setBusy(false);
         setMsg(wrote ? "" : "Built the debrief but couldn't save it — it will rebuild next time you open this tab.");
     };
@@ -9769,7 +9798,7 @@ function DebriefTab({ teams }) {
             React.createElement("section", { className: "ing-card" },
                 React.createElement("h2", null, "Three-day debrief"),
                 React.createElement("p", { className: "dbf-lede" }, "What happened around the league over the last three days, split into the part that changes your inputs and the part that is only worth reading. Pulls finals and box scores from the MLB Stats API \u2014 mostly already cached by the bullpen sweep."),
-                React.createElement("button", { className: "ing-primary", onClick: refresh, disabled: busy }, busy ? "Building\u2026" : "Build debrief"),
+                React.createElement("button", { className: "ing-primary", onClick: () => refresh(false), disabled: busy }, busy ? "Building\u2026" : "Build debrief"),
                 msg && React.createElement("p", { className: "ing-hint" }, msg)));
     const view = debriefForDay(db, day);
     const R = debriefResearch(view, teams, log);
@@ -9777,6 +9806,13 @@ function DebriefTab({ teams }) {
     const built = agoOf(db.asOf ? db.asOf.replace(" ", "T") + ":00Z" : null);
     const stale = built && built.min >= 240;
     const dayList = (db.days || []).map((d) => d.day).sort().reverse();
+    // Only pens under real strain lead. The rest are a click away rather than a
+    // scroll — six teams of relief innings reads as a wall, and the two that
+    // matter get lost in it.
+    const pensShown = allPens ? R.burned : R.burned.filter((b) => b.b2b > 0 || b.heavy.length > 0 || b.ip >= 4).slice(0, 4);
+    const pensHidden = R.burned.length - pensShown.length;
+    const colorCount = C.walkoffs.length + C.extras.length + C.gems.length + C.melt.length +
+        C.slugfests.length + C.pitchers.length + C.blowouts.length;
     const row = (label, body, key) => React.createElement("div", { className: "dbf-row", key: key },
         React.createElement("span", { className: "dbf-lbl" }, label),
         React.createElement("span", { className: "dbf-body" }, body));
@@ -9784,31 +9820,47 @@ function DebriefTab({ teams }) {
         React.createElement("section", { className: "ing-card" },
             React.createElement("div", { className: "dbf-head" },
                 React.createElement("h2", null, day === "all" ? "Three-day debrief" : dayLabelShort(day)),
-                React.createElement("button", { className: "ing-ghost" + (stale ? " warn" : ""), onClick: refresh, disabled: busy }, busy ? "\u2026" : stale ? "\u26A0 Refresh" : "Refresh")),
+                React.createElement("div", { className: "dbf-headacts" },
+                    React.createElement("button", { className: "ing-imp-q", onClick: () => setHelp(!help), "aria-label": "About the debrief" }, help ? "\u00d7" : "?"),
+                    React.createElement("button", { className: "ing-ghost" + (stale || expired ? " warn" : ""), onClick: () => refresh(false), disabled: busy }, busy ? "\u2026" : stale || expired ? "\u26A0 Refresh" : "Refresh"))),
+            // An expired debrief is announced, not decorated with a warning glyph
+            // and left to read as current.
+            expired && React.createElement("p", { className: "dbf-warn" },
+                React.createElement("b", null, "These figures are out of window. "),
+                `They describe ${dayList.length ? dayList[dayList.length - 1] : "an earlier period"}\u2013${dayList[0] || ""}, not the last three days, so nothing here constrains tonight's pens. ${busy ? "Rebuilding now\u2026" : "Refresh to rebuild."}`),
             React.createElement("p", { className: "dbf-meta" },
                 `${R.n} final${R.n === 1 ? "" : "s"}`,
                 day === "all" ? ` across ${dayList.length} day${dayList.length === 1 ? "" : "s"}` : "",
                 built ? ` \u00B7 built ${built.text}` : ` \u00B7 built ${db.asOf}`,
-                stale ? " \u2014 worth refreshing" : ""),
+                stale && !expired ? " \u2014 worth refreshing" : ""),
+            help && React.createElement("div", { className: "ing-imp-help" },
+                React.createElement("p", null, "Three days of finals and box scores, split by whether it changes a number. ",
+                    React.createElement("strong", null, "Bullpen load and short starts are real constraints on tomorrow"),
+                    " \u2014 an arm that threw 40 pitches on back-to-back days is unavailable, and that moves a total."),
+                React.createElement("p", null, "Model bias and typical miss are here to be watched over weeks. Confirming a bias takes roughly 90 graded games; reacting to it at twenty is fitting noise."),
+                React.createElement("p", null, "Everything under ",
+                    React.createElement("strong", null, "Worth reading"),
+                    " is one game. A walk-off, a meltdown, and a gem are the most memorable things that happened and among the least predictive \u2014 the model already prices these clubs from full-season rates.")),
             dayList.length > 1 && React.createElement("div", { className: "dbf-days" },
                 React.createElement("button", { className: day === "all" ? "on" : "", onClick: () => setDay("all") }, `All ${dayList.length} days`),
                 dayList.map((d) => React.createElement("button", { key: d, className: day === d ? "on" : "", onClick: () => setDay(d) }, dayLabelShort(d)))),
             msg && React.createElement("p", { className: "ing-hint" }, msg)),
-        // ---- research ----
+        // ---- research: the part that changes a number ----
         React.createElement("section", { className: "ing-card dbf-research" },
             React.createElement("h3", null, "Changes your inputs"),
-            R.mean != null && row("Run environment", `${R.mean.toFixed(2)} runs per game across ${R.n} games${day === "all" ? "" : ` on ${dayLabelShort(day)}`}. ${day === "all" ? "Three days" : "A single day"} is a small sample \u2014 this is context, not a trend.`),
-            R.burned.length > 0 && React.createElement("div", { className: "dbf-sub" },
-                React.createElement("h4", null, day === "all" ? "Bullpens carrying load \u00B7 3 days" : `Bullpen load on ${dayLabelShort(day)}`),
-                R.burned.map((b) => React.createElement("div", { className: "dbf-pen", key: b.team },
+            R.mean != null && row("Run environment", `${R.mean.toFixed(2)} runs per game across ${R.n} games${day === "all" ? "" : ` on ${dayLabelShort(day)}`} \u2014 context, not a trend.`),
+            pensShown.length > 0 && React.createElement("div", { className: "dbf-sub" },
+                React.createElement("h4", null, day === "all" ? "Bullpens carrying load" : `Bullpen load on ${dayLabelShort(day)}`),
+                pensShown.map((b) => React.createElement("div", { className: "dbf-pen", key: b.team },
                     React.createElement("b", null, b.team),
                     React.createElement("span", null, `${b.ip.toFixed(1)} relief IP, ${b.er} ER over ${b.games} game${b.games === 1 ? "" : "s"}`),
                     b.b2b > 0 && React.createElement("i", null, `${b.b2b} arm${b.b2b === 1 ? "" : "s"} on back-to-back days`),
-                    b.heavy.length > 0 && React.createElement("em", null, `Heaviest: ${b.heavy.slice(0, 3).map((a) => `${a.name} (${a.pitches}p, ${a.days}d)`).join(", ")}`)))),
+                    b.heavy.length > 0 && React.createElement("em", null, `Heaviest: ${b.heavy.slice(0, 3).map((a) => `${a.name} (${a.pitches}p, ${a.days}d)`).join(", ")}`))),
+                pensHidden > 0 && React.createElement("button", { className: "dbf-more", onClick: () => setAllPens(true) }, `Show ${pensHidden} more pen${pensHidden === 1 ? "" : "s"} with lighter load`),
+                allPens && R.burned.length > 4 && React.createElement("button", { className: "dbf-more", onClick: () => setAllPens(false) }, "Show only the constrained pens")),
             R.short.length > 0 && React.createElement("div", { className: "dbf-sub" },
                 React.createElement("h4", null, "Starters who didn't go deep"),
-                React.createElement("p", { className: "dbf-inline" }, R.short.map((x) => `${x.name || "?"} (${x.team}) ${x.ip} ip, ${x.er} er`).join(" \u00B7 ")),
-                React.createElement("p", { className: "dbf-note" }, "Short outings mean the pen behind them absorbed the innings \u2014 the constraint is on the relievers, not a verdict on the arm.")),
+                React.createElement("p", { className: "dbf-inline" }, R.short.map((x) => `${x.name || "?"} (${x.team}) ${x.ip} ip, ${x.er} er`).join(" \u00B7 "))),
             React.createElement("div", { className: "dbf-sub" },
                 React.createElement("h4", null, "How the model did"),
                 R.gradedN === 0
@@ -9816,20 +9868,27 @@ function DebriefTab({ teams }) {
                     : React.createElement(React.Fragment, null,
                         row("Bias", `${R.bias > 0 ? "+" : ""}${R.bias.toFixed(2)} runs over ${R.gradedN} graded game${R.gradedN === 1 ? "" : "s"}`),
                         row("Typical miss", `${R.mae.toFixed(2)} runs`),
-                        React.createElement("p", { className: "dbf-note" }, `${R.gradedN} games is far too few to mean anything \u2014 confirming any bias takes roughly 90. This is here to be watched over weeks, not reacted to.`),
-                        R.worst.length > 0 && React.createElement("p", { className: "dbf-inline" }, "Biggest misses: ", R.worst.map((w) => `${w.away} @ ${w.home} model ${w.model.toFixed(1)} vs ${w.final} (${w.err > 0 ? "+" : ""}${w.err.toFixed(1)})`).join(" \u00B7 ")))) ),
-        React.createElement(MissLab, { log: log }),
-        // ---- color ----
-        React.createElement("section", { className: "ing-card dbf-color" },
-            React.createElement("h3", null, "Worth reading, not acting on"),
-            React.createElement("p", { className: "dbf-warn" }, "Everything below is one game. A walk-off, a meltdown and a gem are the most memorable things that happened and among the least predictive \u2014 your model already prices these teams from full-season rates. Enjoy it; don't move a number for it."),
-            C.walkoffs.length > 0 && row("Walk-offs", C.walkoffs.map((w) => `${w.home} over ${w.away} ${w.hs}-${w.as}${w.extras ? ` in ${w.innings}` : ""} — ${dayLabelShort(w.day)}${windowOf(w) ? `, ${windowOf(w)}` : ""}`).join(" \u00B7 ")),
-            C.extras.length > 0 && row("Longest", C.extras.map((x) => `${x.away} @ ${x.home} ${x.innings} innings, ${x.as}-${x.hs} — ${dayLabelShort(x.day)}${windowOf(x) ? `, ${windowOf(x)}` : ""}${x.durationMin ? ` (${Math.floor(x.durationMin / 60)}h ${x.durationMin % 60}m)` : ""}`).join(" \u00B7 ")),
-            C.gems.length > 0 && row("Gems", C.gems.map((x) => `${x.name} (${x.team}) ${x.ip} ip shutout, ${x.k} K — ${dayLabelShort(x.day)}`).join(" \u00B7 ")),
-            C.melt.length > 0 && row("Pen meltdowns", C.melt.map((m) => `${m.team} pen ${m.er} ER in ${m.ip} ip vs ${m.vs} — ${dayLabelShort(m.day)}`).join(" \u00B7 ")),
-            C.slugfests.length > 0 && row("Highest scoring", C.slugfests.map((x) => `${x.away} @ ${x.home} ${x.total} runs — ${dayLabelShort(x.day)}`).join(" \u00B7 ")),
-            C.pitchers.length > 0 && row("Lowest scoring", C.pitchers.map((x) => `${x.away} @ ${x.home} ${x.total} runs — ${dayLabelShort(x.day)}`).join(" \u00B7 ")),
-            C.blowouts.length > 0 && row("Biggest margins", C.blowouts.map((x) => `${x.as > x.hs ? x.away : x.home} by ${x.margin} \u2014 ${dayLabelShort(x.day)}`).join(" \u00B7 "))));
+                        R.worst.length > 0 && React.createElement("p", { className: "dbf-inline" }, "Biggest misses: ", R.worst.map((w) => `${w.away} @ ${w.home} model ${w.model.toFixed(1)} vs ${w.final} (${w.err > 0 ? "+" : ""}${w.err.toFixed(1)})`).join(" \u00B7 "))))),
+        // ---- miss lab: substantial, and not a daily read ----
+        React.createElement("section", { className: "ing-card dbf-drawer" },
+            React.createElement("button", { className: "dbf-drawer-head", onClick: () => setShowLab(!showLab) },
+                React.createElement("span", null, "Miss lab"),
+                React.createElement("em", null, showLab ? "hide" : "where the model was wrong, and why")),
+            showLab && React.createElement(MissLab, { log: log })),
+        // ---- colour: kept in full, closed by default ----
+        React.createElement("section", { className: "ing-card dbf-drawer dbf-color" },
+            React.createElement("button", { className: "dbf-drawer-head", onClick: () => setShowColor(!showColor) },
+                React.createElement("span", null, "Worth reading, not acting on"),
+                React.createElement("em", null, showColor ? "hide" : `${colorCount} moment${colorCount === 1 ? "" : "s"} \u00B7 no model input`)),
+            showColor && React.createElement(React.Fragment, null,
+                React.createElement("p", { className: "dbf-warn" }, "Everything below is one game, and one game is the least predictive thing here. Enjoy it; don't move a number for it."),
+                C.walkoffs.length > 0 && row("Walk-offs", C.walkoffs.map((w) => `${w.home} over ${w.away} ${w.hs}-${w.as}${w.extras ? ` in ${w.innings}` : ""} \u2014 ${dayLabelShort(w.day)}`).join(" \u00B7 ")),
+                C.extras.length > 0 && row("Longest", C.extras.map((x) => `${x.away} @ ${x.home} ${x.innings} innings, ${x.as}-${x.hs} \u2014 ${dayLabelShort(x.day)}`).join(" \u00B7 ")),
+                C.gems.length > 0 && row("Gems", C.gems.map((x) => `${x.name} (${x.team}) ${x.ip} ip shutout, ${x.k} K \u2014 ${dayLabelShort(x.day)}`).join(" \u00B7 ")),
+                C.melt.length > 0 && row("Pen meltdowns", C.melt.map((m) => `${m.team} pen ${m.er} ER in ${m.ip} ip vs ${m.vs} \u2014 ${dayLabelShort(m.day)}`).join(" \u00B7 ")),
+                C.slugfests.length > 0 && row("Highest scoring", C.slugfests.map((x) => `${x.away} @ ${x.home} ${x.total} runs \u2014 ${dayLabelShort(x.day)}`).join(" \u00B7 ")),
+                C.pitchers.length > 0 && row("Lowest scoring", C.pitchers.map((x) => `${x.away} @ ${x.home} ${x.total} runs \u2014 ${dayLabelShort(x.day)}`).join(" \u00B7 ")),
+                C.blowouts.length > 0 && row("Biggest margins", C.blowouts.map((x) => `${x.as > x.hs ? x.away : x.home} by ${x.margin} \u2014 ${dayLabelShort(x.day)}`).join(" \u00B7 ")))));
 }
 // v2.1 — the morning chore list, in dependency order. Rosters feed name
 // routing and handedness; the board must exist before odds, weather or a scan
@@ -11431,49 +11490,31 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
 // on today's slate from the historical profile, and attaches what bets of
 // that exact shape have actually returned.
 // ===========================================================================
-function BetOfTheDay() {
-    const todayKey = etDayKey();
+// ===========================================================================
+// PATTERN MIRROR — what pattern-you would take, beside what the desk took.
+// Deliberately NOT a second opinion on the board: it reads the desk's own
+// evaluation rather than running its own. One threshold, one set of numbers,
+// and the number shown here is the number that gets graded.
+// ===========================================================================
+function PatternMirror({ ev, committedToday, log }) {
     const [slate, setSlate] = useState(null);
-    const [teams, setTeams] = useState([]);
-    const [botd, setBotd] = useState(null); // { date, ts, scanned, pick|null, patternPick }
-    const [busy, setBusy] = useState(false);
-    const [msg, setMsg] = useState("");
-    // Pull the freshest stored slate. Today's Slate is a separate component that
-    // writes ingenuity:slate:day as you build/enter odds; without re-reading, this
-    // section keeps mount-time state and reports "no slate" even after you've
-    // entered lines and can project. So we refresh on mount, on focus, and on a
-    // short interval — and again inside findBestBet.
-    const loadSlate = React.useCallback(async () => {
-        const day = await store.get("ingenuity:slate:day", null);
-        setSlate(day && day.date === todayKey ? day : null);
-        return day && day.date === todayKey ? day : null;
-    }, [todayKey]);
+    const todayKey = etDayKey();
     useEffect(() => {
         (async () => {
-            const raw = await store.get("ingenuity:teams", []);
-            const migrated = raw.map((x) => ({ ...EMPTY_TEAM, ...x, players: x.players || [], rotation: x.rotation || [] }));
-            const { merged: seeded } = mergeSeedRosters(migrated, false);
-            const merged = dedupeTeams(seeded).teams;
-            setTeams(merged);
-            await loadSlate();
-            const saved = await store.get("ingenuity:botd", null);
-            if (saved && saved.date === todayKey)
-                setBotd(saved); // yesterday's pick never carries over
+            const day = await store.get("ingenuity:slate:day", null);
+            setSlate(day && day.date === todayKey ? day : null);
         })();
-        const onFocus = () => { loadSlate(); };
-        window.addEventListener("focus", onFocus);
-        const iv = setInterval(loadSlate, 4000);
-        return () => { window.removeEventListener("focus", onFocus); clearInterval(iv); };
-    }, [loadSlate, todayKey]);
+    }, [todayKey]);
     const P = BETTOR_PROFILE;
-    const slateGameCount = slate?.games?.length || 0;
-    const games = (slate?.games || []).filter((g) => g.line !== "" && g.line != null && !isNaN(parseFloat(g.line)));
-    // Pattern-you's pick: highest affinity to your most-bet teams, and it's an Over —
-    // because that's what the ledger says you do.
-    const patternPickFrom = (gs) => {
+    const games = (slate && slate.games || []).filter((g) => g.line !== "" && g.line != null && !isNaN(parseFloat(g.line)));
+    // Highest affinity to the clubs you bet most, and an Over — because that is
+    // what the ledger says you do, not what anyone thinks you should do.
+    const patternPick = (() => {
+        if (!games.length)
+            return null;
         const aff = (nm) => P.topTeams.reduce((s2, [t, c]) => s2 + (String(nm).includes(t) ? c : 0), 0);
-        let best = gs[0], bs = -1;
-        for (const g of gs) {
+        let best = games[0], bs = -1;
+        for (const g of games) {
             const sc = aff(g.away) + aff(g.home);
             if (sc > bs) {
                 bs = sc;
@@ -11481,178 +11522,56 @@ function BetOfTheDay() {
             }
         }
         return best ? { matchup: `${best.away} @ ${best.home}`, side: "Over", line: best.line } : null;
-    };
-    const findBestBet = async () => {
-        // Re-read the stored slate synchronously so odds entered in Today's Slate a
-        // moment ago are always in hand — never scan a stale mount-time snapshot.
-        const fresh = await loadSlate();
-        const freshGames = (fresh?.games || []).filter((g) => g.line !== "" && g.line != null && !isNaN(parseFloat(g.line)));
-        if (!freshGames.length) {
-            setMsg("The slate needs games with totals first — build it in Today's Slate below (fetch or paste the board and enter the lines), then come back.");
-            return;
-        }
-        setBusy(true);
-        setMsg("");
-        await new Promise((res) => setTimeout(res, 30));
-        const scored = [];
-        const skipped = [];
-        for (const g of freshGames) {
-            const A = matchTeamDb(g.away, teams), H = matchTeamDb(g.home, teams);
-            if (!A || !H)
-                continue;
-            const num = (v) => (v === "" || v == null ? null : parseFloat(v));
-            const side = (t, pName) => {
-                let sp = num(t.sp) ?? 0.32, spBf = num(t.spBf) ?? 200, spIp = num(t.spIp) ?? 5, spEra = num(t.spEra);
-                let resolved = false;
-                if (pName && t.rotation) {
-                    const pn = normName(pName);
-                    const hit = findRotationArm(t.rotation, pName);
-                    if (hit) {
-                        sp = num(hit.xwoba) ?? sp;
-                        spBf = num(hit.bf) ?? spBf;
-                        spIp = num(hit.ip) ?? spIp;
-                        spEra = num(hit.era) ?? spEra;
-                        resolved = num(hit.xwoba) != null;
-                    }
-                }
-                const lu = offenseFor(t, todayKey);
-                return { off: lu.off ?? CFG.LEAGUE_WOBA, xoff: num(t.xoff), pa: lu.pa ?? 600, recent: num(t.recent), recentPA: num(t.recentPA), recentBbk: num(t.recentBbk), sp, spBf, spIp, spEra, pen: penFor(t).pen ?? 0.318, penBf: penFor(t).penBf ?? 800, penBarrel: num(t.penBarrel), penHardHit: num(t.penHardHit), oaa: num(t.oaa), framing: num(t.framing), penFatigue: teamPenFatigue(t), resolved };
-            };
-            if (g.inPlay || (g.start && new Date(g.start).getTime() <= Date.now()))
-                continue; // underway — not a pregame question
-            const a = side(A, g.awayP), h = side(H, g.homeP);
-            // A "bet of the day" built on a guessed starter is a made-up number wearing
-            // a confidence score. Sit the game out and say so.
-            if (!a.resolved || !h.resolved) {
-                skipped.push({ matchup: `${A.name} @ ${H.name}`, noArm: !g.awayP || !g.homeP });
-                continue;
-            }
-            const line = parseFloat(g.line), over = parseFloat(g.over) || -110, under = parseFloat(g.under) || -110;
-            const r = projectGame({
-                park: parkForTeam(H.name), line, temp: g.wx ? g.wx.temp : null, windOut: g.wx ? g.wx.windOut : null,
-                awayOff: a.off, awayXoff: a.xoff, awayPA: a.pa, awayRecent: a.recent, awayRecentPA: a.recentPA, awayRecentBbk: a.recentBbk, awaySP: a.sp, awaySPbf: a.spBf, awaySPip: a.spIp, awaySPera: a.spEra, awayPen: a.pen, awayPenBf: a.penBf, awayPenBarrel: a.penBarrel, awayPenHardHit: a.penHardHit, awayPenFatigue: a.penFatigue, awayOAA: a.oaa, awayFraming: a.framing,
-                homeOff: h.off, homeXoff: h.xoff, homePA: h.pa, homeRecent: h.recent, homeRecentPA: h.recentPA, homeRecentBbk: h.recentBbk, homeSP: h.sp, homeSPbf: h.spBf, homeSPip: h.spIp, homeSPera: h.spEra, homePen: h.pen, homePenBf: h.penBf, homePenBarrel: h.penBarrel, homePenHardHit: h.penHardHit, homePenFatigue: h.penFatigue, homeOAA: h.oaa, homeFraming: h.framing,
-            }, 8000);
-            const pW = r.pOver / (r.pOver + r.pUnder);
-            const dO = amToDec(over), dU = amToDec(under);
-            const fair = (1 / dO) / ((1 / dO) + (1 / dU));
-            const edge = (pW - fair) * 100;
-            const price = edge > 0 ? over : under;
-            // Your ledger's lesson baked in: standard prices are your near-breakeven
-            // lane; longshot prices are where the CLV paradox lives. Penalize them.
-            const priceOk = Math.abs(price) <= 155;
-            scored.push({ matchup: `${A.name} @ ${H.name}`, side: edge > 0 ? "Over" : "Under", line, price, edge, model: r.mean, pitchers: `${g.awayP || "TBD"} vs ${g.homeP || "TBD"}`, priceOk });
-        }
-        let best = null;
-        for (const x of scored) {
-            const eff = Math.abs(x.edge) - (x.priceOk ? 0 : 2); // longshot penalty
-            if (!best || eff > best.eff)
-                best = { ...x, eff };
-        }
-        const pick = best && Math.abs(best.edge) >= 4 && best.eff >= 4 ? best : null;
-        const noArm = skipped.filter((s) => s.noArm).length;
-        const result = { date: todayKey, ts: new Date().toISOString().slice(11, 16), scanned: scored.length,
-            skipped: skipped.length, noArm, notInDb: skipped.length - noArm,
-            pick, patternPick: patternPickFrom(freshGames) };
-        setBotd(result);
-        await store.set("ingenuity:botd", result);
-        setBusy(false);
-    };
-    return (React.createElement("section", { className: "botd" },
-        React.createElement("div", { className: "botd-head" },
-            React.createElement("h2", null, "Bet of the Day \u2014 model vs the mirror"),
-            React.createElement("span", { className: "botd-sub" },
-                "the model's best find from today's stored slate, next to what pattern-you would take (",
-                P.total.n.toLocaleString(),
-                " logged bets) \u00B7 research, not a recommendation")),
-        !botd && (React.createElement("div", { className: "botd-pick" },
-            React.createElement("p", null, games.length
-                ? `Today's slate is loaded (${games.length} game${games.length === 1 ? "" : "s"} with totals). One tap runs the whole board and picks the single strongest model-vs-book gap — filtered through your own ledger's lessons.`
-                : slateGameCount > 0
-                    ? `Today's slate has ${slateGameCount} game${slateGameCount === 1 ? "" : "s"}, but no totals are entered yet. Add a line to at least one game in Today's Slate below, then find the best bet.`
-                    : "No slate data yet for today. Build it in Today's Slate below (fetch matchups or paste the board), then find the best bet."),
-            React.createElement("button", { className: "ing-run small", onClick: findBestBet, disabled: busy }, busy ? "Scanning the board…" : "Find best bet"),
-            msg && React.createElement("p", { className: "ing-hint" }, msg))),
-        botd && (React.createElement(React.Fragment, null,
-            React.createElement("div", { className: "botd-pick" },
-                botd.pick ? (React.createElement("p", null,
-                    React.createElement("strong", null,
-                        "Model's best find: ",
-                        botd.pick.side.toUpperCase(),
-                        " ",
-                        botd.pick.line,
-                        " \u2014 ",
-                        botd.pick.matchup),
-                    " (",
-                    botd.pick.pitchers,
-                    ") at ",
-                    botd.pick.price > 0 ? "+" : "",
-                    botd.pick.price,
-                    " \u00B7 model ",
-                    botd.pick.model.toFixed(2),
-                    " \u00B7 ",
-                    Math.abs(botd.pick.edge).toFixed(1),
-                    " pts past the no-vig book",
-                    botd.pick.priceOk ? "" : " — but note the price sits outside your profitable band",
-                    ". Scanned ",
-                    botd.scanned,
-                    " game",
-                    botd.scanned === 1 ? "" : "s",
-                    " with confirmed starters at ",
-                    botd.ts,
-                    ". Confirm it in the Terminal before it means anything.")) : botd.scanned === 0 ? (React.createElement("p", null,
-                    React.createElement("strong", null, "No bet of the day yet \u2014 nothing on the board is projectable."),
-                    " Not one game has both starters confirmed, and the starting pitcher is the single biggest input to a total. The odds feed carries lines and prices but never the probables, so tap ",
-                    React.createElement("b", null, "Fetch matchups + pitchers"),
-                    " in Today's Slate below, then re-run. This is a missing-data answer, not a pass.")) : (React.createElement("p", null,
-                    React.createElement("strong", null, "The model's best bet today is the pass."),
-                    " ",
-                    botd.scanned,
-                    " game",
-                    botd.scanned === 1 ? "" : "s",
-                    " scanned at ",
-                    botd.ts,
-                    "; nothing cleared the bar once your ledger's lessons (longshot penalty, 4+ pt minimum) were applied. That's not a blank \u2014 per your own history, the pass has been the most profitable bet you make.")),
-                botd.skipped > 0 && botd.scanned > 0 && (React.createElement("p", { className: "botd-why" },
-                    botd.skipped,
-                    " of ",
-                    botd.scanned + botd.skipped,
-                    " games sat out",
-                    botd.noArm ? ` — ${botd.noArm} with no probable starter posted` : "",
-                    botd.noArm && botd.notInDb ? "," : "",
-                    botd.notInDb ? ` ${botd.notInDb} whose starter isn't in your database yet` : "",
-                    ". Without the arm the model would be pricing a team-average pitcher who isn't throwing \u2014 a made-up number, not a rougher one. Fetch pitchers and re-run to widen the net.")),
-                botd.patternPick && (React.createElement("p", { className: "botd-why" },
-                    "The mirror, for contrast \u2014 pattern-you would take: ",
-                    React.createElement("strong", null,
-                        botd.patternPick.side,
-                        " ",
-                        botd.patternPick.line,
-                        " in ",
-                        botd.patternPick.matchup),
-                    " (",
-                    P.overPct,
-                    "% of your totals are Overs; those teams are your most-bet). ",
-                    botd.pick && botd.pick.matchup === botd.patternPick.matchup && botd.pick.side === botd.patternPick.side ? "Today the model and the mirror agree — rare enough to notice." : "When the model and the mirror disagree, the ledger says trust the model's pass over the pattern's itch.")),
-                React.createElement("button", { className: "ing-ghost", onClick: findBestBet, disabled: busy }, busy ? "Re-scanning…" : "Re-run (odds moved?)")),
-            React.createElement("div", { className: "botd-truth" },
+    })();
+    const taken = (ev && ev.taken) || [];
+    const todaysCommitted = Object.values(log || {}).filter((b) => b.day === todayKey && !b.pass);
+    const deskSide = committedToday
+        ? todaysCommitted.map((b) => ({ matchup: b.label, side: b.side, line: b.line }))
+        : taken.map((c) => ({ matchup: c.label, side: c.side, line: c.line }));
+    const agree = !!(patternPick && deskSide.some((d) => d.matchup === patternPick.matchup && d.side === patternPick.side));
+    return React.createElement("section", { className: "ing-card mirror" },
+        React.createElement("h3", null, "The mirror"),
+        React.createElement("p", { className: "dbf-lede" }, "What pattern-you would take off today's board, from ",
+            P.total.n.toLocaleString(),
+            " logged bets. This is not a second read on the game \u2014 it is a read on you. The desk's pick above is the only number that gets graded."),
+        !patternPick && React.createElement("p", { className: "dbf-note" }, games.length
+            ? "No slate loaded for today yet."
+            : "Today's slate has no totals entered, so there is nothing for the pattern to reach for."),
+        patternPick && React.createElement(React.Fragment, null,
+            React.createElement("div", { className: "mirror-row" },
                 React.createElement("div", null,
-                    React.createElement("em", null, "Pattern-you's record in this shape"),
-                    React.createElement("strong", { className: "neg" },
-                        P.totalsMarket.roi,
-                        "% ROI on totals \u00B7 ",
-                        P.live.roi,
-                        "% live \u00B7 ",
-                        P.parlays.roi,
-                        "% parlays")),
+                    React.createElement("em", null, "Pattern-you"),
+                    React.createElement("strong", null, `${patternPick.side} ${patternPick.line} \u2014 ${patternPick.matchup}`)),
                 React.createElement("div", null,
-                    React.createElement("em", null, "Closing line beaten"),
-                    React.createElement("strong", { className: "neg" },
-                        P.clvBeatPct,
-                        "% of the time")),
-                React.createElement("div", null,
-                    React.createElement("em", null, "The standing rule"),
-                    React.createElement("strong", null, "A pick here is a research flag \u2014 the Terminal's 20k-sim verdict is the only one that counts")))))));
+                    React.createElement("em", null, "The desk"),
+                    React.createElement("strong", { className: deskSide.length ? "" : "pass" }, deskSide.length
+                        ? deskSide.map((d) => `${d.side} ${d.line} \u2014 ${d.matchup}`).join(" \u00b7 ")
+                        : "Pass"))),
+            React.createElement("p", { className: "dbf-note" },
+                `${P.overPct}% of your totals are Overs, and those clubs are your most-bet. `,
+                agree
+                    ? "Today the desk and the pattern land on the same side \u2014 rare enough to be worth noticing, and not by itself a reason to like it more."
+                    : deskSide.length
+                        ? "They disagree. The ledger's verdict on that disagreement is below."
+                        : "The desk passed and the pattern did not. That gap is the single most expensive habit in the ledger.")),
+        React.createElement("div", { className: "botd-truth" },
+            React.createElement("div", null,
+                React.createElement("em", null, "Pattern-you's record in this shape"),
+                React.createElement("strong", { className: "neg" },
+                    P.totalsMarket.roi,
+                    "% ROI on totals \u00b7 ",
+                    P.live.roi,
+                    "% live \u00b7 ",
+                    P.parlays.roi,
+                    "% parlays")),
+            React.createElement("div", null,
+                React.createElement("em", null, "Closing line beaten"),
+                React.createElement("strong", { className: "neg" },
+                    P.clvBeatPct,
+                    "% of the time")),
+            React.createElement("div", null,
+                React.createElement("em", null, "The standing rule"),
+                React.createElement("strong", null, "The desk is paper and it is allowed to pass. A pattern match is not a signal."))));
 }
 // ===========================================================================
 // HISTORY — equity chart with period filters + analytics + full bet browser
@@ -13686,6 +13605,21 @@ const CSS = `
 .ing-prev-chg .to { color: var(--phos); font-variant-numeric: tabular-nums; }
 .ing-prev-chg .chg { color: var(--ink); font-variant-numeric: tabular-nums; }
 .ing-prev-acts { display: flex; align-items: center; gap: 9px; margin-top: 12px; }
+/* ---- Debrief: drawers keep every category, one tap from the default view ---- */
+.dbf-headacts { display: flex; align-items: center; gap: 8px; }
+.dbf-drawer { padding-top: 0; padding-bottom: 0; }
+.dbf-drawer-head { width: 100%; display: flex; justify-content: space-between; align-items: baseline; gap: 12px; background: transparent; border: none; padding: 15px 0; cursor: pointer; text-align: left; }
+.dbf-drawer-head span { font-family: 'Archivo'; font-size: 12px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--phos); }
+.dbf-drawer-head em { font-style: normal; font-size: 11px; color: var(--ink-dim); white-space: nowrap; }
+.dbf-drawer > *:not(.dbf-drawer-head):last-child { padding-bottom: 16px; }
+.dbf-more { background: transparent; border: 1px dashed var(--line); color: var(--ink-dim); font-family: 'Archivo'; font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; padding: 7px 12px; border-radius: 7px; cursor: pointer; margin-top: 9px; }
+.dbf-more:hover { color: var(--ink); border-color: var(--ink-dim); }
+.mirror-row { display: grid; grid-template-columns: 1fr; gap: 9px; margin: 11px 0; }
+.mirror-row > div { display: flex; flex-direction: column; gap: 3px; background: var(--field); border: 1px solid var(--line); border-radius: 8px; padding: 9px 11px; }
+.mirror-row em { font-style: normal; font-family: 'Archivo'; font-size: 9.5px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-dim); }
+.mirror-row strong { font-size: 13px; color: var(--ink); line-height: 1.35; }
+.mirror-row strong.pass { color: var(--phos); }
+@media (min-width: 620px) { .mirror-row { grid-template-columns: 1fr 1fr; } }
 .ing-dir-prov { font-size: 10.5px; color: var(--ink-dim); line-height: 1.45; margin: 7px 0 2px; font-style: italic; }
 .ing-import-toggle { width: 100%; text-align: left; font-family: 'Archivo'; font-size: 11.5px; letter-spacing: 0.08em; text-transform: uppercase; background: var(--field2); border: 1px dashed var(--line); color: var(--cyan); padding: 11px 14px; border-radius: 9px; cursor: pointer; }
 .ing-import-toggle:hover { border-color: var(--cyan); }
