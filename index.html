@@ -1893,7 +1893,16 @@ function penFor(t) {
     const sbf = t.penBf === "" || t.penBf == null ? null : parseFloat(t.penBf);
     if (Number.isFinite(rp))
         return { pen: rp, penBf: Number.isFinite(rbf) ? rbf : sbf, source: "roster" };
-    return { pen: Number.isFinite(sp) ? sp : null, penBf: sbf, source: "season" };
+    if (Number.isFinite(sp))
+        return { pen: sp, penBf: sbf, source: "season" };
+    // Last resort: wOBA reconstructed from published bullpen rate stats. Below
+    // both measured sources on purpose — it is arithmetic on team totals, not a
+    // measurement of the arms, and the source string says so wherever it shows.
+    const rt = t.penRates === "" || t.penRates == null ? null : parseFloat(t.penRates);
+    const rtbf = t.penRatesBf === "" || t.penRatesBf == null ? null : parseFloat(t.penRatesBf);
+    if (Number.isFinite(rt))
+        return { pen: rt, penBf: Number.isFinite(rtbf) ? rtbf : sbf, source: "rates" };
+    return { pen: null, penBf: sbf, source: "season" };
 }
 // Platoon splits, same precedence as penFor: a split derived from the players
 // actually on the club beats a team-level paste, which cannot know who was
@@ -2262,6 +2271,10 @@ function dedupeTeams(teams) {
         for (const f of ["off", "xoff", "pa", "recent", "recentPA", "recentBbk", "offVsL", "paVsL", "offVsR", "paVsR",
             "rosterOffVsL", "rosterPaVsL", "rosterOffVsR", "rosterPaVsR", "playerSplitsAsOf", "splitsDerived",
             "pen", "penBf", "penBarrel", "penHardHit", "oaa", "framing", "penFatigue", "penFatigueAsOf",
+            "penRates", "penRatesBf", "penRatesFrom", "penStatsAsOf", "pen14AsOf",
+            "penIp", "penEra", "penSiera", "penWhip", "penBaa", "penK", "penBb", "penChase", "penZcon", "penFb", "penHr",
+            "pen14Ip", "pen14Era", "pen14Siera", "pen14Whip", "pen14Baa", "pen14K", "pen14Bb",
+            "pen14Chase", "pen14Zcon", "pen14Fb", "pen14Hr", "pen14Barrel", "pen14HardHit", "pen14Woba",
             "penFatigueDetail", "lineup"])
             out[f] = pick(f);
         // Timestamps are not "keep whichever exists" — a merge that pairs newer
@@ -4026,6 +4039,10 @@ function provenanceLine(t) {
         bits.push(`player stats ${ago(t.statsAsOf)}`);
     if (t.recentAsOf)
         bits.push(`14-day form ${ago(t.recentAsOf)}`);
+    if (t.penStatsAsOf)
+        bits.push(`bullpen season stats ${ago(t.penStatsAsOf)}${t.penRatesFrom === "rates" ? ", wOBA rebuilt from rates" : ""}`);
+    if (t.pen14AsOf)
+        bits.push(`bullpen last-14 ${ago(t.pen14AsOf)}`);
     if (t.playerSplitsAsOf)
         bits.push(`splits from player data ${ago(t.playerSplitsAsOf)}`);
     else if (t.splitsAsOf)
@@ -4912,16 +4929,41 @@ function BullpenBoard({ A, H, compact }) {
                     React.createElement("div", { className: "pen-side-head" },
                         React.createElement("span", { className: "pen-team" }, t.name || s.label),
                         fw && React.createElement("span", { className: "pen-chip " + fw.k }, fw.txt)),
-                    React.createElement("div", { className: "pen-qual" },
-                        React.createElement("span", null,
-                            React.createElement("em", null, "Pen xwOBA"),
-                            t.pen || "—"),
-                        React.createElement("span", null,
-                            React.createElement("em", null, "Barrel%"),
-                            t.penBarrel || "—"),
-                        React.createElement("span", null,
-                            React.createElement("em", null, "Hard-hit%"),
-                            t.penHardHit || "—")),
+                    (() => {
+                        // Show the number the ENGINE resolves to, with its source, and
+                        // the season-to-last-14 gap beside it. Workload says how many
+                        // arms are available; this says how well they have been
+                        // throwing — the two together are the actual bullpen read.
+                        const pf = penFor(t);
+                        const d = (a, b) => {
+                            const x = parseFloat(a), y = parseFloat(b);
+                            return Number.isFinite(x) && Number.isFinite(y) ? y - x : null;
+                        };
+                        const eraGap = d(t.penEra, t.pen14Era);
+                        return React.createElement(React.Fragment, null,
+                            React.createElement("div", { className: "pen-qual" },
+                                React.createElement("span", null,
+                                    React.createElement("em", null, `xwOBA (${pf.source})`),
+                                    pf.pen != null ? pf.pen.toFixed(3) : "—"),
+                                React.createElement("span", null,
+                                    React.createElement("em", null, "Barrel%"),
+                                    t.penBarrel || "—"),
+                                React.createElement("span", null,
+                                    React.createElement("em", null, "Hard-hit%"),
+                                    t.penHardHit || "—")),
+                            (t.penEra || t.pen14Era) && React.createElement("div", { className: "pen-qual pen-form" },
+                                React.createElement("span", null,
+                                    React.createElement("em", null, "ERA szn / 14d"),
+                                    `${t.penEra || "—"} / ${t.pen14Era || "—"}`),
+                                React.createElement("span", null,
+                                    React.createElement("em", null, "SIERA szn / 14d"),
+                                    `${t.penSiera || "—"} / ${t.pen14Siera || "—"}`),
+                                React.createElement("span", null,
+                                    React.createElement("em", null, "K% szn / 14d"),
+                                    `${t.penK || "—"} / ${t.pen14K || "—"}`)),
+                            eraGap != null && Math.abs(eraGap) >= 1.25 && React.createElement("p", { className: "pen-note" },
+                                `Last 14 days runs ${Math.abs(eraGap).toFixed(2)} of ERA ${eraGap > 0 ? "worse" : "better"} than the season figure. Two weeks of bullpen ERA is roughly 45 innings \u2014 mostly noise, and it does not feed the projection. Read it as a flag to check the arms, not as a number.`));
+                    })(),
                     !fresh(t) && (React.createElement("p", { className: "pen-empty" },
                         "No workload read for today. Tap ",
                         React.createElement("strong", null, "Bullpen workload"),
@@ -7364,6 +7406,260 @@ function savantCsvToRows(csv) {
     return { rows: out.length ? out : null, headers: rows[0] };
 }
 // ===========================================================================
+// BULLPEN TABLES (v2.2)
+// Team bullpen rate stats, season and last-14. Two things make this worth its
+// own importer rather than another column map:
+//
+//   1. The paste has a TITLE row above the header ("2026 TEAM BULLPEN STATS,
+//      Last Two Weeks"), and often a rank column and both an abbreviation and a
+//      full club name before the numbers. Assuming row one is the header reads
+//      the title as data and produces a phantom team.
+//   2. The sheet publishes no xwOBA, which is the one number the engine
+//      actually consumes. Rather than guess at a mapping, wOBA-against is
+//      RECONSTRUCTED from its components with the real linear weights, and
+//      stamped as reconstructed so it can never be mistaken for measured xwOBA.
+// ===========================================================================
+const BULLPEN_COLS = [
+    { key: "ip", al: ["ip", "innings", "innings pitched"] },
+    { key: "era", al: ["era", "ra", "runs allowed avg"] },
+    { key: "siera", al: ["siera", "xfip", "fip"] },
+    { key: "whip", al: ["whip"] },
+    { key: "baa", al: ["baa", "avg", "ba", "batting average against", "opp avg"] },
+    { key: "k", al: ["k%", "k pct", "k rate", "so%", "strikeout%"] },
+    { key: "bb", al: ["bb%", "bb pct", "bb rate", "walk%"] },
+    { key: "chase", al: ["chase", "chase%", "o swing%", "o-swing%"] },
+    { key: "zcon", al: ["z-", "z con%", "z-con%", "zcon", "z contact%", "z-contact%"] },
+    { key: "fb", al: ["fb%", "fastball%", "fb pct"] },
+    { key: "hardHit", al: ["hh%", "hardhit%", "hard hit%", "hard-hit%", "hh"] },
+    { key: "barrel", al: ["brl%", "barrel%", "brl", "barrel", "barrel %"] },
+    { key: "hr", al: ["hr", "home runs", "hra", "hr allowed"] },
+];
+const normBpHead = (h) => String(h || "").toLowerCase().replace(/[^a-z0-9%+-]+/g, " ").trim();
+// Reconstruct wOBA-against from the components the sheet does publish.
+// PA is recovered from innings and WHIP (outs plus baserunners); hits come from
+// BAA; the extra-base breakdown is the one genuine gap, filled with the league
+// distribution of non-homer hits. Everything else is the real wOBA formula.
+// Returns null rather than a number whenever an input is missing — a bullpen
+// figure invented from two of five components is worse than no figure at all.
+const LW = { bb: 0.69, s1: 0.89, s2: 1.27, s3: 1.62, hr: 2.10 };
+const NONHR_MIX = { s1: 0.783, s2: 0.198, s3: 0.019 };
+function bullpenWoba(r) {
+    const ip = r.ip, whip = r.whip, baa = r.baa, bbPct = r.bb, hr = r.hr;
+    if (![ip, whip, baa, bbPct].every((v) => Number.isFinite(v)) || ip <= 0)
+        return null;
+    const pa = ip * (3 + whip); // outs + baserunners
+    if (!(pa > 0))
+        return null;
+    const bb = (bbPct / 100) * pa;
+    const ab = pa - bb;
+    if (!(ab > 0))
+        return null;
+    const h = baa * ab;
+    const homers = Number.isFinite(hr) ? Math.min(hr, h) : h * 0.13;
+    const nonHr = Math.max(0, h - homers);
+    const woba = (LW.bb * bb + LW.s1 * nonHr * NONHR_MIX.s1 + LW.s2 * nonHr * NONHR_MIX.s2 +
+        LW.s3 * nonHr * NONHR_MIX.s3 + LW.hr * homers) / pa;
+    if (!Number.isFinite(woba) || woba <= 0 || woba > 0.700)
+        return null;
+    return { woba, pa };
+}
+// Parse a bullpen table. Finds the header WHEREVER it sits, so a merged title
+// row above it is ignored instead of parsed.
+function parseBullpenTable(text) {
+    // Lines are NOT trimmed. A spreadsheet header often starts with empty cells
+    // above the label columns ("\t\t\t\tIP\tERA..."), and trimming deletes them —
+    // which silently shifts every column left relative to the data rows and
+    // reads IP as the rank and BAA as the innings. Blank lines are dropped;
+    // leading empty CELLS are load-bearing.
+    const lines = String(text || "").split(/\r?\n/).filter((l) => l.trim() !== "");
+    if (!lines.length)
+        return { rows: null, err: "nothing pasted." };
+    const cut = (line) => {
+        const parts = line.includes("\t") ? line.split("\t")
+            : line.includes("|") ? line.split("|")
+                : line.includes(",") ? line.split(",")
+                    : line.split(/\s{2,}|\s+/);
+        return parts.map((c) => c.trim());
+    };
+    const aliasOf = (cell) => {
+        const v = normBpHead(cell);
+        if (!v)
+            return null;
+        for (const c of BULLPEN_COLS)
+            if (c.al.some((a) => v === a || v === a.replace(/[%]/g, "") || v.replace(/[%]/g, "") === a.replace(/[%]/g, "")))
+                return c.key;
+        return null;
+    };
+    // The header is the first line naming three or more known stats. A title row
+    // names none, so it falls out on its own.
+    let headIdx = -1, cols = null;
+    for (let i = 0; i < Math.min(lines.length, 8); i++) {
+        const cells = cut(lines[i]);
+        const map = {};
+        let hits = 0;
+        cells.forEach((c, j) => {
+            const k = aliasOf(c);
+            if (k && !(k in map)) {
+                map[k] = j;
+                hits++;
+            }
+        });
+        if (hits >= 3) {
+            headIdx = i;
+            cols = map;
+            break;
+        }
+    }
+    if (headIdx < 0)
+        return { rows: null, err: "couldn't find a header row naming bullpen stats. Include the row with IP / ERA / WHIP / BAA / K% / BB% \u2014 the merged title above it is fine, it gets skipped." };
+    const isNum = (c) => /^[-+]?\d*\.?\d+%?$/.test(String(c).replace(/,/g, "").trim());
+    const val = (cells, key) => {
+        const j = cols[key];
+        if (j == null || cells[j] == null || String(cells[j]).trim() === "")
+            return null;
+        const n = parseFloat(String(cells[j]).replace(/[^0-9.\-]/g, ""));
+        return Number.isFinite(n) ? n : null;
+    };
+    const rows = [];
+    const unmatched = [];
+    for (const line of lines.slice(headIdx + 1)) {
+        const cells = cut(line).filter((c) => c !== "");
+        if (cells.length < 3)
+            continue;
+        // Leading run of non-numeric cells is the label: it may carry a rank, an
+        // abbreviation, and a full club name in any combination.
+        const label = [];
+        let i = 0;
+        while (i < cells.length && !isNum(cells[i])) {
+            label.push(cells[i]);
+            i++;
+        }
+        // A leading rank integer is not part of the name.
+        let raw = label.join(" ");
+        if (!raw && /^\d{1,2}$/.test(cells[0])) {
+            const rest = [];
+            let j = 1;
+            while (j < cells.length && !isNum(cells[j])) {
+                rest.push(cells[j]);
+                j++;
+            }
+            raw = rest.join(" ");
+        }
+        if (!raw)
+            continue;
+        const team = resolveTeamName(raw);
+        if (!team) {
+            unmatched.push(raw);
+            continue;
+        }
+        // Re-cut against the ORIGINAL cell positions, since the header indices
+        // were built from the unfiltered row.
+        const full = cut(line);
+        const rec = { team, rawTeam: raw };
+        for (const c of BULLPEN_COLS)
+            rec[c.key] = val(full, c.key);
+        // A row with no usable numbers is a separator, not a club.
+        if (BULLPEN_COLS.every((c) => rec[c.key] == null))
+            continue;
+        const est = bullpenWoba(rec);
+        rec.woba = est ? est.woba : null;
+        rec.paEst = est ? est.pa : null;
+        rows.push(rec);
+    }
+    if (!rows.length)
+        return { rows: null, err: `found the header but no club rows parsed${unmatched.length ? ` \u2014 unrecognised labels: ${unmatched.slice(0, 4).join(", ")}` : ""}.` };
+    // Alignment guard. Every one of these has a range it cannot leave, so a
+    // header that lines up with the wrong data columns shows up as physically
+    // impossible values rather than as a plausible-looking table. This is the
+    // check that catches an off-by-N shift, which otherwise parses perfectly and
+    // stores the rank as innings pitched.
+    const RANGE = { ip: [0, 2000], era: [0, 30], siera: [0, 30], whip: [0, 5], baa: [0, 1],
+        k: [0, 60], bb: [0, 40], chase: [0, 100], zcon: [0, 100], fb: [0, 100],
+        hardHit: [0, 100], barrel: [0, 40], hr: [0, 400] };
+    const offenders = [];
+    for (const r of rows)
+        for (const key in RANGE) {
+            const v = r[key];
+            if (v == null)
+                continue;
+            if (v < RANGE[key][0] || v > RANGE[key][1])
+                offenders.push(`${key}=${v}`);
+        }
+    if (offenders.length > rows.length * 0.5)
+        return { rows: null, err: `the columns don't line up with the header \u2014 values came out impossible (${[...new Set(offenders)].slice(0, 4).join(", ")}). Copy the header row and the club rows together, keeping any empty leading columns, and paste as tab-separated.` };
+    return { rows, unmatched, cols: Object.keys(cols) };
+}
+// Write bullpen rows onto teams. `window` is "season" or "recent"; the two are
+// stored in separate fields and never overwrite each other, because a two-week
+// bullpen and a season bullpen are different claims and the engine should be
+// able to see both.
+function applyBullpenRows(rows, teams, window) {
+    const recent = window === "recent";
+    const idx = new Map();
+    for (const r of rows)
+        idx.set(normName(r.team), r);
+    let applied = 0, fieldsSet = 0, estimated = 0;
+    const matched = new Set();
+    const next = teams.map((t) => {
+        const r = idx.get(normName(t.name));
+        if (!r)
+            return t;
+        matched.add(normName(t.name));
+        const out = { ...t };
+        const put = (k, v, dp) => {
+            if (v == null)
+                return;
+            const str = dp != null ? v.toFixed(dp) : String(v);
+            if (String(t[k] ?? "") === str)
+                return;
+            out[k] = str;
+            fieldsSet++;
+        };
+        const p = recent ? "pen14" : "pen";
+        const cap = (k) => k.charAt(0).toUpperCase() + k.slice(1);
+        put(`${p}${recent ? "Ip" : "Ip"}`, r.ip, 1);
+        put(`${p}Era`, r.era, 2);
+        put(`${p}Siera`, r.siera, 2);
+        put(`${p}Whip`, r.whip, 2);
+        put(`${p}Baa`, r.baa, 3);
+        put(`${p}K`, r.k, 1);
+        put(`${p}Bb`, r.bb, 1);
+        put(`${p}Chase`, r.chase, 1);
+        put(`${p}Zcon`, r.zcon, 1);
+        put(`${p}Fb`, r.fb, 1);
+        put(`${p}Hr`, r.hr, 0);
+        // Contact quality maps straight onto the fields the engine already reads
+        // for the season window \u2014 these are measured, not reconstructed.
+        if (recent) {
+            put("pen14Barrel", r.barrel, 1);
+            put("pen14HardHit", r.hardHit, 1);
+        }
+        else {
+            put("penBarrel", r.barrel, 1);
+            put("penHardHit", r.hardHit, 1);
+        }
+        // Reconstructed wOBA lands in its own field. It never overwrites a
+        // measured xwOBA, and penFor only reaches for it when nothing better
+        // exists.
+        if (r.woba != null) {
+            put(recent ? "pen14Woba" : "penRates", r.woba, 3);
+            if (!recent) {
+                put("penRatesBf", Math.round(r.paEst), null);
+                out.penRatesFrom = "rates";
+            }
+            estimated++;
+        }
+        out[recent ? "pen14AsOf" : "penStatsAsOf"] = etDayKey();
+        applied++;
+        return out;
+    });
+    const missing = [];
+    for (const [k, r] of idx)
+        if (!matched.has(k))
+            missing.push(r.team);
+    return { next, applied, fieldsSet, estimated, missing };
+}
+// ===========================================================================
 // IMPORT CONTRACT (v2.0)
 // The importer used to guess what a paste was, and be forgiving when it guessed
 // wrong. Forgiving is the wrong instinct here: a table read as the wrong KIND
@@ -7392,6 +7688,9 @@ const IMPORT_KINDS = [
     { id: "tsplits", label: "Splits", sub: "by team", tf: null,
         note: "One row per club. A season aggregate \u2014 it still counts hitters who are hurt or benched \u2014 so it sits below player splits in precedence.",
         ph: "Team,wOBA vs L,PA vs L,wOBA vs R,PA vs R\nDodgers,.345,420,.330,1100\n\nOr without a header: Dodgers .345 420 .330 1100" },
+    { id: "bullpen", label: "Bullpen", sub: "season / 14d", tf: null,
+        note: "Team bullpen rate stats \u2014 IP, ERA, SIERA, WHIP, BAA, K%, BB%, chase, Z-contact, FB%, hard-hit%, barrel%, HR. Season and last-14 are stored separately and never overwrite each other.",
+        ph: "Paste straight from the sheet, header row included \u2014 the merged title above it is skipped.\n\n\tIP\tERA\tSIERA\tWHIP\tBAA\tK%\tBB%\tChase\tZ-\tFB%\tHH%\tBRL%\tHR\n1\tATL\tBraves\t47.2\t4.91\t4.51\t1.55\t.239\t22.5%\t13.8%\t36.5%\t82.9%\t42.5%\t37.9%\t6.8%\t7" },
     { id: "teamstats", label: "Team", sub: "OAA / framing", tf: null,
         note: "Team-level fielding and contact quality: OAA, catcher framing, barrel% and hard-hit% allowed, team wOBA / xwOBA, bullpen xwOBA.",
         ph: "Team\tOAA\tFraming\tBarrel%\tHardHit%\nGuardians\t18\t7\t7.1\t38.4\nRockies\t-12\t-3\t9.8\t42.1" },
@@ -7457,7 +7756,11 @@ function validateImport(kind, info) {
 const PREVIEW_TEAM_FIELDS = ["off", "pa", "xoff", "offVsL", "paVsL", "offVsR", "paVsR",
     "rosterOff", "rosterPA", "rosterPen", "rosterPenBf",
     "rosterOffVsL", "rosterPaVsL", "rosterOffVsR", "rosterPaVsR",
-    "recent", "recentPA", "recentBbk", "pen", "penBf", "penBarrel", "penHardHit", "oaa", "framing"];
+    "recent", "recentPA", "recentBbk", "pen", "penBf", "penBarrel", "penHardHit", "oaa", "framing",
+    "penRates", "penRatesBf", "penIp", "penEra", "penSiera", "penWhip", "penBaa", "penK", "penBb",
+    "penChase", "penZcon", "penFb", "penHr",
+    "pen14Ip", "pen14Era", "pen14Siera", "pen14Whip", "pen14Baa", "pen14K", "pen14Bb",
+    "pen14Chase", "pen14Zcon", "pen14Fb", "pen14Hr", "pen14Barrel", "pen14HardHit", "pen14Woba"];
 const PREVIEW_HITTER_FIELDS = ["woba", "pa", "bbk", "wobaVsL", "paVsL", "wobaVsR", "paVsR"];
 const PREVIEW_PITCHER_FIELDS = ["xwoba", "bf", "ip", "era", "gs", "barrel", "hardHit", "hand"];
 const FIELD_LABEL = {
@@ -7471,6 +7774,15 @@ const FIELD_LABEL = {
     oaa: "OAA", framing: "framing", woba: "wOBA", bbk: "BB%\u2212K%",
     wobaVsL: "wOBA vs L", wobaVsR: "wOBA vs R", xwoba: "xwOBA", bf: "BF", ip: "IP",
     era: "ERA", gs: "GS", barrel: "barrel%", hardHit: "hard-hit%", hand: "throws",
+    penRates: "pen wOBA (rebuilt)", penRatesBf: "pen PA (est)",
+    penIp: "pen IP", penEra: "pen ERA", penSiera: "pen SIERA", penWhip: "pen WHIP",
+    penBaa: "pen BAA", penK: "pen K%", penBb: "pen BB%", penChase: "pen chase%",
+    penZcon: "pen Z-contact%", penFb: "pen FB%", penHr: "pen HR",
+    pen14Ip: "14d pen IP", pen14Era: "14d pen ERA", pen14Siera: "14d pen SIERA",
+    pen14Whip: "14d pen WHIP", pen14Baa: "14d pen BAA", pen14K: "14d pen K%",
+    pen14Bb: "14d pen BB%", pen14Chase: "14d pen chase%", pen14Zcon: "14d pen Z-con%",
+    pen14Fb: "14d pen FB%", pen14Hr: "14d pen HR", pen14Barrel: "14d pen barrel%",
+    pen14HardHit: "14d pen hard-hit%", pen14Woba: "14d pen wOBA (rebuilt)",
 };
 function diffTeams(before, after) {
     const out = [];
@@ -7540,7 +7852,7 @@ function diffTeams(before, after) {
 // Returns { ok, err, warns, next, diff, headline }.
 // ---------------------------------------------------------------------------
 function planImport(o) {
-    const { kind, text, rows: preRows, teams, rosterMap, posMap, hand, deriveObpSlg, scope } = o;
+    const { kind, text, rows: preRows, teams, rosterMap, posMap, hand, deriveObpSlg, scope, penWindow } = o;
     const fail = (err, warns) => ({ ok: false, err, warns: warns || [] });
     const scoped = (next) => {
         if (!scope)
@@ -7592,6 +7904,24 @@ function planImport(o) {
             warns.push("wOBA here is ESTIMATED from OBP/SLG, not published wOBA. It's stamped as an estimate, but a real wOBA source is better where you have one.");
         warns.push("team splits sit BELOW player splits in precedence \u2014 any club with player-level splits will keep using those.");
         return done(next, `${p.rows.length} team row${p.rows.length === 1 ? "" : "s"} read \u2014 ${applied} matched a club.`, warns);
+    }
+    // ---- team bullpen rate stats ----
+    if (kind === "bullpen") {
+        const p = parseBullpenTable(text);
+        if (!p.rows)
+            return fail(p.err || "couldn't read that as a bullpen table.");
+        const win = penWindow === "recent" ? "recent" : "season";
+        const res = applyBullpenRows(p.rows, teams, win);
+        const warns = [];
+        if (p.unmatched && p.unmatched.length)
+            warns.push(`unrecognised label${p.unmatched.length === 1 ? "" : "s"}: ${p.unmatched.slice(0, 5).join(", ")}.`);
+        if (res.missing.length)
+            warns.push(`${res.missing.length} club${res.missing.length === 1 ? "" : "s"} in the paste matched no team in the database: ${res.missing.slice(0, 5).join(", ")}.`);
+        if (res.estimated && win === "season")
+            warns.push(`this sheet publishes no xwOBA, so a wOBA-against was reconstructed for ${res.estimated} club${res.estimated === 1 ? "" : "s"} from IP, WHIP, BAA, BB% and HR using the real linear weights. It is stamped as reconstructed and sits BELOW any measured xwOBA \u2014 it is only used where nothing measured exists.`);
+        if (win === "recent")
+            warns.push("14-day bullpen numbers are stored and displayed but do NOT yet feed the projection. Blending recent bullpen form into the sim is a model change with its own weight to justify, not something that should arrive attached to an import.");
+        return done(res.next, `${p.rows.length} club${p.rows.length === 1 ? "" : "s"} read from the ${win === "recent" ? "last-14" : "season"} bullpen table \u2014 ${res.applied} matched, ${res.fieldsSet} value${res.fieldsSet === 1 ? "" : "s"} to write.`, warns);
     }
     // ---- team-level stats ----
     if (kind === "teamstats") {
@@ -7687,6 +8017,7 @@ function SmartImport({ teams, saveTeams, onGameLine, statsFocus }) {
     const [scope, setScope] = useState(""); // "" = all teams, else one club
     const [hand, setHand] = useState(""); // for single-hand splits pages
     const [deriveObp, setDeriveObp] = useState(false);
+    const [penWindow, setPenWindow] = useState("season");
     const [plan, setPlan] = useState(null); // computed result, NOT saved
     const [help, setHelp] = useState(false);
     const [openTeam, setOpenTeam] = useState(-1);
@@ -7696,7 +8027,7 @@ function SmartImport({ teams, saveTeams, onGameLine, statsFocus }) {
     const makePlan = (over) => {
         const p = planImport(Object.assign({
             kind, text, teams, rosterMap, posMap: rosterPos,
-            hand: hand || null, deriveObpSlg: deriveObp, scope: scope || null,
+            hand: hand || null, deriveObpSlg: deriveObp, scope: scope || null, penWindow,
         }, over || {}));
         setPlan(p);
         setOpenTeam(-1);
@@ -8096,6 +8427,11 @@ If none of these: {"kind":"unknown"}` },
                     React.createElement("strong", null, "FantasyPros"),
                     " tables — pasted straight off the page. Keep the header row; it names the columns. Teams route from a Team column, from “Name (TEAM - POS)”, or from MLB's roster list."),
                 React.createElement("p", null, "Game lines belong in the Project tab — they build a projection, not a database entry."))),
+            kind === "bullpen" && (React.createElement("div", { className: "ing-imp-row" },
+                React.createElement("span", { className: "ing-imp-rl" }, "Window"),
+                React.createElement("div", { className: "ing-tf-btns" },
+                    React.createElement("button", { className: penWindow === "season" ? "on" : "", onClick: () => { setPenWindow("season"); setPlan(null); } }, "Season"),
+                    React.createElement("button", { className: penWindow === "recent" ? "on" : "", onClick: () => { setPenWindow("recent"); setPlan(null); } }, "Last 14")))),
             (kind === "psplits" || kind === "tsplits") && (React.createElement("div", { className: "ing-imp-row" },
                 React.createElement("span", { className: "ing-imp-rl" }, "Hand"),
                 React.createElement("div", { className: "ing-tf-btns" },
@@ -13606,6 +13942,8 @@ const CSS = `
 .ing-prev-chg .chg { color: var(--ink); font-variant-numeric: tabular-nums; }
 .ing-prev-acts { display: flex; align-items: center; gap: 9px; margin-top: 12px; }
 /* ---- Debrief: drawers keep every category, one tap from the default view ---- */
+.pen-form em { color: var(--cyan); }
+.pen-note { font-size: 11px; color: var(--amber); line-height: 1.5; margin-top: 7px; padding-left: 8px; border-left: 2px solid rgba(245,196,81,0.4); }
 .dbf-headacts { display: flex; align-items: center; gap: 8px; }
 .dbf-drawer { padding-top: 0; padding-bottom: 0; }
 .dbf-drawer-head { width: 100%; display: flex; justify-content: space-between; align-items: baseline; gap: 12px; background: transparent; border: none; padding: 15px 0; cursor: pointer; text-align: left; }
