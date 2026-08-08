@@ -368,6 +368,7 @@ const DATA_CLASSES = [
     { key: "recentArmsAsOf", label: "14-day starters", fresh: 2, stale: 7, note: "Recent ERA/xERA per starter \u2014 a 2-3 start window" },
     { key: "lineupAsOf", label: "Lineup", fresh: 0, stale: 2, note: "Changes daily \u2014 anything older is last night's card" },
     { key: "penFatigueAsOf", label: "Bullpen fatigue", fresh: 0, stale: 1, note: "Must be same-day or it means nothing" },
+    { key: "availabilityAsOf", label: "Injured list", fresh: 0, stale: 2, note: "IL moves land daily; a stale check leaves hurt bats in the team number" },
 ];
 // "Jul 27" from a YYYY-MM-DD stamp, without dragging the browser timezone in.
 function fmtStamp(iso) {
@@ -406,6 +407,8 @@ function teamHasClass(t, key) {
         return !!(t.lineup && t.lineup.length);
     if (key === "penFatigueAsOf")
         return !!t.penFatigue;
+    if (key === "availabilityAsOf")
+        return !!t.availabilityAsOf;
     return false;
 }
 // One inline "loaded 3d ago \u00B7 Jul 27" chip.
@@ -1640,12 +1643,111 @@ async function fetchAllRosters() {
                 if (!pr.fullName)
                     continue;
                 const ps = e.position || {};
+                // Roster STATUS was arriving in this response and being discarded.
+                // It is how MLB publishes IL placements, options, and activations —
+                // official transactions, filed by the club, posted within minutes.
+                // Keeping it is what lets an injured hitter stop counting toward a
+                // team's offense without anyone typing anything.
+                const st = e.status || {};
                 people.push({ id: pr.id != null ? String(pr.id) : null, name: pr.fullName, team,
-                    pitcher: ps.abbreviation === "P" || ps.code === "1" || ps.type === "Pitcher" });
+                    pitcher: ps.abbreviation === "P" || ps.code === "1" || ps.type === "Pitcher",
+                    statusCode: st.code || null, statusDesc: st.description || null });
             }
         }
     }
     return { people, failed, clubs: teamList.length };
+}
+// ===========================================================================
+// AVAILABILITY (v2.3)
+// A player on the injured list is still on the 40-man — only the 60-day list
+// removes you — so "is he on a roster" was never the right question, and the
+// reconcile's membership test could never have caught an ordinary injury. The
+// right question is the status MLB publishes alongside him.
+//
+// The rule is deliberately narrow: ACTIVE is the only status that counts as
+// available. Everything else — any injured list, optioned to the minors,
+// paternity, bereavement, suspended, restricted — means he is not playing today,
+// and the reason is kept for display rather than collapsed into a boolean.
+// Unrecognised codes are reported, never guessed at: a status this code has
+// never seen should surface as a question, not be silently treated as fit.
+// ===========================================================================
+const AVAILABILITY_LABEL = {
+    A: "Active", D7: "7-day IL", D10: "10-day IL", D15: "15-day IL", D60: "60-day IL",
+    DL: "Injured list", RM: "Optioned", OPT: "Optioned", SU: "Suspended",
+    RES: "Restricted", PL: "Paternity", BRV: "Bereavement", FA: "Free agent",
+    RE: "Released", NRI: "Non-roster", DEC: "Declared", TR: "Traded",
+};
+function availabilityOf(rec) {
+    if (!rec || !rec.statusCode)
+        return { available: true, code: null, label: null, known: false };
+    const code = String(rec.statusCode).toUpperCase();
+    const known = code in AVAILABILITY_LABEL;
+    const label = AVAILABILITY_LABEL[code] || rec.statusDesc || code;
+    return { available: code === "A", code, label, known };
+}
+// Pure. Flags and UNflags, because an activation has to be as automatic as a
+// placement — a stale IL flag left on a returning bat is the same bug pointing
+// the other way. Players the feed doesn't recognise are left alone and reported:
+// a name mismatch is not evidence of an injury.
+function applyAvailability(teams, idx) {
+    let flagged = 0, cleared = 0, unmatched = 0, checked = 0;
+    const nowOut = [], nowBack = [], unknownCodes = new Set();
+    const next = teams.map((t) => {
+        let changed = false;
+        const pass = (bucket) => (t[bucket] || []).map((pl) => {
+            const { rec } = resolveIdentity(pl, idx);
+            if (!rec) {
+                unmatched++;
+                return pl;
+            }
+            checked++;
+            const av = availabilityOf(rec);
+            if (av.code && !av.known)
+                unknownCodes.add(av.code);
+            const wasOut = !!pl.inactive;
+            const isOut = !av.available;
+            if (wasOut === isOut && (pl.availability || "") === (isOut ? av.label : ""))
+                return pl;
+            changed = true;
+            if (isOut && !wasOut) {
+                flagged++;
+                nowOut.push({ name: pl.name, team: t.name, label: av.label });
+            }
+            if (!isOut && wasOut) {
+                cleared++;
+                nowBack.push({ name: pl.name, team: t.name });
+            }
+            return isOut
+                ? { ...pl, inactive: true, availability: av.label }
+                : { ...pl, inactive: undefined, availability: undefined };
+        });
+        const players = pass("players"), rotation = pass("rotation");
+        if (!changed)
+            return t;
+        // Team numbers are derived from who is available, so they have to move
+        // with it. Anything else leaves a projection quietly built on a bat
+        // that is on the shelf.
+        return { ...recomputeFromRoster({ ...t, players, rotation }),
+            availabilityAsOf: etDayKey() };
+    });
+    return { next, flagged, cleared, unmatched, checked,
+        nowOut, nowBack, unknownCodes: [...unknownCodes] };
+}
+// Today's posted lineup versus today's availability. These come from different
+// MLB endpoints at different times, so they can disagree — a lineup pulled at
+// 9am does not know about a 2pm placement. Worth surfacing rather than
+// resolving, because which one is right depends on which was published later.
+function lineupAvailabilityConflicts(t) {
+    if (!t || !t.lineup || t.lineupAsOf !== etDayKey())
+        return [];
+    const out = [];
+    const byName = new Map((t.players || []).map((p) => [normName(p.name), p]));
+    for (const l of t.lineup) {
+        const p = byName.get(normName(l.name));
+        if (p && p.inactive)
+            out.push({ name: l.name, why: p.availability || "not active" });
+    }
+    return out;
 }
 // One identity source for the whole app, cached for the day. The 40-man sweep
 // is 31 requests; every consumer after the first should be free. Position comes
@@ -4033,6 +4135,8 @@ function provenanceLine(t) {
         bits.push("tonight's lineup is posted");
     else if (t.lineupAsOf)
         bits.push(`last lineup ${ago(t.lineupAsOf)}`);
+    if (t.availabilityAsOf)
+        bits.push(`injured list checked ${ago(t.availabilityAsOf)}`);
     if (t.rosterAsOf)
         bits.push(`roster rollup ${ago(t.rosterAsOf)}`);
     if (t.statsAsOf)
@@ -4220,16 +4324,18 @@ function Database({ teams, saveTeams, loaded }) {
                                 React.createElement("h4", null,
                                     "Starting lineup ",
                                     React.createElement("i", { className: "ing-groupnote" }, "batting order 1\u20139")),
-                                React.createElement("div", { className: "ing-roster-preview" }, lineup.map((p, j) => React.createElement("span", { key: j },
+                                React.createElement("div", { className: "ing-roster-preview" }, lineup.map((p, j) => React.createElement("span", { key: j, className: p.inactive ? "out" : "" },
                                     React.createElement("b", { className: "ord" }, j + 1),
                                     " ",
                                     p.name || "?",
+                                    p.inactive ? React.createElement("i", { className: "outtag" }, p.availability || "out") : null,
                                     " ",
                                     React.createElement("em", null, p.woba || "—")))),
                                 bench.length > 0 && (React.createElement(React.Fragment, null,
                                     React.createElement("h4", null, "Bench"),
                                     React.createElement("div", { className: "ing-roster-preview" }, bench.map((p, j) => React.createElement("span", { key: j },
                                         p.name || "?",
+                                        p.inactive ? React.createElement("i", { className: "outtag" }, p.availability || "out") : null,
                                         " ",
                                         React.createElement("em", null, p.woba || "—")))))),
                                 React.createElement("h4", null,
@@ -4237,9 +4343,10 @@ function Database({ teams, saveTeams, loaded }) {
                                     React.createElement("i", { className: "ing-groupnote" }, "starters \u00B7 by workload")),
                                 React.createElement("div", { className: "ing-roster-preview" },
                                     rotation.map((p, j) => (React.createElement("div", { key: j, className: "arm" },
-                                        React.createElement("span", { className: "arm-name" },
+                                        React.createElement("span", { className: "arm-name" + (p.inactive ? " out" : "") },
                                             "\u26BE ",
-                                            p.name || "?"),
+                                            p.name || "?",
+                                            p.inactive ? React.createElement("i", { className: "outtag" }, p.availability || "out") : null),
                                         React.createElement("span", { className: "arm-line season" },
                                             React.createElement("b", null, "SEASON"),
                                             React.createElement("em", null, p.xwoba || "—"),
@@ -4506,6 +4613,24 @@ function LineupFetcher({ teams, saveTeams }) {
                 " from OBP/SLG ((1.7\u00B7OBP + SLG) \u00F7 3), because the API doesn't publish wOBA \u2014 a placeholder, not a measurement. Saving records the batting order and the probable starter and ",
                 React.createElement("strong", null, "never overwrites stats you've already imported"),
                 "; estimates only fill in for players your database hasn't seen. Import those from Savant or FanGraphs and the projection sharpens."),
+            (() => {
+                // Lineups and injured-list status come from different MLB endpoints
+                // at different times, so they can disagree: an order pulled at 9am
+                // knows nothing about a 2pm placement. Surfaced rather than
+                // resolved, because which one is right depends on which was
+                // published later — and only one line appears, only when it happens.
+                const clashes = [];
+                for (const t of (teams || []))
+                    for (const c of lineupAvailabilityConflicts(t))
+                        clashes.push(`${c.name} (${t.name}, ${c.why})`);
+                if (!clashes.length)
+                    return null;
+                return React.createElement("p", { className: "lineup-conflict" },
+                    React.createElement("b", null, `${clashes.length} player${clashes.length === 1 ? "" : "s"} in a saved lineup ${clashes.length === 1 ? "is" : "are"} flagged unavailable: `),
+                    clashes.slice(0, 4).join(", "),
+                    clashes.length > 4 ? ` +${clashes.length - 4}` : "",
+                    ". Re-pull the lineup if the order was saved before the move; re-run the morning refresh if the status is the stale one.");
+            })(),
             React.createElement("div", { className: "ing-fetchbar" },
                 React.createElement("input", { type: "date", value: date, onChange: (e) => setDate(e.target.value) }),
                 React.createElement("button", { className: "ing-run small", onClick: fetchSchedule, disabled: busy }, busy ? "Fetching…" : "Fetch slate"),
@@ -10231,6 +10356,7 @@ function DebriefTab({ teams }) {
 // can attach to it. Only the odds step spends an API request.
 const MORNING_PLAN = [
     { key: "rosters", label: "MLB rosters", hint: "name routing + handedness" },
+    { key: "availability", label: "Injured list", hint: "MLB status \u2014 drops hurt bats from team numbers" },
     { key: "hands", label: "Pitcher hands", hint: "switches on platoon splits" },
     { key: "board", label: "Board + probables", hint: "today's matchups and starters" },
     { key: "odds", label: "Market lines", hint: "the one step that costs a request" },
@@ -10846,7 +10972,42 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
             const n = cached?.map ? Object.keys(cached.map).length : 0;
             return n ? { state: "ok", note: `${n} players` } : { state: "fail", note: "saved nothing" };
         });
-        // 2 — Throwing hands. Without these the platoon adjustment never fires.
+        // 2 — Availability. The 40-man sweep carries MLB's roster status, which is
+        // how injured-list placements and activations arrive. Without this step a
+        // hitter on the IL keeps counting toward his club's offense, which biases
+        // every total that club appears in and never looks like an error.
+        await run("availability", async () => {
+            if (!workingTeams.length)
+                return { state: "skip", note: "database empty" };
+            let idx;
+            try {
+                idx = await buildIdentityIndex(false);
+            }
+            catch (e) {
+                return { state: "fail", note: e.message || "roster sweep failed" };
+            }
+            if (!idx || !idx.people || !idx.people.length)
+                return { state: "fail", note: "no roster data" };
+            if (idx.failed && idx.failed.length > 2)
+                return { state: "warn", note: `${idx.failed.length} clubs didn't answer \u2014 skipped rather than flag half a league` };
+            const av = applyAvailability(workingTeams, idx);
+            if (!av.flagged && !av.cleared)
+                return { state: "ok", note: av.checked ? `${av.checked} checked, no change` : "nothing matched" };
+            workingTeams = av.next;
+            setTeams(av.next);
+            const saved = await store.set("ingenuity:teams", av.next);
+            if (!saved)
+                return { state: "fail", note: store.lastError || "save refused" };
+            const bits = [];
+            if (av.flagged)
+                bits.push(`${av.flagged} out`);
+            if (av.cleared)
+                bits.push(`${av.cleared} back`);
+            if (av.unknownCodes.length)
+                bits.push(`codes unseen: ${av.unknownCodes.join(", ")}`);
+            return { state: av.unknownCodes.length ? "warn" : "ok", note: bits.join(", ") };
+        });
+        // 3 — Throwing hands. Without these the platoon adjustment never fires.
         await run("hands", async () => {
             if (rosters.state !== "ok")
                 return { state: "skip", note: "needs rosters" };
@@ -13942,6 +14103,9 @@ const CSS = `
 .ing-prev-chg .chg { color: var(--ink); font-variant-numeric: tabular-nums; }
 .ing-prev-acts { display: flex; align-items: center; gap: 9px; margin-top: 12px; }
 /* ---- Debrief: drawers keep every category, one tap from the default view ---- */
+.ing-roster-preview span.out, .arm-name.out { opacity: 0.55; text-decoration: line-through; text-decoration-color: var(--rust); }
+.outtag { font-style: normal; font-size: 8.5px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--rust); border: 1px solid rgba(232,115,79,0.45); border-radius: 4px; padding: 1px 4px; margin-left: 5px; text-decoration: none; display: inline-block; vertical-align: middle; }
+.lineup-conflict { font-size: 11.5px; color: var(--amber); line-height: 1.5; margin-top: 8px; padding-left: 9px; border-left: 2px solid rgba(245,196,81,0.45); }
 .pen-form em { color: var(--cyan); }
 .pen-note { font-size: 11px; color: var(--amber); line-height: 1.5; margin-top: 7px; padding-left: 8px; border-left: 2px solid rgba(245,196,81,0.4); }
 .dbf-headacts { display: flex; align-items: center; gap: 8px; }
