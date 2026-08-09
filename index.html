@@ -10178,73 +10178,171 @@ function debriefColor(db) {
     return { walkoffs, extras: extras.slice(0, 3), slugfests, pitchers, blowouts,
         melt: melt.sort((a, b) => b.er - a.er).slice(0, 3), gems: gems.sort((a, b) => b.k - a.k).slice(0, 3) };
 }
+// ===========================================================================
+// MISS LAB — DAILY (v2.4)
+// Yesterday's board in full, the five worst misses taken apart, and the causes
+// counted across the recent sample. The autopsies are fetched during the morning
+// run and cached, so the diagnosis is waiting rather than a tap away.
+//
+// The daily view exists to be READ. It is deliberately not wired to anything
+// that changes a parameter: five games is noise, and a model tuned nightly on
+// noise converges on nothing while looking busy. Significance still lives in
+// the all-time pattern engine below it, which needs 8 games to show a split at
+// all and says out loud that 30 is where it starts meaning something.
+// ===========================================================================
+const AUTOPSY_KEY = "ingenuity:misslab:autopsy";
+const missKey = (r) => `${r.date}|${r.away}|${r.home}`;
+// Everything graded for one day, worst miss first. Includes games that landed —
+// "all games on the slate" means the ones the model got right too, because a
+// day of six good calls and one blow-up reads very differently from a day of
+// seven near-misses, and only one of those is worth worrying about.
+function missDay(log, boards, day) {
+    const rows = [];
+    for (const r of Object.values(log || {})) {
+        if (!r || r.date !== day || r.model == null || r.final == null)
+            continue;
+        let snap = null;
+        const b = (boards || {})[day];
+        if (b && b.games)
+            for (const g of b.games)
+                if (g.proj && g.proj.snap && normName(g.away) === normName(r.away) && normName(g.home) === normName(r.home))
+                    snap = g.proj.snap;
+        rows.push({ ...r, err: r.final - r.model, snap });
+    }
+    rows.sort((a, b) => Math.abs(b.err) - Math.abs(a.err));
+    const errs = rows.map((r) => r.err);
+    const mean = errs.length ? errs.reduce((a, b) => a + b, 0) / errs.length : null;
+    const mae = errs.length ? errs.reduce((a, b) => a + Math.abs(b), 0) / errs.length : null;
+    const inRange = rows.filter((r) => r.snap && r.snap.p10 != null && r.final >= r.snap.p10 && r.final <= r.snap.p90).length;
+    const withSnap = rows.filter((r) => r.snap).length;
+    return { rows, n: rows.length, mean, mae, inRange, withSnap };
+}
+// Count WHY the recent big misses happened, from the cached autopsies. These are
+// descriptions with sample sizes attached, not findings — a count of four out of
+// ten is reported as exactly that, and left alone.
+function missCauses(rows, cache) {
+    const c = { n: 0, oneInning: 0, bullpen: 0, noLineup: 0, unearned: 0, teams: {} };
+    for (const r of rows) {
+        const a = (cache || {})[missKey(r)];
+        c.teams[r.away] = (c.teams[r.away] || 0) + 1;
+        c.teams[r.home] = (c.teams[r.home] || 0) + 1;
+        if (r.snap && r.snap.aLu !== "lineup" && r.snap.hLu !== "lineup")
+            c.noLineup++;
+        if (!a || a.err)
+            continue;
+        c.n++;
+        if (a.big && a.big.runs >= 4)
+            c.oneInning++;
+        if (a.split && a.split.penEr > a.split.spEr)
+            c.bullpen++;
+        if (a.unearned)
+            c.unearned++;
+    }
+    const repeat = Object.entries(c.teams).filter(([, v]) => v >= 3).sort((a, b) => b[1] - a[1]);
+    return { ...c, repeat };
+}
 function MissLab({ log }) {
     const [boards, setBoards] = useState({});
+    const [cache, setCache] = useState({});
     const [open, setOpen] = useState(null);
-    const [auto, setAuto] = useState({});
     const [busy, setBusy] = useState("");
+    const [showAll, setShowAll] = useState(false);
+    const [day, setDay] = useState(etDayKey(new Date(Date.now() - 86400000)));
     useEffect(() => {
         let live = true;
         (async () => {
             const a = await store.get("ingenuity:slate:archive", {});
-            if (live)
-                setBoards(a || {});
+            const c = await store.get(AUTOPSY_KEY, {});
+            if (!live)
+                return;
+            setBoards(a || {});
+            setCache(c || {});
         })();
         return () => { live = false; };
     }, []);
     const pat = detectMissPatterns(log, boards);
-    const misses = pat.rows.slice().sort((a, b) => Math.abs(b.err) - Math.abs(a.err)).slice(0, 6);
+    const D = missDay(log, boards, day);
+    const top5 = D.rows.slice(0, 5);
+    const causes = missCauses(pat.rows.slice().sort((a, b) => Math.abs(b.err) - Math.abs(a.err)).slice(0, 12), cache);
+    const days = [...new Set(Object.values(log || {}).filter((r) => r && r.final != null).map((r) => r.date))].sort().reverse().slice(0, 5);
     const dig = async (r) => {
-        const key = `${r.date}|${r.away}|${r.home}`;
+        const key = missKey(r);
         setOpen(open === key ? null : key);
-        if (auto[key] || open === key)
+        if (cache[key] || open === key)
             return;
         setBusy(key);
         const res = await autopsyGame(r, r.snap);
-        setAuto((m) => ({ ...m, [key]: res }));
+        const next = { ...cache, [key]: res };
+        setCache(next);
+        await store.set(AUTOPSY_KEY, next);
         setBusy("");
     };
+    const missBody = (r) => {
+        const key = missKey(r);
+        const v = missVerdict(r, r.snap);
+        const a = cache[key];
+        return React.createElement("div", { className: "miss-body" },
+            React.createElement("p", { className: "miss-verdict" }, v.text),
+            busy === key && React.createElement("p", { className: "dbf-note" }, "Pulling the box score\u2026"),
+            a && a.err && React.createElement("p", { className: "dbf-note" }, `Couldn't reconstruct this game: ${a.err}`),
+            a && !a.err && React.createElement(React.Fragment, null,
+                a.innings && React.createElement("div", { className: "miss-innings" }, a.innings.map((i) => React.createElement("span", { key: i.n, className: (i.a + i.h) >= 4 ? "big" : "" },
+                    React.createElement("b", null, i.n),
+                    React.createElement("i", null, `${i.a}-${i.h}`)))),
+                a.big && a.big.runs >= 4 && React.createElement("p", { className: "miss-fact" }, `${a.big.runs} of the ${r.final} runs came in a single inning (the ${a.big.inning}${a.big.inning === 1 ? "st" : a.big.inning === 2 ? "nd" : a.big.inning === 3 ? "rd" : "th"}). The model prices an expected rate across nine innings, not one blow-up, so a game decided by one frame says little about the inputs.`),
+                a.split && React.createElement("p", { className: "miss-fact" }, `Starters: ${inningsFromOuts(a.split.spOuts)} ip, ${a.split.spEr} er. Bullpens: ${inningsFromOuts(a.split.penOuts)} ip, ${a.split.penEr} er.${a.split.penEr > a.split.spEr ? " Most of the damage was on the bullpens \u2014 the input with the widest error bars." : ""}`),
+                (a.hr != null || a.unearned != null) && React.createElement("p", { className: "miss-fact" }, `${a.hr || 0} home run${a.hr === 1 ? "" : "s"}${a.unearned ? `, ${a.unearned} unearned run${a.unearned === 1 ? "" : "s"} \u2014 unearned runs come from defence the run model doesn't simulate` : ""}.`),
+                r.snap && React.createElement("p", { className: "miss-fact snap" }, `Model expected ${r.snap.aMean} \u2013 ${r.snap.hMean} (${r.away} \u2013 ${r.home}), park ${r.snap.park || "\u2014"}${r.snap.parkF != null ? ` (${r.snap.parkF})` : ""}${r.snap.temp != null ? `, ${r.snap.temp}\u00B0` : ""}${r.snap.windOut ? ", wind out" : ""}. Starters priced: ${r.snap.aSP || "?"} / ${r.snap.hSP || "?"}.${r.snap.aLu === "lineup" || r.snap.hLu === "lineup" ? "" : " Priced before lineups posted."}`)));
+    };
+    const missRow = (r, rank) => {
+        const key = missKey(r);
+        const v = missVerdict(r, r.snap);
+        return React.createElement("div", { className: "miss-row " + v.verdict, key: key },
+            React.createElement("button", { className: "miss-head", onClick: () => dig(r) },
+                rank != null && React.createElement("span", { className: "miss-rank" }, rank),
+                React.createElement("span", { className: "miss-teams" }, `${r.away} @ ${r.home}`),
+                React.createElement("span", { className: "miss-num" }, `model ${r.model.toFixed(1)} \u2192 ${r.final}`),
+                React.createElement("span", { className: "miss-err" }, `${v.err > 0 ? "+" : ""}${v.err.toFixed(1)}`),
+                cache[key] ? React.createElement("span", { className: "miss-ready" }, "\u25CF") : null),
+            open === key && missBody(r));
+    };
     return React.createElement("section", { className: "ing-card miss-lab" },
-        React.createElement("h3", null, "Miss autopsy"),
-        pat.rows.length === 0
-            ? React.createElement("p", { className: "dbf-note" }, "No graded projections on file yet.")
+        React.createElement("h3", null, "Miss lab"),
+        // ---- yesterday, in full ----
+        days.length > 1 && React.createElement("div", { className: "dbf-days" }, days.map((d) => React.createElement("button", { key: d, className: day === d ? "on" : "", onClick: () => { setDay(d); setOpen(null); setShowAll(false); } }, dayLabelShort(d)))),
+        D.n === 0
+            ? React.createElement("p", { className: "dbf-note" }, `Nothing graded for ${dayLabelShort(day)} yet. Games grade once finals land, usually overnight.`)
             : React.createElement(React.Fragment, null,
-                React.createElement("p", { className: "dbf-note" }, `${pat.rows.length} graded game${pat.rows.length === 1 ? "" : "s"} on file, ${pat.withSnap} with a saved model snapshot. Only snapshotted games can be judged against the model's own predicted range \u2014 the rest can be described but not attributed.`),
-                misses.map((r) => {
-                    const key = `${r.date}|${r.away}|${r.home}`;
-                    const v = missVerdict(r, r.snap);
-                    const a = auto[key];
-                    return React.createElement("div", { className: "miss-row " + v.verdict, key: key },
-                        React.createElement("button", { className: "miss-head", onClick: () => dig(r) },
-                            React.createElement("span", { className: "miss-teams" }, `${r.away} @ ${r.home}`),
-                            React.createElement("span", { className: "miss-num" }, `model ${r.model.toFixed(1)} \u2192 ${r.final}`),
-                            React.createElement("span", { className: "miss-err" }, `${v.err > 0 ? "+" : ""}${v.err.toFixed(1)}`),
-                            React.createElement("span", { className: "miss-day" }, dayLabelShort(r.date))),
-                        open === key && React.createElement("div", { className: "miss-body" },
-                            React.createElement("p", { className: "miss-verdict" }, v.text),
-                            busy === key && React.createElement("p", { className: "dbf-note" }, "Pulling the box score\u2026"),
-                            a && a.err && React.createElement("p", { className: "dbf-note" }, `Couldn't reconstruct this game: ${a.err}`),
-                            a && !a.err && React.createElement(React.Fragment, null,
-                                a.innings && React.createElement("div", { className: "miss-innings" },
-                                    a.innings.map((i) => React.createElement("span", { key: i.n, className: (i.a + i.h) >= 4 ? "big" : "" },
-                                        React.createElement("b", null, i.n),
-                                        React.createElement("i", null, `${i.a}-${i.h}`)))),
-                                a.big && a.big.runs >= 4 && React.createElement("p", { className: "miss-fact" }, `${a.big.runs} of the ${r.final} runs came in a single inning (the ${a.big.inning}${a.big.inning === 1 ? "st" : a.big.inning === 2 ? "nd" : a.big.inning === 3 ? "rd" : "th"}). The model prices an expected rate across nine innings, not one blow-up, so a game decided by one frame tells you little about the inputs.`),
-                                a.split && React.createElement("p", { className: "miss-fact" }, `Starters: ${inningsFromOuts(a.split.spOuts)} ip, ${a.split.spEr} er. Bullpens: ${inningsFromOuts(a.split.penOuts)} ip, ${a.split.penEr} er.${a.split.penEr > a.split.spEr ? " Most of the damage was on the bullpens \u2014 the input with the widest error bars." : ""}`),
-                                (a.hr != null || a.unearned != null) && React.createElement("p", { className: "miss-fact" }, `${a.hr || 0} home run${a.hr === 1 ? "" : "s"}${a.unearned ? `, ${a.unearned} unearned run${a.unearned === 1 ? "" : "s"} \u2014 unearned runs come from defence the run model doesn't simulate` : ""}.`),
-                                r.snap && React.createElement("p", { className: "miss-fact snap" }, `Model expected ${r.snap.aMean} \u2013 ${r.snap.hMean} (${r.away} \u2013 ${r.home}), park ${r.snap.park || "\u2014"}${r.snap.parkF != null ? ` (${r.snap.parkF})` : ""}${r.snap.temp != null ? `, ${r.snap.temp}\u00B0` : ""}${r.snap.windOut ? ", wind out" : ""}. Starters priced: ${r.snap.aSP || "?"} / ${r.snap.hSP || "?"}.`))));
-                }),
-                React.createElement("h4", null, "Patterns across all graded games"),
-                React.createElement("p", { className: "dbf-note" }, "One miss is an anecdote. A lean that holds across dozens of games is the only thing worth changing a parameter for."),
-                pat.overall.n > 0 && React.createElement("p", { className: "miss-fact" }, `Overall: ${pat.overall.mean > 0 ? "+" : ""}${pat.overall.mean.toFixed(2)} runs over ${pat.overall.n} games, noise band \u00B1${pat.overall.ci.toFixed(2)}. ${pat.overall.real ? "This clears its own noise band." : "Inside the noise band \u2014 not yet a finding."}`),
-                pat.splits.length === 0
-                    ? React.createElement("p", { className: "dbf-note" }, "No split has 8+ games yet. Splits appear as the sample grows; treating fewer than that as a pattern is how a model gets tuned onto noise.")
-                    : pat.splits.map((sp) => React.createElement("div", { className: "miss-split", key: sp.label },
-                        React.createElement("div", { className: "ms-head" },
-                            React.createElement("b", null, sp.label),
-                            React.createElement("span", { className: sp.a.real ? "sig" : "" }, sp.a.real ? "signal" : "not significant")),
-                        React.createElement("p", null, `${sp.a.mean > 0 ? "+" : ""}${sp.a.mean.toFixed(2)} runs over ${sp.a.n} game${sp.a.n === 1 ? "" : "s"} vs ${sp.b.mean != null ? `${sp.b.mean > 0 ? "+" : ""}${sp.b.mean.toFixed(2)} over ${sp.b.n}` : "\u2014"} elsewhere${sp.gap != null ? `, a gap of ${Math.abs(sp.gap).toFixed(2)} runs` : ""}. ${sp.a.n < 30 ? `Only ${sp.a.n} games \u2014 far too few; roughly 30 before this means anything.` : sp.a.real ? "Clears its own noise band. Worth investigating the underlying input." : "Inside the noise band."}`),
-                        React.createElement("em", null, sp.why)))));
+                React.createElement("p", { className: "miss-day-line" },
+                    React.createElement("b", null, `${D.n} game${D.n === 1 ? "" : "s"} graded`),
+                    ` \u00B7 ${D.mean > 0 ? "+" : ""}${D.mean.toFixed(2)} average error, ${D.mae.toFixed(2)} typical miss`,
+                    D.withSnap ? ` \u00B7 ${D.inRange} of ${D.withSnap} landed inside the model's own 10\u201390 range` : " \u00B7 no snapshots for this day, so these can be described but not attributed"),
+                top5.map((r, i) => missRow(r, i + 1)),
+                D.rows.length > 5 && React.createElement(React.Fragment, null,
+                    React.createElement("button", { className: "dbf-more", onClick: () => setShowAll(!showAll) }, showAll ? "Hide the games that landed" : `Show the other ${D.rows.length - 5} game${D.rows.length - 5 === 1 ? "" : "s"}`),
+                    showAll && D.rows.slice(5).map((r) => missRow(r, null)))),
+        // ---- causes, counted, not concluded ----
+        causes.n > 0 && React.createElement("div", { className: "miss-causes" },
+            React.createElement("h4", null, "Across the last 12 big misses"),
+            React.createElement("p", { className: "dbf-note" }, `Counts, not findings \u2014 ${causes.n} of the 12 have a reconstructed box score. A count is a place to look, not a reason to change a number.`),
+            React.createElement("div", { className: "mc-grid" },
+                React.createElement("span", null, React.createElement("b", null, causes.oneInning), ` decided by one inning of 4+ runs`),
+                React.createElement("span", null, React.createElement("b", null, causes.bullpen), ` where the pen gave up more than the starter`),
+                React.createElement("span", null, React.createElement("b", null, causes.noLineup), ` priced before either lineup posted`),
+                React.createElement("span", null, React.createElement("b", null, causes.unearned), ` with unearned runs the model can't simulate`)),
+            causes.repeat.length > 0 && React.createElement("p", { className: "miss-fact" }, `Clubs appearing three or more times: ${causes.repeat.map(([t, n]) => `${t} (${n})`).join(", ")}. With twelve games that is well short of a pattern \u2014 but it is where to look first if it holds.`)),
+        // ---- the part that carries statistical weight ----
+        React.createElement("h4", null, "Patterns across all graded games"),
+        React.createElement("p", { className: "dbf-note" }, `${pat.rows.length} graded, ${pat.withSnap} with a saved snapshot. One miss is an anecdote. A lean that holds across dozens of games is the only thing worth changing a parameter for.`),
+        pat.overall.n > 0 && React.createElement("p", { className: "miss-fact" }, `Overall: ${pat.overall.mean > 0 ? "+" : ""}${pat.overall.mean.toFixed(2)} runs over ${pat.overall.n} games, noise band \u00B1${pat.overall.ci.toFixed(2)}. ${pat.overall.real ? "This clears its own noise band." : "Inside the noise band \u2014 not yet a finding."}`),
+        pat.splits.length === 0
+            ? React.createElement("p", { className: "dbf-note" }, "No split has 8+ games yet. Splits appear as the sample grows; treating fewer than that as a pattern is how a model gets tuned onto noise.")
+            : pat.splits.map((sp) => React.createElement("div", { className: "miss-split", key: sp.label },
+                React.createElement("div", { className: "ms-head" },
+                    React.createElement("b", null, sp.label),
+                    React.createElement("span", { className: sp.a.real ? "sig" : "" }, sp.a.real ? "signal" : "not significant")),
+                React.createElement("p", null, `${sp.a.mean > 0 ? "+" : ""}${sp.a.mean.toFixed(2)} runs over ${sp.a.n} game${sp.a.n === 1 ? "" : "s"} vs ${sp.b.mean != null ? `${sp.b.mean > 0 ? "+" : ""}${sp.b.mean.toFixed(2)} over ${sp.b.n}` : "\u2014"} elsewhere${sp.gap != null ? `, a gap of ${Math.abs(sp.gap).toFixed(2)} runs` : ""}. ${sp.a.n < 30 ? `Only ${sp.a.n} games \u2014 far too few; roughly 30 before this means anything.` : sp.a.real ? "Clears its own noise band. Worth investigating the underlying input." : "Inside the noise band."}`),
+                React.createElement("em", null, sp.why))));
 }
 function DeskTab() {
     const [log, setLog] = useState({});
@@ -10537,6 +10635,7 @@ const MORNING_PLAN = [
     { key: "bullpen", label: "Bullpen workload", hint: "last 3 days of box scores" },
     { key: "recentform", label: "Recent form (14d)", hint: "outcome wOBA + BB%\u2212K%, MLB Stats API" },
     { key: "lineups", label: "Batting orders", hint: "usually posted ~3h before first pitch" },
+    { key: "project", label: "Price the board", hint: "freezes a snapshot so tomorrow's miss can be attributed" },
     { key: "settle", label: "Settle the desk", hint: "grade yesterday's paper bets against real finals" },
     { key: "diagnose", label: "Self-diagnosis", hint: "grade finished slates, then check where the model is wrong" },
 ];
@@ -10673,6 +10772,120 @@ function ResultsLogAudit() {
                         React.createElement("h5", null, `${dh.length} doubleheader row${dh.length === 1 ? "" : "s"}`),
                         React.createElement("p", { className: "grade-note" }, `Two games with this matchup were played that day and the stored total matches neither. There is no way to tell which game the board meant, so these are left alone rather than guessed. ${dh.map((b) => `${b.r.date} ${b.r.away} @ ${b.r.home} (stored ${b.r.final}, real ${b.totals.join(" and ")})`).join(" \u00B7 ")}`))),
             armed && React.createElement("button", { className: "ing-ghost", onClick: () => setArmed("") }, "Cancel")));
+}
+// Per-team inputs for the projection, resolved through the same precedence the
+// rest of the app uses. `resolved` means THIS starter was found with a real
+// xwOBA — a fallback to a team average isn't a weaker projection, it's a
+// projection of a different game, so callers refuse it rather than price it.
+function buildProjectionSide(t, pitcherName, dayKey) {
+    const num = (v) => (v === "" || v == null ? null : parseFloat(v));
+    let sp = num(t.sp) ?? 0.32, spBf = num(t.spBf) ?? 200, spIp = num(t.spIp) ?? 5, spEra = num(t.spEra);
+    let resolved = false;
+    if (pitcherName && t.rotation) {
+        const hit = findRotationArm(t.rotation, pitcherName);
+        if (hit) {
+            sp = num(hit.xwoba) ?? sp;
+            spBf = num(hit.bf) ?? spBf;
+            spIp = num(hit.ip) ?? spIp;
+            spEra = num(hit.era) ?? spEra;
+            resolved = num(hit.xwoba) != null;
+        }
+    }
+    const lu = offenseFor(t, dayKey);
+    const pf = penFor(t);
+    return { lu, off: lu.off ?? CFG.LEAGUE_WOBA, xoff: num(t.xoff), pa: lu.pa ?? 600,
+        recent: num(t.recent), recentPA: num(t.recentPA), recentBbk: num(t.recentBbk),
+        sp, spBf, spIp, spEra, pen: pf.pen ?? 0.318, penBf: pf.penBf ?? 800,
+        penBarrel: num(t.penBarrel), penHardHit: num(t.penHardHit),
+        oaa: num(t.oaa), framing: num(t.framing), penFatigue: teamPenFatigue(t), resolved };
+}
+// Price one board. Pure: returns rows, never writes. `sims` is a knob only so
+// the morning pass can be told to match the hub exactly — it always should.
+function projectSlate(games, teams, dayKey, sims) {
+    const out = [];
+    for (const g of (games || [])) {
+        const line = parseFloat(g.line);
+        if (isNaN(line)) {
+            out.push({ ...g, status: "skip", code: "no_line", err: "no total set" });
+            continue;
+        }
+        const A = matchTeamDb(g.away, teams), H = matchTeamDb(g.home, teams);
+        if (!A || !H) {
+            out.push({ ...g, status: "skip", code: "no_team", err: `no DB match for ${!A ? g.away : g.home}` });
+            continue;
+        }
+        if (g.inPlay || (g.start && new Date(g.start).getTime() <= Date.now())) {
+            out.push({ ...g, status: "skip", code: "started", err: "first pitch has passed \u2014 this model prices 9 innings, not a game in progress" });
+            continue;
+        }
+        const a = buildProjectionSide(A, g.awayP, dayKey), h = buildProjectionSide(H, g.homeP, dayKey);
+        if (!a.resolved || !h.resolved) {
+            const missing = [];
+            if (!a.resolved)
+                missing.push(g.awayP ? `${g.awayP} (${A.name})` : `${A.name} \u2014 none posted`);
+            if (!h.resolved)
+                missing.push(g.homeP ? `${g.homeP} (${H.name})` : `${H.name} \u2014 none posted`);
+            const why = (!g.awayP || !g.homeP)
+                ? `probable starter not posted: ${missing.join(" \u00B7 ")}`
+                : `not in your database: ${missing.join(" \u00B7 ")}`;
+            out.push({ ...g, status: "skip", code: (!g.awayP || !g.homeP) ? "no_sp_posted" : "no_sp_db",
+                err: why + " \u2014 the arm is the biggest input; won't guess it" });
+            continue;
+        }
+        const over = parseFloat(g.over) || -110, under = parseFloat(g.under) || -110;
+        const homePark = parkForTeam(H.name);
+        const r = projectGame({
+            park: homePark, line, temp: g.wx ? g.wx.temp : null, windOut: g.wx ? g.wx.windOut : null,
+            awayOff: a.off, awayXoff: a.xoff, awayPA: a.pa, awayRecent: a.recent, awayRecentPA: a.recentPA, awayRecentBbk: a.recentBbk, awaySP: a.sp, awaySPbf: a.spBf, awaySPip: a.spIp, awaySPera: a.spEra, awayPen: a.pen, awayPenBf: a.penBf, awayPenBarrel: a.penBarrel, awayPenHardHit: a.penHardHit, awayPenFatigue: a.penFatigue, awayOAA: a.oaa, awayFraming: a.framing,
+            homeOff: h.off, homeXoff: h.xoff, homePA: h.pa, homeRecent: h.recent, homeRecentPA: h.recentPA, homeRecentBbk: h.recentBbk, homeSP: h.sp, homeSPbf: h.spBf, homeSPip: h.spIp, homeSPera: h.spEra, homePen: h.pen, homePenBf: h.penBf, homePenBarrel: h.penBarrel, homePenHardHit: h.penHardHit, homePenFatigue: h.penFatigue, homeOAA: h.oaa, homeFraming: h.framing,
+        }, sims || 8000);
+        const pW = r.pOver / (r.pOver + r.pUnder);
+        const dO = amToDec(over), dU = amToDec(under);
+        const fairOver = (1 / dO) / ((1 / dO) + (1 / dU));
+        const edge = (pW - fairOver) * 100;
+        const evOver = r.pOver * (dO - 1) * 100 - r.pUnder * 100;
+        const evUnder = r.pUnder * (dU - 1) * 100 - r.pOver * 100;
+        out.push({ ...g, status: "ok", awayName: A.name, homeName: H.name, model: r.mean, pW, edge, evOver, evUnder,
+            lu: { a: a.lu, h: h.lu },
+            // The snapshot. Without it a past miss can only be described, never
+            // attributed: the spread and the per-side expectation are what
+            // separate "we were wrong" from "this landed in the tail we predicted".
+            snap: {
+                aMean: +r.awayMean.toFixed(2), hMean: +r.homeMean.toFixed(2),
+                p10: +r.p10.toFixed(1), p90: +r.p90.toFixed(1),
+                park: homePark || null, parkF: PARKS[homePark] != null ? +PARKS[homePark].toFixed(3) : null,
+                temp: g.wx ? g.wx.temp : null, windOut: g.wx ? g.wx.windOut : null,
+                aSP: g.awayP || null, hSP: g.homeP || null,
+                aSPx: a.sp ?? null, hSPx: h.sp ?? null,
+                aOff: a.off ?? null, hOff: h.off ?? null,
+                aRec: a.recent ?? null, hRec: h.recent ?? null,
+                aPen: a.pen ?? null, hPen: h.pen ?? null,
+                aOaa: a.oaa ?? null, hOaa: h.oaa ?? null,
+                // Priced on today's posted nine, or on season numbers? The miss lab
+                // can then test whether misses cluster in games priced without
+                // lineups, which is a real and answerable question.
+                aLu: a.lu ? a.lu.source : null, hLu: h.lu ? h.lu.source : null,
+                aLuEst: a.lu ? a.lu.est : null, hLuEst: h.lu ? h.lu.est : null,
+                aFat: a.penFatigue ?? null, hFat: h.penFatigue ?? null,
+            },
+        });
+    }
+    return out;
+}
+// Fold priced rows back onto a stored board. A skip never erases a projection
+// frozen earlier — a post-first-pitch rescan skips everything, and the number
+// frozen before the game is the honest pregame record.
+function foldProjections(games, rows, stamp, dayKey, how) {
+    return (games || []).map((g) => {
+        const r = rows.find((x) => x.away === g.away && x.home === g.home);
+        if (r && r.status === "ok")
+            return { ...g, skip: undefined, proj: { model: +r.model.toFixed(2), edge: +r.edge.toFixed(1),
+                    pOver: +r.pW.toFixed(3), atLine: r.line, ts: stamp, day: dayKey,
+                    how: how || "manual", snap: r.snap || null } };
+        if (r && r.status === "skip" && !g.proj)
+            return { ...g, skip: r.code };
+        return g;
+    });
 }
 function SlateHub({ onOpenInTerminal }) {
     const hosted = typeof STANDALONE !== "undefined" && STANDALONE;
@@ -11298,6 +11511,42 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
             const left = [...new Set(lu.notPosted)].length;
             return { state: left ? "warn" : "ok", note: `${lu.got.length} team${lu.got.length === 1 ? "" : "s"}${left ? `, ${left} not posted yet` : ""}` };
         });
+        // Price every game and freeze the snapshot. This is the step that was
+        // missing: the projection only ever ran from the Slate hub's scan button,
+        // so a day nobody scanned produced a graded result with nothing to grade
+        // it against. 128 of 169 games on file are in that state — describable,
+        // not attributable. From here every game carries its own p10/p90 and the
+        // inputs it was priced on, whether or not anyone opens the app.
+        await run("project", async () => {
+            const arch = await store.get("ingenuity:slate:archive", {});
+            const board = arch[todayKey];
+            if (!board || !board.games || !board.games.length)
+                return { state: "skip", note: "no board for today" };
+            if (!workingTeams.length)
+                return { state: "skip", note: "database empty" };
+            const rows = projectSlate(board.games, workingTeams, todayKey, 8000);
+            const scored = rows.filter((r) => r.status === "ok");
+            if (!scored.length) {
+                const why = {};
+                for (const r of rows)
+                    if (r.code)
+                        why[r.code] = (why[r.code] || 0) + 1;
+                const top = Object.entries(why).sort((a, b) => b[1] - a[1])[0];
+                return { state: "warn", note: top ? `none priced \u2014 mostly ${(SKIP_LABELS[top[0]] || [top[0]])[0]}` : "none priced" };
+            }
+            const stamp = new Date().toISOString().slice(11, 16);
+            arch[todayKey] = { ...board, games: foldProjections(board.games, rows, stamp, todayKey, "morning") };
+            const wrote = await store.set("ingenuity:slate:archive", arch);
+            if (!wrote)
+                return { state: "fail", note: store.lastError || "save refused \u2014 no snapshot frozen" };
+            // Which inputs it was priced on decides how much the snapshot is worth,
+            // so it is recorded rather than assumed. A morning price is pre-lineup
+            // by definition; a later rescan replaces it with a better one.
+            const onLineups = scored.filter((r) => r.lu && r.lu.a && r.lu.h && r.lu.a.source === "lineup" && r.lu.h.source === "lineup").length;
+            const unpriced = board.games.length - scored.length;
+            return { state: unpriced ? "warn" : "ok",
+                note: `${scored.length} of ${board.games.length} priced${onLineups ? `, ${onLineups} on posted lineups` : ", all on season numbers (lineups not out yet)"}${unpriced ? `, ${unpriced} unpriced` : ""}` };
+        });
         await run("settle", async () => {
             // Yesterday's bets settle themselves rather than waiting for a visit to
             // the Desk tab. A record that only updates when you remember to look
@@ -11322,6 +11571,36 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
             const flagged = (d.checks || []).filter((c) => c.flagged);
             for (const c of flagged)
                 await logActivity("calibration", `Self-diagnosis flagged: ${c.label}`, c.value);
+            // Take yesterday's five worst misses apart now, while the box scores
+            // are being fetched anyway, and cache the result. The point is that
+            // the diagnosis is WAITING when the tab opens rather than costing a
+            // tap and a round trip per game — a lab you have to operate by hand
+            // is a lab you stop opening.
+            try {
+                const yday = etDayKey(new Date(Date.now() - 86400000));
+                const dayRows = missDay(rlog, boards, yday).rows.slice(0, 5);
+                if (dayRows.length) {
+                    const cache = await store.get(AUTOPSY_KEY, {});
+                    let done = 0;
+                    for (const r of dayRows) {
+                        const k = missKey(r);
+                        if (cache[k] && !cache[k].err)
+                            continue;
+                        cache[k] = await autopsyGame(r, r.snap);
+                        done++;
+                    }
+                    if (done) {
+                        // Keep only the last 14 days of autopsies. An unbounded
+                        // cache is how a storage budget disappears quietly.
+                        const cutoff = etDayKey(new Date(Date.now() - 14 * 86400000));
+                        for (const k of Object.keys(cache))
+                            if (String(k).split("|")[0] < cutoff)
+                                delete cache[k];
+                        await store.set(AUTOPSY_KEY, cache);
+                    }
+                }
+            }
+            catch { /* an autopsy failing must never fail the diagnosis */ }
             if (!d.n)
                 return { state: "skip", note: "no graded games yet" };
             const pending = (d.checks || []).filter((c) => !c.flagged && c.n != null && c.n < 20).length;
@@ -11608,75 +11887,10 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
                 }
             }
         }
-        const out = [];
-        for (const g of slate.games) {
-            const line = parseFloat(g.line);
-            if (isNaN(line)) {
-                out.push({ ...g, status: "skip", code: "no_line", err: "no total set" });
-                continue;
-            }
-            const A = matchTeamDb(g.away, liveTeams), H = matchTeamDb(g.home, liveTeams);
-            if (!A || !H) {
-                out.push({ ...g, status: "skip", code: "no_team", err: `no DB match for ${!A ? g.away : g.home}` });
-                continue;
-            }
-            if (g.inPlay || (g.start && new Date(g.start).getTime() <= Date.now())) {
-                out.push({ ...g, status: "skip", code: "started", err: "first pitch has passed — this model prices 9 innings, not a game in progress" });
-                continue;
-            }
-            const a = buildSide(A, g.awayP), h = buildSide(H, g.homeP);
-            if (!a.resolved || !h.resolved) {
-                // Naming the arm matters: an unnamed "starter not in your database"
-                // on a two-pitcher game sends you checking the one that was fine.
-                const missing = [];
-                if (!a.resolved)
-                    missing.push(g.awayP ? `${g.awayP} (${A.name})` : `${A.name} \u2014 none posted`);
-                if (!h.resolved)
-                    missing.push(g.homeP ? `${g.homeP} (${H.name})` : `${H.name} \u2014 none posted`);
-                const why = (!g.awayP || !g.homeP)
-                    ? `probable starter not posted: ${missing.join(" \u00B7 ")}`
-                    : `not in your database: ${missing.join(" \u00B7 ")}`;
-                out.push({ ...g, status: "skip", code: (!g.awayP || !g.homeP) ? "no_sp_posted" : "no_sp_db", err: why + " — the arm is the biggest input; won't guess it" });
-                continue;
-            }
-            const over = parseFloat(g.over) || -110, under = parseFloat(g.under) || -110;
-            const homePark = parkForTeam(H.name);
-            const r = projectGame({
-                park: homePark, line, temp: g.wx ? g.wx.temp : null, windOut: g.wx ? g.wx.windOut : null,
-                awayOff: a.off, awayXoff: a.xoff, awayPA: a.pa, awayRecent: a.recent, awayRecentPA: a.recentPA, awayRecentBbk: a.recentBbk, awaySP: a.sp, awaySPbf: a.spBf, awaySPip: a.spIp, awaySPera: a.spEra, awayPen: a.pen, awayPenBf: a.penBf, awayPenBarrel: a.penBarrel, awayPenHardHit: a.penHardHit, awayPenFatigue: a.penFatigue, awayOAA: a.oaa, awayFraming: a.framing,
-                homeOff: h.off, homeXoff: h.xoff, homePA: h.pa, homeRecent: h.recent, homeRecentPA: h.recentPA, homeRecentBbk: h.recentBbk, homeSP: h.sp, homeSPbf: h.spBf, homeSPip: h.spIp, homeSPera: h.spEra, homePen: h.pen, homePenBf: h.penBf, homePenBarrel: h.penBarrel, homePenHardHit: h.penHardHit, homePenFatigue: h.penFatigue, homeOAA: h.oaa, homeFraming: h.framing,
-            }, 8000);
-            const pW = r.pOver / (r.pOver + r.pUnder);
-            const dO = amToDec(over), dU = amToDec(under);
-            const fairOver = (1 / dO) / ((1 / dO) + (1 / dU));
-            const edge = (pW - fairOver) * 100;
-            const evOver = r.pOver * (dO - 1) * 100 - r.pUnder * 100;
-            const evUnder = r.pUnder * (dU - 1) * 100 - r.pOver * 100;
-            out.push({ ...g, status: "ok", awayName: A.name, homeName: H.name, model: r.mean, pW, edge, evOver, evUnder,
-                lu: { a: a.lu, h: h.lu },
-                // The snapshot. Without this a past miss can only be described, never
-                // attributed: the model's spread and its per-side expectation are what
-                // separate "we were wrong" from "this landed in the tail we predicted".
-                snap: {
-                    aMean: +r.awayMean.toFixed(2), hMean: +r.homeMean.toFixed(2),
-                    p10: +r.p10.toFixed(1), p90: +r.p90.toFixed(1),
-                    park: homePark || null, parkF: PARKS[homePark] != null ? +PARKS[homePark].toFixed(3) : null,
-                    temp: g.wx ? g.wx.temp : null, windOut: g.wx ? g.wx.windOut : null,
-                    aSP: g.awayP || null, hSP: g.homeP || null,
-                    aSPx: a.sp ?? null, hSPx: h.sp ?? null,
-                    aOff: a.off ?? null, hOff: h.off ?? null,
-                    aRec: a.recent ?? null, hRec: h.recent ?? null,
-                    aPen: a.pen ?? null, hPen: h.pen ?? null,
-                    aOaa: a.oaa ?? null, hOaa: h.oaa ?? null,
-                    // Was this priced on today's posted nine or on season numbers?
-                    // The miss lab can then test whether misses cluster in games
-                    // priced without lineups, which is a real and testable question.
-                    aLu: a.lu ? a.lu.source : null, hLu: h.lu ? h.lu.source : null,
-                    aLuEst: a.lu ? a.lu.est : null, hLuEst: h.lu ? h.lu.est : null,
-                    aFat: a.penFatigue ?? null, hFat: h.penFatigue ?? null,
-                },
-            });
-        }
+        // One implementation, shared with the morning pass. Two copies of this
+        // would drift, and the drift would be invisible: both would produce
+        // numbers, and only one would match what the desk graded.
+        const out = projectSlate(slate.games, liveTeams, todayKey, 8000);
         const scored = out.filter((x) => x.status === "ok");
         let top = null;
         for (const x of scored)
@@ -11689,17 +11903,7 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
         // self-contained: the line it saw, the price it saw, and its own number.
         // Without this you can never honestly grade a past day.
         const stamp = new Date().toISOString().slice(11, 16);
-        await saveSlate({ ...slate, games: slate.games.map((g) => {
-                const r = out.find((x) => x.away === g.away && x.home === g.home);
-                if (r && r.status === "ok")
-                    return { ...g, skip: undefined, proj: { model: +r.model.toFixed(2), edge: +r.edge.toFixed(1), pOver: +r.pW.toFixed(3), atLine: r.line, ts: stamp, day: viewDate, snap: r.snap || null } };
-                // A skip must never erase a projection frozen earlier — a post-first-pitch
-                // rescan skips everything, and that number is the honest pregame record.
-                // Only games that never got projected carry a skip reason.
-                if (r && r.status === "skip" && !g.proj)
-                    return { ...g, skip: r.code };
-                return g;
-            }) });
+        await saveSlate({ ...slate, games: foldProjections(slate.games, out, stamp, viewDate, "manual") });
         // Lines move. Knowing when the board was last priced is the difference
         // between a current read and a stale one worn as a current one.
         await store.set("ingenuity:stamp:scan", { at: new Date().toISOString(), day: viewDate, n: scored.length });
@@ -14279,6 +14483,16 @@ const CSS = `
 .ing-roster-preview span.out, .arm-name.out { opacity: 0.55; text-decoration: line-through; text-decoration-color: var(--rust); }
 .outtag { font-style: normal; font-size: 8.5px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--rust); border: 1px solid rgba(232,115,79,0.45); border-radius: 4px; padding: 1px 4px; margin-left: 5px; text-decoration: none; display: inline-block; vertical-align: middle; }
 .lineup-conflict { font-size: 11.5px; color: var(--amber); line-height: 1.5; margin-top: 8px; padding-left: 9px; border-left: 2px solid rgba(245,196,81,0.45); }
+/* ---- miss lab, daily ---- */
+.miss-day-line { font-size: 12px; color: var(--ink-dim); line-height: 1.55; margin: 9px 0 11px; }
+.miss-day-line b { color: var(--ink); }
+.miss-rank { font-family: 'Archivo'; font-size: 9.5px; color: var(--ink-dim); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; margin-right: 7px; }
+.miss-ready { color: var(--phos); font-size: 8px; margin-left: 6px; }
+.miss-causes { margin: 16px 0 4px; padding-top: 13px; border-top: 1px solid var(--line); }
+.mc-grid { display: grid; grid-template-columns: 1fr; gap: 5px; margin: 9px 0; }
+.mc-grid span { font-size: 11.5px; color: var(--ink-dim); background: var(--field); border: 1px solid var(--line); border-radius: 7px; padding: 7px 10px; line-height: 1.4; }
+.mc-grid span b { color: var(--ink); font-size: 14px; margin-right: 6px; font-variant-numeric: tabular-nums; }
+@media (min-width: 620px) { .mc-grid { grid-template-columns: 1fr 1fr; } }
 .pen-form em { color: var(--cyan); }
 .pen-note { font-size: 11px; color: var(--amber); line-height: 1.5; margin-top: 7px; padding-left: 8px; border-left: 2px solid rgba(245,196,81,0.4); }
 .dbf-headacts { display: flex; align-items: center; gap: 8px; }
