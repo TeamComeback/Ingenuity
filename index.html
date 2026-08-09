@@ -1264,6 +1264,9 @@ function parlayDecimal(legs) {
 // refuse. lastError carries the reason so callers can say something true.
 const store = {
     lastError: null,
+    failedAt: null, // when a write last failed, and on which key
+    lastOk: null, // when a write last succeeded
+    onFailure: null, // set by the app so a silent loss becomes a visible banner
     async get(k, def) {
         try {
             const r = localStorage.getItem(k);
@@ -1274,17 +1277,74 @@ const store = {
         }
     },
     async set(k, v) {
+        let payload;
         try {
-            localStorage.setItem(k, JSON.stringify(v));
-            store.lastError = null;
-            return true;
+            payload = JSON.stringify(v);
+        }
+        catch (e) {
+            store.note(k, `couldn't serialise: ${e.message}`);
+            return false;
+        }
+        try {
+            localStorage.setItem(k, payload);
         }
         catch (e) {
             const quota = e && (e.name === "QuotaExceededError" || e.code === 22 || e.code === 1014);
-            store.lastError = quota ? "browser storage is full" : String(e && e.message ? e.message : e);
-            console.error("storage write failed:", k, e);
+            store.note(k, quota ? "browser storage is full" : String(e && e.message ? e.message : e));
             return false;
         }
+        // READ BACK. This is the whole point: setItem returning without throwing
+        // means the call was accepted, not that the bytes are retrievable. Every
+        // "I fixed this yesterday and it was back this morning" bug lives in the
+        // gap between those two things.
+        let back;
+        try {
+            back = localStorage.getItem(k);
+        }
+        catch (e) {
+            store.note(k, `written but unreadable: ${e.message}`);
+            return false;
+        }
+        if (back == null || back.length !== payload.length) {
+            store.note(k, back == null ? "written but read back empty" : `written ${payload.length} bytes, read back ${back.length}`);
+            return false;
+        }
+        store.lastError = null;
+        store.failedAt = null;
+        store.lastOk = Date.now();
+        return true;
+    },
+    note(k, msg) {
+        store.lastError = msg;
+        store.failedAt = { key: k, at: Date.now() };
+        console.error("storage write failed:", k, msg);
+        // A caller that forgets to check still cannot lose data quietly.
+        if (typeof store.onFailure === "function")
+            try {
+                store.onFailure(k, msg);
+            }
+            catch { }
+    },
+    // Bytes per key, so "is storage full" is a measurement rather than a guess.
+    audit() {
+        const rows = [];
+        let total = 0;
+        try {
+            for (let i = 0; i < localStorage.length; i++) {
+                const k = localStorage.key(i);
+                if (k == null)
+                    continue;
+                const v = localStorage.getItem(k);
+                const bytes = (k.length + (v ? v.length : 0)) * 2; // UTF-16 in practice
+                rows.push({ key: k, bytes });
+                total += bytes;
+            }
+        }
+        catch (e) {
+            return { rows: [], total: 0, err: e.message };
+        }
+        rows.sort((a, b) => b.bytes - a.bytes);
+        return { rows, total, err: null };
     },
 };
 // ---------------------------------------------------------------------------
@@ -1879,15 +1939,24 @@ async function planRosterReconcile(teams) {
                     if (rec.id && String(pl.mlbId || "") !== rec.id)
                         out.idStamps.push({ team: t.name, bucket, name: pl.name, id: rec.id });
                     if (normName(rec.team) === normName(t.name)) {
-                        if (pl.inactive)
+                        // Right club. The only remaining question is availability,
+                        // and it is answered by MLB's status rather than by the
+                        // fact that he appears on a 40-man — a player optioned to
+                        // Triple-A appears on one and is not playing tonight.
+                        const av = availabilityOf(rec);
+                        if (pl.inactive && av.available)
                             out.moves.push({ name: pl.name, from: t.name, to: t.name, bucket, id: rec.id, reactivate: true });
+                        else if (!pl.inactive && !av.available)
+                            out.inactive.push({ name: pl.name, team: t.name, bucket, label: av.label, code: av.code });
                         continue;
                     }
                     if (!dbTeamNames.has(normName(rec.team))) {
                         out.unknownTeams.push(rec.team);
                         continue;
                     }
+                    const mvAv = availabilityOf(rec);
                     out.moves.push({ name: pl.name, from: t.name, to: rec.team, bucket,
+                        available: mvAv.available, label: mvAv.label,
                         toBucket: rec.pitcher ? "rotation" : "players", id: rec.id });
                 }
             }
@@ -1931,7 +2000,7 @@ function applyRosterReconcile(teams, plan) {
             const arr = next[fi][mv.bucket];
             const k = arr.findIndex((p) => normName(p.name) === normName(mv.name));
             if (k >= 0) {
-                arr[k] = { ...arr[k], inactive: undefined, mlbId: mv.id || arr[k].mlbId };
+                arr[k] = { ...arr[k], inactive: undefined, availability: undefined, mlbId: mv.id || arr[k].mlbId };
                 reactivated++;
             }
             continue;
@@ -1947,7 +2016,12 @@ function applyRosterReconcile(teams, plan) {
         const destKey = mv.toBucket || mv.bucket;
         const dest = next[ti][destKey];
         if (!dest.some((p) => normName(p.name) === normName(pl.name)))
-            dest.push({ ...pl, inactive: undefined, mlbId: mv.id || pl.mlbId });
+            // A player arriving from another club is available only if MLB says
+            // so. Blanket-clearing on arrival is what let a traded-and-optioned
+            // player come back as a starter.
+            dest.push({ ...pl, inactive: mv.available === false ? true : undefined,
+                availability: mv.available === false ? (mv.label || "not active") : undefined,
+                mlbId: mv.id || pl.mlbId });
         moved++;
     }
     for (const inact of plan.inactive) {
@@ -1957,7 +2031,7 @@ function applyRosterReconcile(teams, plan) {
         const arr = next[i][inact.bucket];
         const k = arr.findIndex((p) => normName(p.name) === normName(inact.name));
         if (k >= 0) {
-            arr[k] = { ...arr[k], inactive: true };
+            arr[k] = { ...arr[k], inactive: true, availability: inact.label || "not active" };
             flagged++;
         }
     }
@@ -3446,9 +3520,19 @@ function Terminal({ onHome, pendingGame, onPendingConsumed }) {
             setLoaded(true);
         })();
     }, []);
+    // Returns TRUE only if the bytes came back. Callers that check can report
+    // honestly; callers that forget are caught by the banner below, which is
+    // wired to store.onFailure. Both paths exist because the failure this
+    // guards against is invisible by nature — the screen says "saved" and the
+    // morning says otherwise.
+    const [writeFail, setWriteFail] = useState(null);
+    useEffect(() => {
+        store.onFailure = (key, msg) => setWriteFail({ key, msg, at: Date.now() });
+        return () => { store.onFailure = null; };
+    }, []);
     const saveTeams = useCallback(async (next) => {
         setTeams(next);
-        await store.set("ingenuity:teams", next);
+        return await store.set("ingenuity:teams", next);
     }, []);
     // Today's Slate auto-apply: when both loaded teams match a slate game,
     // pull in the stored line, prices, and probable starters automatically.
@@ -3734,6 +3818,13 @@ function Terminal({ onHome, pendingGame, onPendingConsumed }) {
                 React.createElement("button", { className: tab === "bullpens" ? "on" : "", onClick: () => setTab("bullpens") }, "Bullpens"),
                 React.createElement("button", { className: tab === "debrief" ? "on" : "", onClick: () => setTab("debrief") }, "Debrief"),
                 React.createElement("button", { className: tab === "desk" ? "on" : "", onClick: () => setTab("desk") }, "Desk"))),
+        // A write that didn't land is announced across every tab, not left for
+        // whichever panel happened to make the call. The choke point raises its
+        // hand so a caller that forgets to check still can't lose data quietly.
+        writeFail && React.createElement("div", { className: "wfail" },
+            React.createElement("b", null, "Not saved. "),
+            `The last write to ${String(writeFail.key).replace(/^ingenuity:/, "")} didn't land — ${writeFail.msg}. Anything changed since then exists only on screen and will be gone on reload.`,
+            React.createElement("button", { onClick: () => setWriteFail(null) }, "Dismiss")),
         tab === "project" && (React.createElement("main", { className: "ing-main" },
             React.createElement("section", { className: "ing-inputs" },
                 React.createElement(SmartImport, { teams: teams, saveTeams: saveTeams, onGameLine: loadGameLine }),
@@ -3793,7 +3884,9 @@ function Terminal({ onHome, pendingGame, onPendingConsumed }) {
                 React.createElement(CoveragePanel, { teams: teams })),
             React.createElement("div", { className: "ing-db-import tight" },
                 React.createElement(PlatoonImport, { teams: teams, saveTeams: saveTeams })),
-            React.createElement(Database, { teams: teams, saveTeams: saveTeams, loaded: loaded }))),
+            React.createElement(Database, { teams: teams, saveTeams: saveTeams, loaded: loaded }),
+            React.createElement("div", { className: "ing-db-import tight" },
+                React.createElement(StorageHealth, null)))),
         tab === "lineups" && React.createElement(LineupFetcher, { teams: teams, saveTeams: saveTeams }),
         tab === "bullpens" && React.createElement(BullpenTab, { teams: teams }),
         tab === "debrief" && React.createElement(DebriefTab, { teams: teams }),
@@ -3982,7 +4075,8 @@ function RosterReconcile({ teams, onApply }) {
                         React.createElement("h5", null, `${plan.inactive.length} no longer on a 40-man`),
                         React.createElement("p", { className: "grade-note" }, "Their stats are kept \u2014 they are only flagged so they stop counting toward a current-roster figure, and they come back automatically if they return."),
                         React.createElement("p", { className: "dbf-inline" }, plan.inactive.slice(0, 10).map((x) => `${x.name} (${x.team})`).join(" \u00B7 "), plan.inactive.length > 10 ? ` \u00B7 +${plan.inactive.length - 10}` : "")),
-                    reacts.length > 0 && React.createElement("p", { className: "grade-note" }, `${reacts.length} previously-inactive player${reacts.length === 1 ? " is" : "s are"} back on a roster and will be reactivated.`),
+                    reacts.length > 0 && React.createElement("p", { className: "grade-note" }, `${reacts.length} player${reacts.length === 1 ? " is" : "s are"} listed Active by MLB again and will be un-flagged.`),
+                    plan.inactive.length > 0 && React.createElement("p", { className: "grade-note" }, `${plan.inactive.length} player${plan.inactive.length === 1 ? " is" : "s are"} on a 40-man but not Active (${[...new Set(plan.inactive.map((x) => x.label))].slice(0, 4).join(", ")}) and will be dropped from team ratings until MLB reinstates them.`),
                     plan.missingFromDb > 0 && React.createElement("p", { className: "grade-note" }, `${plan.missingFromDb} player${plan.missingFromDb === 1 ? "" : "s"} on 40-man rosters aren't in your database at all. They aren't added here \u2014 a name with no stats can't be projected, so the fix is a stats import rather than a placeholder that looks like data.`),
                     plan.unknownTeams.length > 0 && React.createElement("p", { className: "grade-note" }, `Skipped players moving to clubs not in your database: ${plan.unknownTeams.join(", ")}.`),
                     React.createElement("button", { className: "ing-ghost", onClick: () => (armed ? apply() : setArmed(true)) },
@@ -4155,9 +4249,84 @@ function provenanceLine(t) {
         return "No import stamped yet — these are seed values.";
     return bits.join(" · ");
 }
+// Keys that can be regenerated from source at any time. Everything else — the
+// database, the ledger, the results log — is irreplaceable and never offered.
+const SHEDDABLE = [
+    { prefix: "ingenuity:slate:archive", label: "Board snapshots", why: "frozen scan-time projections; the desk only reads the last few days" },
+    { prefix: "ingenuity:debrief", label: "Debrief cache", why: "rebuilt from MLB in one press" },
+    { prefix: "ingenuity:mlb:", label: "MLB fetch cache", why: "re-fetched automatically on the next morning run" },
+];
+function StorageHealth() {
+    const [open, setOpen] = useState(false);
+    const [snap, setSnap] = useState(null);
+    const [msg, setMsg] = useState("");
+    const read = () => setSnap(store.audit());
+    useEffect(() => {
+        read();
+    }, []);
+    const fmt = (b) => (b >= 1048576 ? `${(b / 1048576).toFixed(2)} MB` : b >= 1024 ? `${Math.round(b / 1024)} KB` : `${b} B`);
+    // Browsers publish no quota for localStorage; 5 MB is the near-universal
+    // floor. Treated as a yardstick, not a promise.
+    const LIMIT = 5 * 1024 * 1024;
+    const total = snap ? snap.total : 0;
+    const pct = Math.min(100, Math.round((total / LIMIT) * 100));
+    const tone = pct >= 85 ? "bad" : pct >= 65 ? "warn" : "ok";
+    const shed = async (grp) => {
+        if (!snap)
+            return;
+        const hits = snap.rows.filter((r) => r.key.startsWith(grp.prefix));
+        if (!hits.length)
+            return;
+        let freed = 0;
+        for (const h of hits) {
+            try {
+                localStorage.removeItem(h.key);
+                freed += h.bytes;
+            }
+            catch { }
+        }
+        read();
+        setMsg(`Cleared ${hits.length} ${grp.label.toLowerCase()} key${hits.length === 1 ? "" : "s"}, ${fmt(freed)} freed. ${grp.why}.`);
+    };
+    const failure = store.failedAt;
+    return React.createElement("section", { className: "ing-card sh" },
+        React.createElement("button", { className: "dbf-drawer-head", onClick: () => { setOpen(!open); read(); } },
+            React.createElement("span", null, "Storage health"),
+            React.createElement("em", { className: tone }, snap ? `${fmt(total)} used \u00b7 ${pct}% of the usual limit` : "checking\u2026")),
+        open && snap && React.createElement(React.Fragment, null,
+            React.createElement("div", { className: "sh-bar" },
+                React.createElement("span", { className: tone, style: { width: `${Math.max(2, pct)}%` } })),
+            failure && React.createElement("p", { className: "sh-fail" },
+                React.createElement("b", null, "Last write failed. "),
+                `${failure.key} — ${store.lastError}. Anything you changed after that point is not on disk.`),
+            !failure && store.lastOk && React.createElement("p", { className: "sh-note ok" }, `Last write verified at ${new Date(store.lastOk).toLocaleTimeString()} — the bytes were read back, not just accepted.`),
+            React.createElement("div", { className: "sh-rows" }, snap.rows.slice(0, 10).map((r) => React.createElement("div", { className: "sh-row", key: r.key },
+                React.createElement("span", { className: "k" }, r.key.replace(/^ingenuity:/, "")),
+                React.createElement("span", { className: "v" }, fmt(r.bytes))))),
+            snap.rows.length > 10 && React.createElement("p", { className: "ing-microhint" }, `+${snap.rows.length - 10} smaller keys`),
+            React.createElement("div", { className: "sh-shed" }, SHEDDABLE.map((g) => {
+                const hits = snap.rows.filter((r) => r.key.startsWith(g.prefix));
+                const bytes = hits.reduce((a, b) => a + b.bytes, 0);
+                if (!bytes)
+                    return null;
+                return React.createElement("button", { key: g.prefix, className: "ing-ghost", onClick: () => shed(g) }, `Clear ${g.label} (${fmt(bytes)})`);
+            })),
+            msg && React.createElement("p", { className: "sh-note" }, msg),
+            React.createElement("p", { className: "sh-note dim" }, "The database, ledger, and results log are never offered here \u2014 they can't be rebuilt from anything. Only caches and superseded board snapshots can be shed.")));
+}
 function Database({ teams, saveTeams, loaded }) {
     const [editing, setEditing] = useState({ ...EMPTY_TEAM });
     const [fixNote, setFixNote] = useState("");
+    const [fixFailed, setFixFailed] = useState(false);
+    // One handler for every repair panel. A fix that never reached storage is
+    // reported as a failure rather than as a success with an invisible asterisk
+    // — that gap is precisely why the same corrections kept reappearing each
+    // morning looking as though they had never been made.
+    const applyAndVerify = async (next, note) => {
+        const ok = await saveTeams(next);
+        setFixFailed(!ok);
+        setFixNote(ok ? note : `NOT SAVED — ${store.lastError || "the write didn't land"}. Nothing changed, so this fix will still be waiting. Check Storage health below.`);
+    };
     const [editIndex, setEditIndex] = useState(-1);
     const [openRoster, setOpenRoster] = useState(-1);
     const commitTeam = () => {
@@ -4173,7 +4342,7 @@ function Database({ teams, saveTeams, loaded }) {
             else
                 next.push({ ...editing });
         }
-        saveTeams(next);
+        applyAndVerify(next, editIndex >= 0 ? `Saved ${editing.name}.` : `Added ${editing.name}.`);
         setEditing({ ...EMPTY_TEAM });
         setEditIndex(-1);
     };
@@ -4201,13 +4370,13 @@ function Database({ teams, saveTeams, loaded }) {
         .map((g) => ({ g, items: teams.map((t, i) => ({ t, i })).filter(({ t }) => leagueOf(t.name) === g) }))
         .filter(({ items }) => items.length > 0);
     return (React.createElement("main", { className: "ing-db" },
-        teams.length > 0 && React.createElement(TeamsAsPlayers, { teams: teams, onApply: (next, note) => { saveTeams(next); setFixNote(note); } }),
-        teams.length > 0 && React.createElement(RosterReconcile, { teams: teams, onApply: (next, note) => { saveTeams(next); setFixNote(note); } }),
-        teams.length > 0 && React.createElement(MisplacedPlayers, { teams: teams, onApply: (next, note) => { saveTeams(next); setFixNote(note); } }),
-        fixNote && React.createElement("p", { className: "fresh-audit-note fixnote" }, fixNote),
+        teams.length > 0 && React.createElement(TeamsAsPlayers, { teams: teams, onApply: applyAndVerify }),
+        teams.length > 0 && React.createElement(RosterReconcile, { teams: teams, onApply: applyAndVerify }),
+        teams.length > 0 && React.createElement(MisplacedPlayers, { teams: teams, onApply: applyAndVerify }),
+        fixNote && React.createElement("p", { className: "fresh-audit-note fixnote" + (fixFailed ? " bad" : "") }, fixNote),
         teams.length > 0 && React.createElement(FreshnessAudit, { teams: teams, onRepair: (names) => {
             const hit = new Set(names);
-            saveTeams(teams.map((t) => hit.has(t.name) ? { ...t, recent: "", recentPA: "", recentBbk: "", recentAsOf: undefined } : t));
+            applyAndVerify(teams.map((t) => hit.has(t.name) ? { ...t, recent: "", recentPA: "", recentBbk: "", recentAsOf: undefined } : t), `Cleared 14-day form on ${hit.size} team${hit.size === 1 ? "" : "s"}.`);
         } }),
         editIndex >= 0 && (React.createElement("section", { className: "ing-db-editor" },
             React.createElement("h2", null,
@@ -4282,7 +4451,7 @@ function Database({ teams, saveTeams, loaded }) {
                             })()),
                         React.createElement("div", { className: "ing-dir-btns" },
                             React.createElement("button", { onClick: () => { setEditing({ ...EMPTY_TEAM, ...t }); setEditIndex(i); }, "aria-label": `Edit ${t.name}` }, "\u270E"),
-                            React.createElement("button", { onClick: () => { const n = teams.filter((_, j) => j !== i); saveTeams(n); if (open)
+                            React.createElement("button", { onClick: () => { const n = teams.filter((_, j) => j !== i); applyAndVerify(n, `Removed ${t.name}.`); if (open)
                                     setOpenRoster(-1); }, "aria-label": `Delete ${t.name}` }, "\u2715")),
                         open && (() => {
                             const isStarter = (p) => (parseFloat(p.bf) || 0) >= 250 || (parseFloat(p.ip) || 0) >= 3.5;
@@ -4569,7 +4738,10 @@ function LineupFetcher({ teams, saveTeams }) {
     // Single-team save from a game card: merge, persist, report.
     const importTeam = (t) => {
         const { next, kept, estimated, added, lineupLen, spNote } = mergeLineup(t, teams);
-        saveTeams(next);
+        saveTeams(next).then((wrote) => {
+            if (!wrote)
+                setImportMsg(`NOT SAVED — ${store.lastError || "the write didn't land"}. ${t.name}'s order is on screen only; pull it again after freeing storage.`);
+        });
         setImportMsg(`Saved ${t.name}'s batting order (${lineupLen}).` +
             (kept ? ` ${kept} kept their imported stats.` : "") +
             (estimated ? ` ${estimated} ${estimated === 1 ? "is an OBP/SLG estimate" : "are OBP/SLG estimates"}${added ? ` (${added} new to your database)` : ""} — import real numbers and the projection sharpens.` : "") +
@@ -4596,8 +4768,9 @@ function LineupFetcher({ teams, saveTeams }) {
                     next.push(merged);
                 count++;
             }
-            saveTeams(next);
-            setPasteMsg(`Imported ${count} team${count === 1 ? "" : "s"}.`);
+            saveTeams(next).then((wrote) => setPasteMsg(wrote
+                ? `Imported ${count} team${count === 1 ? "" : "s"}.`
+                : `NOT SAVED — ${store.lastError || "the write didn't land"}. Nothing was stored.`));
             setPasteText("");
         }
         catch {
@@ -14122,6 +14295,30 @@ const CSS = `
 .mirror-row strong { font-size: 13px; color: var(--ink); line-height: 1.35; }
 .mirror-row strong.pass { color: var(--phos); }
 @media (min-width: 620px) { .mirror-row { grid-template-columns: 1fr 1fr; } }
+.fresh-audit-note.fixnote.bad { color: var(--rust); border-left: 2px solid var(--rust); padding-left: 9px; }
+/* ---- storage health ---- */
+.sh-bar { height: 6px; border-radius: 3px; background: var(--field); overflow: hidden; margin-bottom: 11px; }
+.sh-bar span { display: block; height: 100%; border-radius: 3px; }
+.sh-bar span.ok { background: var(--phos); }
+.sh-bar span.warn { background: var(--amber); }
+.sh-bar span.bad { background: var(--rust); }
+.dbf-drawer-head em.warn { color: var(--amber); }
+.dbf-drawer-head em.bad { color: var(--rust); }
+.sh-rows { display: flex; flex-direction: column; gap: 2px; }
+.sh-row { display: flex; justify-content: space-between; gap: 12px; font-size: 11.5px; padding: 3px 0; border-bottom: 1px solid var(--line); }
+.sh-row .k { color: var(--ink-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sh-row .v { color: var(--ink); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.sh-shed { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 11px; }
+.sh-shed button { font-size: 10.5px; padding: 7px 11px; }
+.sh-note { font-size: 11px; color: var(--ink-dim); line-height: 1.5; margin-top: 9px; }
+.sh-note.ok { color: var(--phos); }
+.sh-note.dim { opacity: 0.75; }
+.sh-fail { font-size: 11.5px; color: var(--rust); line-height: 1.5; margin-bottom: 9px; padding-left: 9px; border-left: 2px solid var(--rust); }
+.sh .dbf-drawer-head { padding: 13px 0; }
+/* ---- app-wide write failure ---- */
+.wfail { margin: 0 28px 14px; padding: 11px 13px; border-radius: 9px; background: rgba(232,115,79,0.10); border: 1px solid rgba(232,115,79,0.45); color: var(--ink); font-size: 12px; line-height: 1.55; }
+.wfail b { color: var(--rust); }
+.wfail button { margin-left: 8px; background: transparent; border: 1px solid rgba(232,115,79,0.5); color: var(--rust); border-radius: 6px; padding: 3px 9px; font-size: 10px; font-family: 'Archivo'; letter-spacing: 0.06em; text-transform: uppercase; cursor: pointer; }
 .ing-dir-prov { font-size: 10.5px; color: var(--ink-dim); line-height: 1.45; margin: 7px 0 2px; font-style: italic; }
 .ing-import-toggle { width: 100%; text-align: left; font-family: 'Archivo'; font-size: 11.5px; letter-spacing: 0.08em; text-transform: uppercase; background: var(--field2); border: 1px dashed var(--line); color: var(--cyan); padding: 11px 14px; border-radius: 9px; cursor: pointer; }
 .ing-import-toggle:hover { border-color: var(--cyan); }
