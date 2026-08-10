@@ -63,6 +63,22 @@ const DEFAULT_CFG = {
     // innings on average. Books price this; a model that doesn't runs ~2%
     // hot on every home total.
     HOME_BAT_FACTOR: 0.951,
+    // v2.5: the constants say what they mean. RUN_ENV_CAL scales BOTH lambdas —
+    // the 9-inning base rate was ~10% hot once extras started carrying their own
+    // share of the run mass. HOME_ADV is the RELATIVE per-inning batting gap
+    // between home and away; 1.114 is what real scoring implies once the skipped
+    // bottom 9th is accounted for (home ~4.46 over ~8.56 innings vs away ~4.26
+    // over 9). Both tuned empirically by calibrate.js against 150k-sim runs,
+    // not set by hand — the first hand-set values were wrong in a way that only
+    // measurement caught. Previously the model had home and away REVERSED
+    // (home 4.33 / away 4.56).
+    RUN_ENV_CAL: 0.898,
+    HOME_ADV: 1.114,
+    // v2.5: extra innings. 9-inning totals can tie; real games cannot. Ties go
+    // to extras with the ghost runner, at this many expected runs per team per
+    // extra inning. Also removes ~0.13 runs of structural under-projection that
+    // sat below the noise floor of any graded sample small enough to collect.
+    EXTRA_INNING_LAMBDA: 0.95,
     WEATHER_MAX_BOOST: 0.06,
     // v1.3: pitcher rating = xwOBA blended with an ERA-derived equivalent.
     // xwOBA is contact quality; ERA/xERA capture sequencing, stretch-vs-stuff,
@@ -873,7 +889,10 @@ function simulateSide(offW, oppSP, oppSPip, oppPen, park, fld, n, gameFactor, si
         sip = Math.max(1.5, Math.min(9, sip));
         const penIp = Math.max(0, 9 - sip);
         const mrun = (pitchW, ip) => {
-            const m = (offW + pitchW) / 2;
+            // Additive (log5-equivalent for small deviations): both deviations
+            // carry at full strength. Clamped to a physical range so a corrupt
+            // input degrades to an extreme rate, never a negative or absurd one.
+            const m = Math.max(0.200, Math.min(0.480, offW + pitchW - CFG.LEAGUE_WOBA));
             const pa = ip * CFG.PA_PER_INNING;
             return ((m - CFG.LEAGUE_WOBA) / CFG.WOBA_SCALE + CFG.LEAGUE_RUNS_PER_PA) * pa;
         };
@@ -907,8 +926,26 @@ function projectGame(g, nOverride) {
     const gameFactor = new Float64Array(n);
     for (let i = 0; i < n; i++)
         gameFactor[i] = randGamma(CFG.OVERDISP_SHAPE_GAME) / CFG.OVERDISP_SHAPE_GAME;
-    const awayRuns = simulateSide(awayOff, homeSP, g.homeSPip, homePen, park, homeField, n, gameFactor, 1);
-    const homeRuns = simulateSide(homeOff, awaySP, g.awaySPip, awayPen, park, awayField, n, gameFactor, CFG.HOME_BAT_FACTOR);
+    const awayRuns = simulateSide(awayOff, homeSP, g.homeSPip, homePen, park, homeField, n, gameFactor, CFG.RUN_ENV_CAL);
+    const homeRuns = simulateSide(homeOff, awaySP, g.awaySPip, awayPen, park, awayField, n, gameFactor, CFG.RUN_ENV_CAL * CFG.HOME_BAT_FACTOR * CFG.HOME_ADV);
+    // v2.5: a nine-inning tie cannot end a baseball game. Tied draws go to
+    // extras with the ghost runner; the home half is truncated to a one-run
+    // walk-off, which is the dominant real ending. This removes impossible
+    // tied outcomes AND adds the extras run mass through the only mechanism
+    // that actually produces it — instead of smearing a correction over every
+    // game, it lands only on the ~9% that were tied, where it belongs.
+    for (let i = 0; i < n; i++) {
+        let guard = 0;
+        while (awayRuns[i] === homeRuns[i] && guard < 15) {
+            const ax = randPoisson(CFG.EXTRA_INNING_LAMBDA);
+            let hx = randPoisson(CFG.EXTRA_INNING_LAMBDA);
+            if (hx > ax)
+                hx = ax + 1; // walk-off: the game ends the moment home leads
+            awayRuns[i] += ax;
+            homeRuns[i] += hx;
+            guard++;
+        }
+    }
     const totals = new Float64Array(n); // integer-valued: sides are Poisson draws
     for (let i = 0; i < n; i++)
         totals[i] = awayRuns[i] + homeRuns[i];
@@ -10190,6 +10227,65 @@ function debriefColor(db) {
 // the all-time pattern engine below it, which needs 8 games to show a split at
 // all and says out loud that 30 is where it starts meaning something.
 // ===========================================================================
+// ---------------------------------------------------------------------------
+// RE-SCORE (v2.5) — the honest before/after for an engine change.
+// Every snapshotted game is re-priced from the inputs frozen at scan time,
+// under the engine as it stands NOW, and both versions are graded against the
+// real final. This is the only defensible way to judge a formula change: the
+// same games, the same inputs, two engines. APPROXIMATE by construction —
+// snapshots don't carry sample sizes, so regression runs at defaults — which is
+// why it reports a comparison, and does not touch a single stored number.
+// ---------------------------------------------------------------------------
+function rescoreSnapshots(log, boards, sims) {
+    const rows = [];
+    for (const r of Object.values(log || {})) {
+        if (!r || r.model == null || r.final == null)
+            continue;
+        const b = (boards || {})[r.date];
+        if (!b || !b.games)
+            continue;
+        for (const g of b.games) {
+            if (!g.proj || !g.proj.snap)
+                continue;
+            if (normName(g.away) !== normName(r.away) || normName(g.home) !== normName(r.home))
+                continue;
+            const sn = g.proj.snap;
+            if (sn.aOff == null || sn.hOff == null || sn.aSPx == null || sn.hSPx == null)
+                continue;
+            const line = r.line != null ? parseFloat(r.line) : 8.5;
+            const p = projectGame({
+                park: sn.park || null, line: isNaN(line) ? 8.5 : line,
+                temp: sn.temp ?? null, windOut: sn.windOut ?? null,
+                awayOff: parseFloat(sn.aOff), awayXoff: null, awayPA: 4000,
+                awayRecent: sn.aRec != null ? parseFloat(sn.aRec) : null, awayRecentPA: null, awayRecentBbk: null,
+                awaySP: parseFloat(sn.aSPx), awaySPbf: 600, awaySPip: 5.4, awaySPera: null,
+                awayPen: sn.aPen != null ? parseFloat(sn.aPen) : null, awayPenBf: 900,
+                awayOAA: sn.aOaa != null ? parseFloat(sn.aOaa) : null,
+                awayPenFatigue: sn.aFat ?? null,
+                homeOff: parseFloat(sn.hOff), homeXoff: null, homePA: 4000,
+                homeRecent: sn.hRec != null ? parseFloat(sn.hRec) : null, homeRecentPA: null, homeRecentBbk: null,
+                homeSP: parseFloat(sn.hSPx), homeSPbf: 600, homeSPip: 5.4, homeSPera: null,
+                homePen: sn.hPen != null ? parseFloat(sn.hPen) : null, homePenBf: 900,
+                homeOAA: sn.hOaa != null ? parseFloat(sn.hOaa) : null,
+                homePenFatigue: sn.hFat ?? null,
+            }, sims || 8000);
+            rows.push({ date: r.date, away: r.away, home: r.home, final: r.final,
+                oldModel: r.model, newModel: +p.mean.toFixed(2),
+                oldErr: r.final - r.model, newErr: r.final - p.mean });
+            break;
+        }
+    }
+    const agg = (errs) => {
+        if (!errs.length)
+            return { n: 0, bias: null, mae: null };
+        const bias = errs.reduce((a, b) => a + b, 0) / errs.length;
+        const mae = errs.reduce((a, b) => a + Math.abs(b), 0) / errs.length;
+        return { n: errs.length, bias, mae };
+    };
+    return { rows,
+        old: agg(rows.map((x) => x.oldErr)),
+        neu: agg(rows.map((x) => x.newErr)) };
+}
 const AUTOPSY_KEY = "ingenuity:misslab:autopsy";
 const missKey = (r) => `${r.date}|${r.away}|${r.home}`;
 // Everything graded for one day, worst miss first. Includes games that landed —
@@ -10247,6 +10343,19 @@ function MissLab({ log }) {
     const [open, setOpen] = useState(null);
     const [busy, setBusy] = useState("");
     const [showAll, setShowAll] = useState(false);
+    const [rescore, setRescore] = useState(null);
+    const [rescoring, setRescoring] = useState(false);
+    const runRescore = async () => {
+        setRescoring(true);
+        await new Promise((res) => setTimeout(res, 30));
+        try {
+            setRescore(rescoreSnapshots(log, boards, 8000));
+        }
+        catch (e) {
+            setRescore({ err: e.message });
+        }
+        setRescoring(false);
+    };
     const [day, setDay] = useState(etDayKey(new Date(Date.now() - 86400000)));
     useEffect(() => {
         let live = true;
@@ -10331,6 +10440,25 @@ function MissLab({ log }) {
                 React.createElement("span", null, React.createElement("b", null, causes.noLineup), ` priced before either lineup posted`),
                 React.createElement("span", null, React.createElement("b", null, causes.unearned), ` with unearned runs the model can't simulate`)),
             causes.repeat.length > 0 && React.createElement("p", { className: "miss-fact" }, `Clubs appearing three or more times: ${causes.repeat.map(([t, n]) => `${t} (${n})`).join(", ")}. With twelve games that is well short of a pattern \u2014 but it is where to look first if it holds.`)),
+        // ---- engine change audit ----
+        React.createElement("div", { className: "miss-rescore" },
+            React.createElement("div", { className: "mr-head" },
+                React.createElement("h4", null, "Re-score under the current engine"),
+                React.createElement("button", { className: "ing-ghost", onClick: runRescore, disabled: rescoring }, rescoring ? "Re-pricing…" : "Run")),
+            React.createElement("p", { className: "dbf-note" }, "Every snapshotted game re-priced from its frozen inputs under the engine as it stands now, both versions graded against the real final. The honest before/after for any formula change — approximate (snapshots don't carry sample sizes) and read-only: nothing stored changes."),
+            rescore && rescore.err && React.createElement("p", { className: "dbf-note" }, `Couldn't re-score: ${rescore.err}`),
+            rescore && !rescore.err && rescore.old.n === 0 && React.createElement("p", { className: "dbf-note" }, "No snapshotted graded games to re-score yet. From now on the morning run freezes a snapshot for every game, so this fills in on its own."),
+            rescore && !rescore.err && rescore.old.n > 0 && React.createElement(React.Fragment, null,
+                React.createElement("div", { className: "mr-grid" },
+                    React.createElement("span", null,
+                        React.createElement("em", null, "Stored engine"),
+                        React.createElement("b", null, `${rescore.old.bias > 0 ? "+" : ""}${rescore.old.bias.toFixed(2)} bias`),
+                        `${rescore.old.mae.toFixed(2)} typical miss`),
+                    React.createElement("span", null,
+                        React.createElement("em", null, "Current engine"),
+                        React.createElement("b", null, `${rescore.neu.bias > 0 ? "+" : ""}${rescore.neu.bias.toFixed(2)} bias`),
+                        `${rescore.neu.mae.toFixed(2)} typical miss`)),
+                React.createElement("p", { className: "dbf-note" }, `${rescore.old.n} game${rescore.old.n === 1 ? "" : "s"} re-priced. ${Math.abs(rescore.neu.bias) < Math.abs(rescore.old.bias) ? "The current engine is less biased on these games." : Math.abs(rescore.neu.bias) > Math.abs(rescore.old.bias) ? "The current engine is MORE biased on these games — worth understanding before trusting it further." : "Bias unchanged."} At ${rescore.old.n} games the noise band on a bias is roughly ±${(1.96 * 4 / Math.sqrt(rescore.old.n)).toFixed(2)} runs — differences inside that are not evidence.`))),
         // ---- the part that carries statistical weight ----
         React.createElement("h4", null, "Patterns across all graded games"),
         React.createElement("p", { className: "dbf-note" }, `${pat.rows.length} graded, ${pat.withSnap} with a saved snapshot. One miss is an anecdote. A lean that holds across dozens of games is the only thing worth changing a parameter for.`),
@@ -11524,7 +11652,7 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
                 return { state: "skip", note: "no board for today" };
             if (!workingTeams.length)
                 return { state: "skip", note: "database empty" };
-            const rows = projectSlate(board.games, workingTeams, todayKey, 8000);
+            const rows = projectSlate(board.games, workingTeams, todayKey, 20000);
             const scored = rows.filter((r) => r.status === "ok");
             if (!scored.length) {
                 const why = {};
@@ -11890,7 +12018,7 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
         // One implementation, shared with the morning pass. Two copies of this
         // would drift, and the drift would be invisible: both would produce
         // numbers, and only one would match what the desk graded.
-        const out = projectSlate(slate.games, liveTeams, todayKey, 8000);
+        const out = projectSlate(slate.games, liveTeams, todayKey, 20000);
         const scored = out.filter((x) => x.status === "ok");
         let top = null;
         for (const x of scored)
@@ -14493,6 +14621,14 @@ const CSS = `
 .mc-grid span { font-size: 11.5px; color: var(--ink-dim); background: var(--field); border: 1px solid var(--line); border-radius: 7px; padding: 7px 10px; line-height: 1.4; }
 .mc-grid span b { color: var(--ink); font-size: 14px; margin-right: 6px; font-variant-numeric: tabular-nums; }
 @media (min-width: 620px) { .mc-grid { grid-template-columns: 1fr 1fr; } }
+/* ---- rescore ---- */
+.miss-rescore { margin: 16px 0 4px; padding-top: 13px; border-top: 1px solid var(--line); }
+.mr-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.mr-head button { font-size: 10.5px; padding: 7px 12px; }
+.mr-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 10px 0 6px; }
+.mr-grid span { display: flex; flex-direction: column; gap: 2px; background: var(--field); border: 1px solid var(--line); border-radius: 8px; padding: 9px 11px; font-size: 11px; color: var(--ink-dim); }
+.mr-grid span em { font-style: normal; font-family: 'Archivo'; font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase; }
+.mr-grid span b { color: var(--ink); font-size: 14px; font-variant-numeric: tabular-nums; }
 .pen-form em { color: var(--cyan); }
 .pen-note { font-size: 11px; color: var(--amber); line-height: 1.5; margin-top: 7px; padding-left: 8px; border-left: 2px solid rgba(245,196,81,0.4); }
 .dbf-headacts { display: flex; align-items: center; gap: 8px; }
