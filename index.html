@@ -132,6 +132,18 @@ const DEFAULT_CFG = {
     // matching the research consensus that the 3rd-time penalty is the biggest.
     TTO_STEP: 0.010,
 };
+// The simulation's own version. Bumped ONLY when the maths changes, so a bias
+// measured across two values of this is measuring the change, not the model.
+// v2.5: matchup went from (offense+pitcher)/2 to the additive form, which had
+// been halving every talent signal; home and away were un-reversed; tied
+// nine-inning games now play extras. Any of those alone reprices every game.
+const ENGINE_VERSION = "2.5";
+const ENGINE_HISTORY = [
+    { v: "2.5", date: "2026-08-10", what: "Additive matchup (was halving every input), home/away un-reversed, extra innings, 20k sims" },
+    { v: "1.7", date: "2026-07-28", what: "Bullpen fatigue from recent workload" },
+    { v: "1.6", date: "2026-07-22", what: "Platoon splits by starter handedness" },
+    { v: "1.5", date: "2026-07-18", what: "Times-through-the-order penalty" },
+];
 // Live config = defaults + brain overrides (persisted, human-approved).
 let CFG = { ...DEFAULT_CFG };
 // The brain may tune ONLY these, inside these bounds.
@@ -379,7 +391,11 @@ function recentIsDuplicate(t) {
 const DATA_CLASSES = [
     { key: "statsAsOf", label: "Season stats", fresh: 7, stale: 21, note: "Team wOBA, rotation and bullpen rates" },
     { key: "recentAsOf", label: "14-day form", fresh: 2, stale: 7, note: "A rolling window \u2014 goes stale by definition" },
-    { key: "splitsAsOf", label: "Platoon splits", fresh: 14, stale: 30, note: "wOBA vs LHP and vs RHP" },
+    { key: "splitsAsOf", label: "Platoon splits", fresh: 14, stale: 30, note: "wOBA vs LHP and vs RHP",
+        // Two sources write two different stamps and the newer one is the truth.
+        // Reading only splitsAsOf meant a player-level import — the better
+        // source — left the clock showing the age of the last team paste.
+        alt: "playerSplitsAsOf" },
     { key: "teamStatsAsOf", label: "Defense & framing", fresh: 14, stale: 30, note: "OAA, catcher framing, pen contact quality" },
     { key: "recentArmsAsOf", label: "14-day starters", fresh: 2, stale: 7, note: "Recent ERA/xERA per starter \u2014 a 2-3 start window" },
     { key: "lineupAsOf", label: "Lineup", fresh: 0, stale: 2, note: "Changes daily \u2014 anything older is last night's card" },
@@ -408,6 +424,12 @@ function ageMeta(stamp, cls) {
 // Which classes a team actually carries data for. A team with no splits loaded
 // shouldn't be scored as having stale splits — absent and rotten are different
 // problems and get counted separately.
+// The stamp that actually applies, across every source that can write one.
+function classStamp(t, cls) {
+    const a = t[cls.key] || "";
+    const b = cls.alt ? (t[cls.alt] || "") : "";
+    return (a > b ? a : b) || "";
+}
 function teamHasClass(t, key) {
     if (key === "statsAsOf")
         return !!(t.off || (t.players || []).some((p) => p.woba) || (t.rotation || []).some((p) => p.xwoba));
@@ -3659,8 +3681,29 @@ function Backup() {
 // ===========================================================================
 // TERMINAL
 // ===========================================================================
+// A small control that remounts whatever is on screen. Sits in the nav of every
+// view so a refresh is always one tap away, never a close-and-reopen.
+// Remounting is the whole mechanism: every tab loads its data in a mount
+// effect, so a new key re-runs all of them. A short busy flag exists only so
+// the control visibly responds — the remount itself is instant.
+function useReload() {
+    const [n, setN] = useState(0);
+    const [busy, setBusy] = useState(false);
+    const reload = () => {
+        setBusy(true);
+        setN((x) => x + 1);
+        setTimeout(() => setBusy(false), 450);
+    };
+    return { reloadN: n, reload, reloading: busy };
+}
+function ReloadButton({ onReload, busy }) {
+    return React.createElement("button", { className: "nav-reload" + (busy ? " spin" : ""),
+        onClick: onReload, title: "Reload this page's data from storage", "aria-label": "Reload" },
+        "\u27f3");
+}
 function Terminal({ onHome, pendingGame, onPendingConsumed }) {
     const [tab, setTab] = useState("project");
+    const { reloadN, reload, reloading } = useReload();
     const [handoff, setHandoff] = useState("");
     const [teams, setTeams] = useState([]);
     const [loaded, setLoaded] = useState(false);
@@ -4029,14 +4072,15 @@ function Terminal({ onHome, pendingGame, onPendingConsumed }) {
                 React.createElement("button", { className: "ing-home-btn", onClick: onHome, "aria-label": "Back to home" }, "\u2190 Home"),
                 React.createElement("div", null,
                     React.createElement("h1", null, "TERMINAL"),
-                    React.createElement("p", null, "Run projection \u00B7 v1.7 \u00B7 research"))),
+                    React.createElement("p", null, `Run projection \u00B7 engine v${ENGINE_VERSION} \u00B7 research`))),
             React.createElement("nav", { className: "ing-nav" },
                 React.createElement("button", { className: tab === "project" ? "on" : "", onClick: () => setTab("project") }, "Project"),
                 React.createElement("button", { className: tab === "database" ? "on" : "", onClick: () => setTab("database") }, "Database"),
                 React.createElement("button", { className: tab === "lineups" ? "on" : "", onClick: () => setTab("lineups") }, "Lineups"),
                 React.createElement("button", { className: tab === "bullpens" ? "on" : "", onClick: () => setTab("bullpens") }, "Bullpens"),
                 React.createElement("button", { className: tab === "debrief" ? "on" : "", onClick: () => setTab("debrief") }, "Debrief"),
-                React.createElement("button", { className: tab === "desk" ? "on" : "", onClick: () => setTab("desk") }, "Desk"))),
+                React.createElement("button", { className: tab === "desk" ? "on" : "", onClick: () => setTab("desk") }, "Desk"),
+                React.createElement(ReloadButton, { onReload: reload, busy: reloading }))),
         // A write that didn't land is announced across every tab, not left for
         // whichever panel happened to make the call. The choke point raises its
         // hand so a caller that forgets to check still can't lose data quietly.
@@ -4044,6 +4088,7 @@ function Terminal({ onHome, pendingGame, onPendingConsumed }) {
             React.createElement("b", null, "Not saved. "),
             `The last write to ${String(writeFail.key).replace(/^ingenuity:/, "")} didn't land — ${writeFail.msg}. Anything changed since then exists only on screen and will be gone on reload.`,
             React.createElement("button", { onClick: () => setWriteFail(null) }, "Dismiss")),
+        React.createElement(React.Fragment, { key: `body-${reloadN}` },
         tab === "project" && (React.createElement("main", { className: "ing-main" },
             React.createElement("section", { className: "ing-inputs" },
                 React.createElement(SmartImport, { teams: teams, saveTeams: saveTeams, onGameLine: loadGameLine }),
@@ -4109,7 +4154,7 @@ function Terminal({ onHome, pendingGame, onPendingConsumed }) {
         tab === "lineups" && React.createElement(LineupFetcher, { teams: teams, saveTeams: saveTeams }),
         tab === "bullpens" && React.createElement(BullpenTab, { teams: teams }),
         tab === "debrief" && React.createElement(DebriefTab, { teams: teams }),
-        tab === "desk" && React.createElement(DeskTab, null),
+        tab === "desk" && React.createElement(DeskTab, null)),
         React.createElement("footer", { className: "ing-foot" }, "Research instrument. Projections are estimates from the inputs you provide \u2014 only as good as the data entered. Not betting advice.")));
 }
 // ---------------------------------------------------------------------------
@@ -4486,7 +4531,7 @@ function TeamFreshness({ t }) {
         return null;
     return React.createElement("div", { className: "fresh-strip" },
         React.createElement("div", { className: "fresh-head" }, "Last loaded"),
-        React.createElement("div", { className: "fresh-chips" }, held.map((c) => React.createElement(Stamp, { key: c.key, cls: c, value: t[c.key] }))),
+        React.createElement("div", { className: "fresh-chips" }, held.map((c) => React.createElement(Stamp, { key: c.key, cls: c, value: classStamp(t, c) }))),
         !held.length && React.createElement("p", { className: "fresh-none" }, "No stats loaded for this team yet."),
         recentIsDuplicate(t) && React.createElement("p", { className: "fresh-dupe" },
             React.createElement("b", null, "14-day form matches season wOBA exactly "),
@@ -4506,7 +4551,7 @@ function FreshnessAudit({ teams, onRepair }) {
         const tally = { fresh: 0, aging: 0, stale: 0, unknown: 0 };
         let oldest = null;
         for (const t of hold) {
-            const a = ageMeta(t[c.key], c);
+            const a = ageMeta(classStamp(t, c), c);
             tally[a.tone]++;
             if (a.days != null && (oldest == null || a.days > oldest))
                 oldest = a.days;
@@ -4533,6 +4578,18 @@ function FreshnessAudit({ teams, onRepair }) {
                     r.missing > 0 && React.createElement("span", { className: "never" }, r.missing + " not loaded"),
                     r.held === 0 && r.missing === 0 && React.createElement("span", { className: "never" }, "\u2014")),
                 r.oldest != null && React.createElement("div", { className: "fresh-audit-age" }, "oldest " + r.oldest + "d"))),
+            // Splits come from two sources with different quality, and the panel
+            // used to show only an age. "Did my upload work" was answerable only
+            // by inference; this answers it directly, per source.
+            (() => {
+                const roster = teams.filter((t) => t.rosterOffVsL || t.rosterOffVsR).length;
+                const pasted = teams.filter((t) => !(t.rosterOffVsL || t.rosterOffVsR) && (t.offVsL || t.offVsR)).length;
+                const none = teams.length - roster - pasted;
+                return React.createElement("p", { className: "fresh-audit-note split-src" },
+                    React.createElement("b", null, "Platoon splits in use: "),
+                    `${roster} club${roster === 1 ? "" : "s"} from player-level data (the sharper source \u2014 rebuilt from whoever is actually on the roster), ${pasted} from a team-level paste, ${none} with none. The engine reads the first of those it finds.`,
+                    roster > 0 && ` Open any club below to see its wOBA vs LHP/RHP and which tier it came from.`);
+            })(),
             dupes.length > 0 && React.createElement("div", { className: "fresh-repair" },
                 React.createElement("p", null,
                     React.createElement("b", null, dupes.length + " team" + (dupes.length === 1 ? "" : "s") + " have 14-day form identical to season wOBA. "),
@@ -4788,7 +4845,7 @@ function Database({ teams, saveTeams, loaded }) {
                                 if (!held.length)
                                     return null;
                                 const RANK = ["stale", "unknown", "aging", "fresh"];
-                                const worst = held.map((c) => ageMeta(t[c.key], c)).reduce((w, a) => (RANK.indexOf(a.tone) < RANK.indexOf(w.tone) ? a : w));
+                                const worst = held.map((c) => ageMeta(classStamp(t, c), c)).reduce((w, a) => (RANK.indexOf(a.tone) < RANK.indexOf(w.tone) ? a : w));
                                 return React.createElement("span", { className: "ing-dir-age " + worst.tone, title: worst.days == null ? "Some inputs on this team have no timestamp \u2014 loaded before freshness tracking existed" : "Oldest input on this team" }, worst.days == null ? "no date" : worst.days === 0 ? "today" : worst.days + "d");
                             })()),
                         React.createElement("div", { className: "ing-dir-btns" },
@@ -6090,6 +6147,7 @@ const BLANK_BET = {
 };
 function Ledger({ onHome }) {
     const [tab, setTab] = useState("record");
+    const { reloadN, reload, reloading } = useReload();
     const [games, setGames] = useState(SEED_GAMES);
     const [bets, setBets] = useState(SEED_BETS);
     const [form, setForm] = useState({ ...BLANK_GAME });
@@ -6271,7 +6329,9 @@ function Ledger({ onHome }) {
                 React.createElement("div", null,
                     React.createElement("h1", null, "LEDGER"),
                     React.createElement("p", null, "Research record \u00B7 game archive \u00B7 honest bookkeeping"))),
-            React.createElement("nav", { className: "ing-nav" }, ["record", "history", "archive", "addgame", "addbet"].map((t) => (React.createElement("button", { key: t, className: tab === t ? "on" : "", onClick: () => setTab(t) }, t === "record" ? "Record" : t === "history" ? "History" : t === "archive" ? "Games" : t === "addgame" ? "Add game" : "Add bet"))))),
+            React.createElement("nav", { className: "ing-nav" }, ["record", "history", "archive", "addgame", "addbet"].map((t) => (React.createElement("button", { key: t, className: tab === t ? "on" : "", onClick: () => setTab(t) }, t === "record" ? "Record" : t === "history" ? "History" : t === "archive" ? "Games" : t === "addgame" ? "Add game" : "Add bet"))),
+                React.createElement(ReloadButton, { onReload: reload, busy: reloading }))),
+        React.createElement(React.Fragment, { key: `lg-body-${reloadN}` },
         tab === "record" && (React.createElement("main", { className: "lg-main" },
             React.createElement("section", { className: "lg-stats" },
                 React.createElement("div", { className: "lg-stat big" },
@@ -6472,7 +6532,7 @@ function Ledger({ onHome }) {
             React.createElement("label", { className: "lg-f wide" },
                 React.createElement("span", null, "Notes"),
                 React.createElement("textarea", { rows: 3, value: betForm.notes, onChange: (e) => setBetForm({ ...betForm, notes: e.target.value }), placeholder: "Why this bet \u2014 what the read was, what to check when it settles" })),
-            React.createElement("button", { className: "lg-run", onClick: addBet }, "Save bet"))),
+            React.createElement("button", { className: "lg-run", onClick: addBet }, "Save bet")))),
         React.createElement("footer", { className: "ing-foot" }, "Research ledger. The honest record is the point \u2014 wins, losses, passes, and what each one taught. Not betting advice.")));
 }
 function F({ l, v, on, ph }) {
@@ -9917,6 +9977,8 @@ const SLATE_ARCHIVE_DAYS = 1000;
 // one compact permanent row (~120 bytes): date, teams, park, line, model,
 // final, and O/U result. Keyed by date+matchup so re-grading can't duplicate.
 // This is the store R&D reads from, and what powers over/under streaks.
+// The permanent log outlives the boards, so it has to carry the engine stamp or
+// the segmentation disappears the moment an archive day is pruned.
 async function recordFinals(arch) {
     const rec = await store.get("ingenuity:results:log", {});
     let added = 0;
@@ -9929,7 +9991,8 @@ async function recordFinals(arch) {
                 continue;
             const line = g.proj ? g.proj.atLine : (g.line !== "" && g.line != null ? parseFloat(g.line) : null);
             const ou = line == null ? null : g.final > line ? "O" : g.final < line ? "U" : "P";
-            rec[key] = { date: d, away: g.away, home: g.home, line, final: g.final, model: g.proj ? g.proj.model : null, ou };
+            rec[key] = { date: d, away: g.away, home: g.home, line, final: g.final, model: g.proj ? g.proj.model : null, ou,
+                eng: (g.proj && g.proj.snap && g.proj.snap.eng) || null };
             added++;
         }
     }
@@ -10210,9 +10273,11 @@ function splitSignificance(errs) {
     const ci = se != null ? 1.96 * se : null;
     return { n, mean, mae, se, ci, real: n >= 30 && ci != null && Math.abs(mean) > ci };
 }
-function detectMissPatterns(log, boards) {
+// `engine` filters to one engine version; omit it to pool everything, which is
+// only honest for describing games, never for measuring the model.
+function detectMissPatterns(log, boards, engine) {
     // Pull every graded row and attach whatever snapshot the board kept.
-    const rows = [];
+    const all = [];
     for (const r of Object.values(log || {})) {
         if (!r || r.model == null || r.final == null)
             continue;
@@ -10225,8 +10290,14 @@ function detectMissPatterns(log, boards) {
                 if (normName(g.away) === normName(r.away) && normName(g.home) === normName(r.home))
                     snap = g.proj.snap;
             }
-        rows.push({ ...r, err: r.final - r.model, snap });
+        const eng = r.eng || (snap && snap.eng) || "pre-2.5";
+        all.push({ ...r, err: r.final - r.model, snap, eng });
     }
+    // The splits below are the ones most sensitive to a maths change — the
+    // high/low-total asymmetry IS the compression v2.5 removed — so a pooled
+    // reading here would be the least trustworthy number in the app.
+    const rows = engine ? all.filter((r) => r.eng === engine) : all;
+    const otherEng = all.length - rows.length;
     const overall = splitSignificance(rows.map((r) => r.err));
     const splits = [];
     const add = (label, hit, why) => {
@@ -10243,7 +10314,8 @@ function detectMissPatterns(log, boards) {
     add("Snapshot: wind blowing out", (r) => r.snap && r.snap.windOut === true, "The weather boost is capped at +/-6%; this tests whether the cap is right.");
     add("Snapshot: tired pen (fatigue 0.5+)", (r) => r.snap && (parseFloat(r.snap.aFat) >= 0.5 || parseFloat(r.snap.hFat) >= 0.5), "Fatigue is one of the newest inputs and the least validated.");
     const withSnap = rows.filter((r) => r.snap).length;
-    return { rows, overall, splits: splits.sort((a, b) => Math.abs(b.gap || 0) - Math.abs(a.gap || 0)), withSnap };
+    return { rows, all, otherEng, engine: engine || null, overall,
+        splits: splits.sort((a, b) => Math.abs(b.gap || 0) - Math.abs(a.gap || 0)), withSnap };
 }
 // ---- Results log verifier ---------------------------------------------------
 // The permanent log never expires by design, so a row written from a mis-parsed
@@ -10657,9 +10729,20 @@ function rescoreSnapshots(log, boards, sims) {
                 homeOAA: sn.hOaa != null ? parseFloat(sn.hOaa) : null,
                 homePenFatigue: sn.hFat ?? null,
             }, sims || 8000);
-            rows.push({ date: r.date, away: r.away, home: r.home, final: r.final,
+            const lineNum = isNaN(line) ? null : line;
+            // Which side each engine leaned, and whether that changed. A bias
+            // that improves while every call flips is a different event from one
+            // that improves while the calls hold.
+            const sideOf = (m) => (lineNum == null ? null : m > lineNum ? "Over" : m < lineNum ? "Under" : "Push");
+            const oldSide = sideOf(r.model), newSide = sideOf(p.mean);
+            const truth = lineNum == null || r.final === lineNum ? null : r.final > lineNum ? "Over" : "Under";
+            rows.push({ date: r.date, away: r.away, home: r.home, final: r.final, line: lineNum,
                 oldModel: r.model, newModel: +p.mean.toFixed(2),
-                oldErr: r.final - r.model, newErr: r.final - p.mean });
+                oldErr: r.final - r.model, newErr: r.final - p.mean,
+                oldSide, newSide, flipped: oldSide != null && newSide != null && oldSide !== newSide,
+                oldRight: truth != null && oldSide === truth,
+                newRight: truth != null && newSide === truth,
+                eng: (sn.eng || "pre-2.5") });
             break;
         }
     }
@@ -10670,9 +10753,17 @@ function rescoreSnapshots(log, boards, sims) {
         const mae = errs.reduce((a, b) => a + Math.abs(b), 0) / errs.length;
         return { n: errs.length, bias, mae };
     };
-    return { rows,
+    const scored = rows.filter((r) => r.oldSide != null && r.newSide != null && r.line != null && r.final !== r.line);
+    return { rows: rows.sort((a, b) => Math.abs(b.newModel - b.oldModel) - Math.abs(a.newModel - a.oldModel)),
         old: agg(rows.map((x) => x.oldErr)),
-        neu: agg(rows.map((x) => x.newErr)) };
+        neu: agg(rows.map((x) => x.newErr)),
+        flips: rows.filter((r) => r.flipped).length,
+        // Side accuracy on games with a real line and no push. This is closer to
+        // the question that matters than bias is — a model can be unbiased and
+        // still pick the wrong side every time.
+        oldRight: scored.filter((r) => r.oldRight).length,
+        newRight: scored.filter((r) => r.newRight).length,
+        scoredN: scored.length };
 }
 const AUTOPSY_KEY = "ingenuity:misslab:autopsy";
 const missKey = (r) => `${r.date}|${r.away}|${r.home}`;
@@ -10733,6 +10824,24 @@ function MissLab({ log }) {
     const [showAll, setShowAll] = useState(false);
     const [rescore, setRescore] = useState(null);
     const [rescoring, setRescoring] = useState(false);
+    const [showRows, setShowRows] = useState(12);
+    const [adopted, setAdopted] = useState(false);
+    // Write the re-scored errors where the Brain reads them, stamped with the
+    // current engine so they clear its version gate. The ORIGINAL model numbers
+    // are never altered: the record of what was actually projected on the day
+    // stays honest, and this sits beside it as a parallel series.
+    const adoptRescore = async () => {
+        if (!rescore || !rescore.rows || !rescore.rows.length)
+            return;
+        const payload = { engine: ENGINE_VERSION, at: new Date().toISOString(),
+            rows: rescore.rows.map((r) => ({ date: r.date, away: r.away, home: r.home,
+                line: r.line, final: r.final, model: r.newModel, err: +(r.final - r.newModel).toFixed(2) })) };
+        const wrote = await store.set("ingenuity:rescored", payload);
+        setAdopted(wrote);
+        if (wrote)
+            await logActivity("calibration", `Adopted ${payload.rows.length} re-scored games as v${ENGINE_VERSION} evidence`,
+                "original projections untouched; the Brain now has a current-engine sample");
+    };
     const runRescore = async () => {
         setRescoring(true);
         await new Promise((res) => setTimeout(res, 30));
@@ -10757,7 +10866,9 @@ function MissLab({ log }) {
         })();
         return () => { live = false; };
     }, []);
-    const pat = detectMissPatterns(log, boards);
+    // Gated to the current engine: the high/low-total split IS the asymmetry
+    // v2.5 removed, so pooling across the change would measure the change.
+    const pat = detectMissPatterns(log, boards, ENGINE_VERSION);
     const D = missDay(log, boards, day);
     const top5 = D.rows.slice(0, 5);
     const causes = missCauses(pat.rows.slice().sort((a, b) => Math.abs(b.err) - Math.abs(a.err)).slice(0, 12), cache);
@@ -10800,6 +10911,7 @@ function MissLab({ log }) {
                 React.createElement("span", { className: "miss-teams" }, `${r.away} @ ${r.home}`),
                 React.createElement("span", { className: "miss-num" }, `model ${r.model.toFixed(1)} \u2192 ${r.final}`),
                 React.createElement("span", { className: "miss-err" }, `${v.err > 0 ? "+" : ""}${v.err.toFixed(1)}`),
+                r.snap && r.snap.eng && r.snap.eng !== ENGINE_VERSION ? React.createElement("span", { className: "miss-eng" }, `v${r.snap.eng}`) : null,
                 cache[key] ? React.createElement("span", { className: "miss-ready" }, "\u25CF") : null),
             open === key && missBody(r));
     };
@@ -10836,20 +10948,62 @@ function MissLab({ log }) {
             React.createElement("p", { className: "dbf-note" }, "Every snapshotted game re-priced from its frozen inputs under the engine as it stands now, both versions graded against the real final. The honest before/after for any formula change — approximate (snapshots don't carry sample sizes) and read-only: nothing stored changes."),
             rescore && rescore.err && React.createElement("p", { className: "dbf-note" }, `Couldn't re-score: ${rescore.err}`),
             rescore && !rescore.err && rescore.old.n === 0 && React.createElement("p", { className: "dbf-note" }, "No snapshotted graded games to re-score yet. From now on the morning run freezes a snapshot for every game, so this fills in on its own."),
-            rescore && !rescore.err && rescore.old.n > 0 && React.createElement(React.Fragment, null,
-                React.createElement("div", { className: "mr-grid" },
-                    React.createElement("span", null,
-                        React.createElement("em", null, "Stored engine"),
-                        React.createElement("b", null, `${rescore.old.bias > 0 ? "+" : ""}${rescore.old.bias.toFixed(2)} bias`),
-                        `${rescore.old.mae.toFixed(2)} typical miss`),
-                    React.createElement("span", null,
-                        React.createElement("em", null, "Current engine"),
-                        React.createElement("b", null, `${rescore.neu.bias > 0 ? "+" : ""}${rescore.neu.bias.toFixed(2)} bias`),
-                        `${rescore.neu.mae.toFixed(2)} typical miss`)),
-                React.createElement("p", { className: "dbf-note" }, `${rescore.old.n} game${rescore.old.n === 1 ? "" : "s"} re-priced. ${Math.abs(rescore.neu.bias) < Math.abs(rescore.old.bias) ? "The current engine is less biased on these games." : Math.abs(rescore.neu.bias) > Math.abs(rescore.old.bias) ? "The current engine is MORE biased on these games — worth understanding before trusting it further." : "Bias unchanged."} At ${rescore.old.n} games the noise band on a bias is roughly ±${(1.96 * 4 / Math.sqrt(rescore.old.n)).toFixed(2)} runs — differences inside that are not evidence.`))),
+            rescore && !rescore.err && rescore.old.n > 0 && (() => {
+                const better = Math.abs(rescore.neu.bias) < Math.abs(rescore.old.bias);
+                const band = 1.96 * 4 / Math.sqrt(rescore.old.n);
+                const maeBetter = rescore.neu.mae < rescore.old.mae;
+                return React.createElement(React.Fragment, null,
+                    React.createElement("div", { className: "mr-grid" },
+                        React.createElement("span", null,
+                            React.createElement("em", null, "Old engine"),
+                            React.createElement("b", null, `${rescore.old.bias > 0 ? "+" : ""}${rescore.old.bias.toFixed(2)}`),
+                            `bias \u00B7 ${rescore.old.mae.toFixed(2)} typical miss`,
+                            rescore.scoredN > 0 && React.createElement("i", null, `${rescore.oldRight}/${rescore.scoredN} sides right`)),
+                        React.createElement("span", { className: better ? "win" : "" },
+                            React.createElement("em", null, `Engine v${ENGINE_VERSION}`),
+                            React.createElement("b", null, `${rescore.neu.bias > 0 ? "+" : ""}${rescore.neu.bias.toFixed(2)}`),
+                            `bias \u00B7 ${rescore.neu.mae.toFixed(2)} typical miss`,
+                            rescore.scoredN > 0 && React.createElement("i", null, `${rescore.newRight}/${rescore.scoredN} sides right`))),
+                    React.createElement("p", { className: "dbf-note" },
+                        `${rescore.old.n} game${rescore.old.n === 1 ? "" : "s"} re-priced from their frozen inputs. `,
+                        better ? "Bias is smaller under the current engine. " : Math.abs(rescore.neu.bias) > Math.abs(rescore.old.bias) ? "Bias is LARGER under the current engine \u2014 worth understanding before trusting it further. " : "Bias unchanged. ",
+                        maeBetter ? "Typical miss also improved. " : "Typical miss did not improve, which matters more than bias \u2014 a model can be unbiased and still be wrong on every game. ",
+                        `At ${rescore.old.n} games the noise band is roughly \u00B1${band.toFixed(2)} runs; a difference smaller than that is not evidence.`),
+                    rescore.flips > 0 && React.createElement("p", { className: "dbf-note" },
+                        React.createElement("b", null, `${rescore.flips} call${rescore.flips === 1 ? "" : "s"} flipped side. `),
+                        "A repricing that improves the average while reversing the picks is a different event from one that leaves them standing \u2014 flipped games are outlined below."),
+                    React.createElement("div", { className: "mr-table" },
+                        React.createElement("div", { className: "mr-row mr-head-row" },
+                            React.createElement("span", { className: "g" }, "Game"),
+                            React.createElement("span", null, "Line"),
+                            React.createElement("span", null, "Old"),
+                            React.createElement("span", null, `v${ENGINE_VERSION}`),
+                            React.createElement("span", null, "Final")),
+                        rescore.rows.slice(0, showRows).map((r, i) => React.createElement("div", { className: "mr-row" + (r.flipped ? " flip" : ""), key: i },
+                            React.createElement("span", { className: "g" },
+                                `${r.away} @ ${r.home}`,
+                                React.createElement("em", null, r.date)),
+                            React.createElement("span", null, r.line != null ? r.line : "\u2014"),
+                            React.createElement("span", { className: r.oldRight ? "right" : r.oldSide ? "wrong" : "" },
+                                r.oldModel.toFixed(1),
+                                r.oldSide && React.createElement("em", null, r.oldSide)),
+                            React.createElement("span", { className: r.newRight ? "right" : r.newSide ? "wrong" : "" },
+                                r.newModel.toFixed(1),
+                                r.newSide && React.createElement("em", null, r.newSide)),
+                            React.createElement("span", { className: "fin" }, r.final)))),
+                    rescore.rows.length > showRows && React.createElement("button", { className: "dbf-more", onClick: () => setShowRows(showRows + 25) },
+                        `Show ${Math.min(25, rescore.rows.length - showRows)} more of ${rescore.rows.length}`),
+                    React.createElement("div", { className: "mr-adopt" },
+                        React.createElement("div", null,
+                            React.createElement("strong", null, `Count these as v${ENGINE_VERSION} evidence`),
+                            React.createElement("p", null, "These games were priced by an older engine, so the Brain excludes them from calibration. A re-scored error comes from the CURRENT maths on the ORIGINAL inputs, which is exactly what calibration needs \u2014 adopting them rebuilds the sample today instead of over the next fortnight. Approximate: snapshots carry no sample sizes, so regression runs at defaults. The stored projections are not altered.")),
+                        React.createElement("button", { className: "ing-run small", onClick: adoptRescore, disabled: adopted }, adopted ? "Adopted" : "Adopt")));
+            })()),
         // ---- the part that carries statistical weight ----
         React.createElement("h4", null, "Patterns across all graded games"),
-        React.createElement("p", { className: "dbf-note" }, `${pat.rows.length} graded, ${pat.withSnap} with a saved snapshot. One miss is an anecdote. A lean that holds across dozens of games is the only thing worth changing a parameter for.`),
+        React.createElement("p", { className: "dbf-note" }, `${pat.rows.length} graded on engine v${ENGINE_VERSION}, ${pat.withSnap} with a saved snapshot. One miss is an anecdote. A lean that holds across dozens of games is the only thing worth changing a parameter for.`),
+        pat.otherEng > 0 && React.createElement("p", { className: "dbf-warn" },
+            `${pat.otherEng} further graded game${pat.otherEng === 1 ? " is" : "s are"} on an earlier engine and excluded here. These splits test how the model errs, and the v2.5 matchup fix changed exactly that \u2014 mixing the two would describe the fix rather than the model. Re-score above to convert them into current-engine evidence.`),
         pat.overall.n > 0 && React.createElement("p", { className: "miss-fact" }, `Overall: ${pat.overall.mean > 0 ? "+" : ""}${pat.overall.mean.toFixed(2)} runs over ${pat.overall.n} games, noise band \u00B1${pat.overall.ci.toFixed(2)}. ${pat.overall.real ? "This clears its own noise band." : "Inside the noise band \u2014 not yet a finding."}`),
         pat.splits.length === 0
             ? React.createElement("p", { className: "dbf-note" }, "No split has 8+ games yet. Splits appear as the sample grows; treating fewer than that as a pattern is how a model gets tuned onto noise.")
@@ -11367,6 +11521,9 @@ function projectSlate(games, teams, dayKey, sims) {
             // attributed: the spread and the per-side expectation are what
             // separate "we were wrong" from "this landed in the tail we predicted".
             snap: {
+                // Which engine priced this. Without it the Brain pools games from
+                // before and after a maths change and fits a constant to the seam.
+                eng: ENGINE_VERSION,
                 aMean: +r.awayMean.toFixed(2), hMean: +r.homeMean.toFixed(2),
                 p10: +r.p10.toFixed(1), p90: +r.p90.toFixed(1),
                 park: homePark || null, parkF: PARKS[homePark] != null ? +PARKS[homePark].toFixed(3) : null,
@@ -12504,7 +12661,7 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
                 continue;
             const k = r.date + "|" + normName(r.away) + "@" + normName(r.home);
             seen.add(k);
-            rows2.push({ date: r.date, away: r.away, home: r.home, model: r.model, line: r.line, final: r.final, err: r.final - r.model });
+            rows2.push({ date: r.date, away: r.away, home: r.home, model: r.model, line: r.line, final: r.final, err: r.final - r.model, eng: r.eng || null });
         }
         // then any still-in-window boards not yet distilled
         for (const d of Object.keys(arch)) {
@@ -12513,7 +12670,7 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
                     const k = d + "|" + normName(g.away) + "@" + normName(g.home);
                     if (seen.has(k))
                         continue;
-                    rows2.push({ date: d, away: g.away, home: g.home, model: g.proj.model, line: g.proj.atLine, final: g.final, err: g.final - g.proj.model });
+                    rows2.push({ date: d, away: g.away, home: g.home, model: g.proj.model, line: g.proj.atLine, final: g.final, err: g.final - g.proj.model, eng: (g.proj.snap && g.proj.snap.eng) || null });
                 }
             }
         }
@@ -12523,7 +12680,23 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
         const bias = rows2.reduce((s, r) => s + r.err, 0) / n;
         const mae = rows2.reduce((s, r) => s + Math.abs(r.err), 0) / n;
         const big = rows2.filter((r) => Math.abs(r.err) > 3.5).length;
-        return { n, bias, mae, big, rows: rows2.sort((a, b) => (a.date < b.date ? 1 : -1)) };
+        // Segment by the engine that priced each game. A bias measured across a
+        // maths change is measuring the change: pooling games from before and
+        // after the matchup formula was fixed and fitting one CALIBRATION_OFFSET
+        // to the result would be fitting a constant to a seam.
+        const byEng = {};
+        for (const r of rows2) {
+            const k = r.eng || "pre-2.5";
+            (byEng[k] = byEng[k] || []).push(r.err);
+        }
+        const engines = Object.entries(byEng).map(([v, errs]) => ({
+            v, n: errs.length,
+            bias: errs.reduce((a, b) => a + b, 0) / errs.length,
+            mae: errs.reduce((a, b) => a + Math.abs(b), 0) / errs.length,
+        })).sort((a, b) => (a.v < b.v ? 1 : -1));
+        const cur = engines.find((e) => e.v === ENGINE_VERSION) || null;
+        return { n, bias, mae, big, engines, current: cur,
+            rows: rows2.sort((a, b) => (a.date < b.date ? 1 : -1)) };
     };
     // Catch-up grading: a static page can't work while it's closed, so it settles
     // up the moment it opens. Fetches real finals for archived boards and scores
@@ -12571,7 +12744,7 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
         const cv = computeCoverage(arch);
         setCov(cv);
         if (a.n)
-            await store.set("ingenuity:brain:slateAccuracy", { n: a.n, bias: +a.bias.toFixed(3), mae: +a.mae.toFixed(3), big: a.big, coverage: cv, errs: a.rows.map((r) => [r.date, +r.err.toFixed(2)]), ts: new Date().toISOString().slice(0, 16).replace("T", " ") });
+            await store.set("ingenuity:brain:slateAccuracy", { n: a.n, bias: +a.bias.toFixed(3), mae: +a.mae.toFixed(3), big: a.big, coverage: cv, engines: a.engines, current: a.current, engine: ENGINE_VERSION, errs: a.rows.map((r) => [r.date, +r.err.toFixed(2), r.eng || "pre-2.5"]), ts: new Date().toISOString().slice(0, 16).replace("T", " ") });
         // refresh the viewed board so any new finals show immediately
         if (got && arch[viewDate])
             setSlate(arch[viewDate]);
@@ -13269,7 +13442,9 @@ function SelfCheck() {
                                     : "Your agreements are outperforming your overrides \u2014 evidence for trusting the model's side rather than talking yourself off it."))))));
 }
 function Brain({ onHome }) {
+    const { reloadN, reload, reloading } = useReload();
     const [params, setParams] = useState({});
+    const [rescored, setRescored] = useState(null);
     const [draft, setDraft] = useState({});
     const [log, setLog] = useState([]);
     const [games, setGames] = useState([]);
@@ -13315,6 +13490,7 @@ function Brain({ onHome }) {
             setSlateScan(await store.get("ingenuity:brain:slateScan", null));
             setSlateAcc(await store.get("ingenuity:brain:slateAccuracy", null));
             setInterpLog(await store.get("ingenuity:brain:interpLog", []));
+            setRescored(await store.get("ingenuity:rescored", null));
             // persist the imported history + profile for recollection by any module
             await store.set("ingenuity:brain:bettorProfile", BETTOR_PROFILE);
             await store.set("ingenuity:brain:history", BET_HISTORY);
@@ -13359,10 +13535,30 @@ function Brain({ onHome }) {
     const boardBias = slateAcc ? slateAcc.bias : null;
     const boardMae = slateAcc ? slateAcc.mae : null;
     const boardSig = biasSignal(boardN, boardBias, boardMae);
-    // A bias pooled across parameter changes is measuring several different
-    // models at once. Only games projected since the last change are homogeneous.
+    // Two different boundaries, and the engine one is the harder of the two.
+    // A parameter change tunes the same maths; an ENGINE change replaces it. The
+    // v2.5 matchup fix repriced every game, so a bias measured across that seam
+    // is measuring the fix, and a CALIBRATION_OFFSET fitted to it would be
+    // correcting for an improvement. Games from other engines are excluded
+    // before the parameter filter runs, not averaged in.
+    const engines = (slateAcc && slateAcc.engines) || [];
+    const otherEngN = engines.filter((e) => e.v !== ENGINE_VERSION).reduce((n, e) => n + e.n, 0);
     const paramDate = log.length && log[0].ts ? String(log[0].ts).slice(0, 10) : null;
-    const allErrs = (slateAcc && slateAcc.errs) || [];
+    const rawErrs = (slateAcc && slateAcc.errs) || [];
+    // Payloads written before engine stamping have no third element; those games
+    // predate v2.5 by definition, so they are treated as such rather than assumed
+    // current.
+    const nativeErrs = rawErrs.filter((e) => (e[2] || "pre-2.5") === ENGINE_VERSION);
+    // Games re-priced under the current engine from their original frozen
+    // inputs. Same maths, same inputs, real finals — valid current-engine
+    // evidence, and the only way the pre-v2.5 sample can contribute anything
+    // honest. De-duplicated against anything natively priced on this engine.
+    const adoptedRows = (rescored && rescored.engine === ENGINE_VERSION && rescored.rows) ? rescored.rows : [];
+    const nativeKeys = new Set(nativeErrs.map((e) => e[0]));
+    const adoptedErrs = adoptedRows
+        .filter((r) => !nativeKeys.has(r.date) || true)
+        .map((r) => [r.date, r.err, ENGINE_VERSION]);
+    const allErrs = [...nativeErrs, ...adoptedErrs];
     const cleanErrs = paramDate ? allErrs.filter((e) => e[0] >= paramDate) : allErrs;
     const cleanN = cleanErrs.length;
     const cleanBias = cleanN ? cleanErrs.reduce((t, e) => t + e[1], 0) / cleanN : null;
@@ -13375,10 +13571,17 @@ function Brain({ onHome }) {
     // are no per-game errors on file (a payload from before this build) do we judge
     // the pooled number, and the read says so.
     const haveErrs = allErrs.length > 0;
-    const useClean = haveErrs && paramDate != null && cleanN < boardN;
-    const judgeN = useClean ? cleanN : boardN;
-    const judgeBias = useClean ? cleanBias : boardBias;
-    const judgeSig = useClean ? cleanSig : boardSig;
+    // On the current engine there is a homogeneous sample: use it, however small.
+    // With none, there is nothing honest to calibrate against yet, and the read
+    // below says exactly that rather than borrowing the pooled number.
+    const engOnly = { n: allErrs.length,
+        bias: allErrs.length ? allErrs.reduce((t, e) => t + e[1], 0) / allErrs.length : null,
+        mae: allErrs.length ? allErrs.reduce((t, e) => t + Math.abs(e[1]), 0) / allErrs.length : null };
+    const engSig = biasSignal(engOnly.n, engOnly.bias, engOnly.mae);
+    const useClean = haveErrs && paramDate != null && cleanN < engOnly.n;
+    const judgeN = haveErrs ? (useClean ? cleanN : engOnly.n) : boardN;
+    const judgeBias = haveErrs ? (useClean ? cleanBias : engOnly.bias) : boardBias;
+    const judgeSig = haveErrs ? (useClean ? cleanSig : engSig) : boardSig;
     const boardCov = slateAcc && slateAcc.coverage ? slateAcc.coverage : null;
     // ---- AI recalibration (Claude API — available inside this app) ----
     const askAI = async () => {
@@ -13430,6 +13633,10 @@ Respond ONLY with JSON, no markdown fences, exactly this shape:
         }
         setAiBusy(false);
     };
+    // Engine changes are code-level and never passed through BRAIN_TUNABLES, so
+    // the Brain's log had no record of them at all — which is how a repriced
+    // model could look identical to an untouched one.
+    const engineRows = ENGINE_HISTORY.map((e) => ({ ts: e.date, source: "engine", change: `Engine v${e.v}`, reason: e.what }));
     const applySuggestion = (sg) => {
         const spec = BRAIN_TUNABLES[sg.param];
         const v = Math.min(spec.max, Math.max(spec.min, parseFloat(sg.value)));
@@ -13447,10 +13654,10 @@ Respond ONLY with JSON, no markdown fences, exactly this shape:
             ...(boardN === 0
                 ? { tone: "idle", status: "no feed", read: `The board grader hasn't reported yet. Open Today's Slate and tap "Grade past boards" — it scores every archived game that carried a frozen pregame projection. Until that feed exists this agent is blind, and the ${graded.length}-game hand-logged ledger is far too small to calibrate on. Holding the engine at ${tunedCount ? tunedCount + " tuned param" + (tunedCount === 1 ? "" : "s") : "defaults"}.` }
                 : (judgeN < 30 || judgeBias == null)
-                    ? { tone: "idle", status: "waiting", read: `${judgeN} graded game${judgeN === 1 ? "" : "s"}${useClean ? ` since your last parameter change on ${paramDate} (${boardN} total on file, but a bias pooled across changes measures several different models at once)` : ""} — under the 30 needed before a bias signal means anything. Holding at ${tunedCount ? tunedCount + " tuned param" + (tunedCount === 1 ? "" : "s") : "defaults"}.` }
+                    ? { tone: "idle", status: "waiting", read: `${judgeN} graded game${judgeN === 1 ? "" : "s"} on engine v${ENGINE_VERSION}${adoptedErrs.length ? `, including ${adoptedErrs.length} re-scored from frozen inputs` : ""}${otherEngN ? ` (${otherEngN} more on earlier engines, excluded — the v2.5 matchup fix repriced every game, so pooling across it would measure the fix rather than the model)` : ""}${useClean ? `, since your last parameter change on ${paramDate}` : ""} — under the 30 needed before a bias signal means anything. Holding at ${tunedCount ? tunedCount + " tuned param" + (tunedCount === 1 ? "" : "s") : "defaults"}.` }
                     : judgeSig.real
-                        ? { tone: "alert", status: "signal", read: `Bias is ${Math.abs(judgeBias).toFixed(2)} runs ${judgeBias > 0 ? "LOW" : "HIGH"} over ${judgeN} games${useClean ? ` since the ${paramDate} parameter change` : ""}, clearing the ±${judgeSig.ci.toFixed(2)} noise band. That is a real signal. Recommends nudging CALIBRATION_OFFSET ${judgeBias > 0 ? "up" : "down"}${boardCov && boardCov.reasons && boardCov.reasons.no_sp_db ? `, but check coverage first — ${boardCov.reasons.no_sp_db} game${boardCov.reasons.no_sp_db === 1 ? "" : "s"} never graded for a missing starter, so this bias may be a data gap wearing a parameter's clothes` : ""}. Run AI recalibration to draft the exact value.` }
-                        : { tone: "ok", status: "calibrated", read: `Bias ${judgeBias > 0 ? "+" : ""}${judgeBias.toFixed(2)} runs over ${judgeN} games${useClean ? ` since the ${paramDate} change` : ""} — inside the ±${judgeSig.ci.toFixed(2)} noise band, so it reads directional but is not distinguishable from chance. Confirming a bias this size needs about ${judgeSig.needed} games. No change warranted. MAE ${boardMae ? boardMae.toFixed(2) : "—"} against a 4.1 floor; anything below that floor is luck or a leak, not skill.` }),
+                        ? { tone: "alert", status: "signal", read: `Bias is ${Math.abs(judgeBias).toFixed(2)} runs ${judgeBias > 0 ? "LOW" : "HIGH"} over ${judgeN} games on engine v${ENGINE_VERSION}${useClean ? ` since the ${paramDate} parameter change` : ""}, clearing the ±${judgeSig.ci.toFixed(2)} noise band. That is a real signal. Recommends nudging CALIBRATION_OFFSET ${judgeBias > 0 ? "up" : "down"}${boardCov && boardCov.reasons && boardCov.reasons.no_sp_db ? `, but check coverage first — ${boardCov.reasons.no_sp_db} game${boardCov.reasons.no_sp_db === 1 ? "" : "s"} never graded for a missing starter, so this bias may be a data gap wearing a parameter's clothes` : ""}. Run AI recalibration to draft the exact value.` }
+                        : { tone: "ok", status: "calibrated", read: `Bias ${judgeBias > 0 ? "+" : ""}${judgeBias.toFixed(2)} runs over ${judgeN} games on engine v${ENGINE_VERSION}${useClean ? ` since the ${paramDate} change` : ""} — inside the ±${judgeSig.ci.toFixed(2)} noise band, so it reads directional but is not distinguishable from chance. Confirming a bias this size needs about ${judgeSig.needed} games. No change warranted. MAE ${boardMae ? boardMae.toFixed(2) : "—"} against a 4.1 floor; anything below that floor is luck or a leak, not skill.` }),
         },
         {
             id: "scout", glyph: "\u25C8", name: "Data Scout", role: "Watches roster & stat freshness",
@@ -13506,8 +13713,9 @@ Respond ONLY with JSON, no markdown fences, exactly this shape:
                 React.createElement("button", { className: "ing-home-btn", onClick: onHome, "aria-label": "Back to home" }, "\u2190 Home"),
                 React.createElement("div", null,
                     React.createElement("h1", null, "BRAIN"),
-                    React.createElement("p", null, "Model oversight \u00B7 human-approved changes \u00B7 v1.3")))),
-        React.createElement("main", { className: "lg-main" },
+                    React.createElement("p", null, `Model oversight \u00B7 human-approved changes \u00B7 engine v${ENGINE_VERSION}`))),
+            React.createElement(ReloadButton, { onReload: reload, busy: reloading })),
+        React.createElement("main", { className: "lg-main", key: `br-body-${reloadN}` },
             React.createElement("section", { className: "lg-stats" },
                 React.createElement("div", { className: "lg-stat" },
                     React.createElement("span", { className: "lg-stat-val" }, boardN || "—"),
@@ -13719,16 +13927,26 @@ Respond ONLY with JSON, no markdown fences, exactly this shape:
                     React.createElement("button", { className: "ing-ghost", onClick: resetAll }, "Reset to defaults"),
                     saved && React.createElement("span", { className: "ing-importmsg" }, saved))),
             React.createElement(SelfCheck, null),
-            React.createElement(SelfCheck, null),
             React.createElement(ActivityFeed, null),
-            log.length > 0 && (React.createElement("section", { className: "br-log" },
-                React.createElement("h2", { className: "lg-formtitle" }, "Change log"),
-                log.map((e, i) => (React.createElement("div", { className: "br-log-row", key: i },
-                    React.createElement("span", { className: "br-log-ts" }, e.ts),
-                    React.createElement("span", { className: "lg-tag " + (e.source === "ai" ? "ok" : "quiet") }, e.source === "ai" ? "AI + approved" : "manual"),
-                    React.createElement("span", { className: "br-log-change" },
-                        e.change,
-                        e.reason ? ` — ${e.reason}` : ""))))))),
+            // Parameter tweaks AND engine changes, in one list. The Brain only ever
+            // logged what it tuned itself, so an engine change that repriced every
+            // game left no trace here — which is exactly the gap that made a
+            // repriced model look untouched.
+            (() => {
+                const merged = [...log, ...engineRows].sort((a, b) => (String(a.ts) < String(b.ts) ? 1 : -1));
+                if (!merged.length)
+                    return null;
+                return React.createElement("section", { className: "br-log" },
+                    React.createElement("h2", { className: "lg-formtitle" }, "Change log"),
+                    React.createElement("p", { className: "dbf-note" }, `Engine v${ENGINE_VERSION} is live. An engine change replaces the simulation maths, so games priced before one are excluded from calibration rather than averaged in.`),
+                    merged.map((e, i) => (React.createElement("div", { className: "br-log-row" + (e.source === "engine" ? " engine" : ""), key: i },
+                        React.createElement("span", { className: "br-log-ts" }, e.ts),
+                        React.createElement("span", { className: "lg-tag " + (e.source === "ai" ? "ok" : e.source === "engine" ? "warn" : "quiet") },
+                            e.source === "ai" ? "AI + approved" : e.source === "engine" ? "engine" : "manual"),
+                        React.createElement("span", { className: "br-log-change" },
+                            e.change,
+                            e.reason ? ` \u2014 ${e.reason}` : "")))));
+            })()),
         React.createElement("footer", { className: "ing-foot" }, "The brain adjusts parameters, never records. The ledger stays the untouched source of truth it grades itself against.")));
 }
 // ===========================================================================
@@ -15082,6 +15300,35 @@ const CSS = `
 .sh-note.ok { color: var(--phos); }
 .sh-note.dim { opacity: 0.75; }
 .ing-ghost.tiny { font-size: 10px; padding: 6px 10px; margin-top: 9px; }
+/* ---- reload ---- */
+.nav-reload { margin-left: auto; width: 34px; height: 34px; border-radius: 9px; background: transparent; border: 1px solid var(--line); color: var(--cyan); font-size: 15px; line-height: 1; cursor: pointer; flex: 0 0 auto; }
+.nav-reload:hover { border-color: var(--cyan); }
+.nav-reload.spin { animation: reload-spin 0.45s linear; }
+@keyframes reload-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .nav-reload.spin { animation: none; opacity: 0.5; } }
+.ing-head .nav-reload { margin-left: auto; align-self: center; }
+/* ---- rescore side-by-side ---- */
+.mr-grid span.win { border-color: rgba(52,230,168,0.45); }
+.mr-grid span i { font-style: normal; font-size: 10px; color: var(--ink-dim); margin-top: 2px; }
+.mr-table { margin-top: 12px; border-top: 1px solid var(--line); }
+.mr-row { display: grid; grid-template-columns: 1fr 42px 62px 62px 44px; gap: 6px; align-items: center; padding: 7px 0; border-bottom: 1px solid var(--line); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.mr-row.mr-head-row { font-family: 'Archivo'; font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-dim); border-bottom: 1px solid var(--line); }
+.mr-row.flip { background: rgba(245,196,81,0.06); border-left: 2px solid var(--amber); padding-left: 7px; }
+.mr-row .g { color: var(--ink); display: flex; flex-direction: column; gap: 1px; overflow: hidden; }
+.mr-row .g em { font-style: normal; font-size: 9.5px; color: var(--ink-dim); }
+.mr-row span { color: var(--ink-dim); display: flex; flex-direction: column; }
+.mr-row span em { font-style: normal; font-size: 9px; letter-spacing: 0.04em; }
+.mr-row .right { color: var(--phos); }
+.mr-row .wrong { color: var(--rust); }
+.mr-row .fin { color: var(--ink); font-weight: 600; }
+.mr-adopt { display: flex; align-items: center; gap: 12px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
+.mr-adopt strong { font-size: 12.5px; color: var(--ink); }
+.mr-adopt p { font-size: 11px; color: var(--ink-dim); line-height: 1.45; margin-top: 3px; }
+.mr-adopt button { white-space: nowrap; }
+.miss-eng { font-size: 8.5px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--amber); border: 1px solid rgba(245,196,81,0.4); border-radius: 4px; padding: 1px 4px; margin-left: 6px; }
+.br-log-row.engine { border-left: 2px solid var(--amber); padding-left: 9px; }
+.fresh-audit-note.split-src { border-left: 2px solid var(--phos); padding-left: 9px; }
+.fresh-audit-note.split-src b { color: var(--phos); }
 .rla-seen { font-size: 11px; color: var(--ink-dim); line-height: 1.5; margin-top: 8px; font-style: italic; }
 .rla-seen button { background: transparent; border: none; color: var(--cyan); font-size: 11px; cursor: pointer; text-decoration: underline; padding: 0; font-style: normal; }
 .sh-fail { font-size: 11.5px; color: var(--rust); line-height: 1.5; margin-bottom: 9px; padding-left: 9px; border-left: 2px solid var(--rust); }
