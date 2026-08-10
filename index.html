@@ -1182,7 +1182,9 @@ async function deskCommit(day, taken) {
     // record shows restraint rather than a gap that looks like inactivity.
     if (!added && !taken.length)
         log[`${day}|pass`] = { day, pass: true, placedAt: new Date().toISOString() };
-    await store.set(DESK_KEY, log);
+    const wrote = await store.set(DESK_KEY, log);
+    if (!wrote)
+        return { log, added: 0, already: false, saveFailed: true };
     return { log, added, already: false };
 }
 // Grade against real finals. Push returns the stake.
@@ -1196,7 +1198,9 @@ async function deskGrade() {
     for (const d of days) {
         let finals = null;
         try {
-            const r = await mlbFetch(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${d}`);
+            // force: a cached "not final yet" is worthless when the whole
+            // question is whether it has become final.
+            const r = await mlbFetch(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${d}`, true);
             if (!r.ok)
                 continue;
             const j = await r.json();
@@ -1299,21 +1303,132 @@ function parlayDecimal(legs) {
 // (usually a full quota) used to look identical to success, which meant data
 // could vanish with no signal — the exact failure mode this app is built to
 // refuse. lastError carries the reason so callers can say something true.
+// ---------------------------------------------------------------------------
+// IndexedDB engine. Promise-wrapped, opened once, with every failure path
+// falling back to localStorage rather than throwing — a storage layer that can
+// fail closed is worse than a small one.
+// ---------------------------------------------------------------------------
+const IDB_NAME = "ingenuity";
+const IDB_STORE = "kv";
+let _idbPromise = null;
+let _idbOk = null; // null = untried, true/false once known
+function idbOpen() {
+    if (_idbPromise)
+        return _idbPromise;
+    _idbPromise = new Promise((resolve) => {
+        let idb;
+        try {
+            idb = typeof indexedDB !== "undefined" ? indexedDB : null;
+        }
+        catch {
+            idb = null;
+        }
+        if (!idb) {
+            _idbOk = false;
+            return resolve(null);
+        }
+        let req;
+        try {
+            req = idb.open(IDB_NAME, 1);
+        }
+        catch {
+            _idbOk = false;
+            return resolve(null);
+        }
+        // Safari can leave open() hanging (private mode, storage pressure).
+        // A hang would freeze every read in the app, so it times out into the
+        // localStorage fallback instead.
+        const timer = setTimeout(() => { _idbOk = false; resolve(null); }, 3000);
+        req.onupgradeneeded = () => {
+            try {
+                if (!req.result.objectStoreNames.contains(IDB_STORE))
+                    req.result.createObjectStore(IDB_STORE);
+            }
+            catch { }
+        };
+        req.onsuccess = () => { clearTimeout(timer); _idbOk = true; resolve(req.result); };
+        req.onerror = () => { clearTimeout(timer); _idbOk = false; resolve(null); };
+        req.onblocked = () => { clearTimeout(timer); _idbOk = false; resolve(null); };
+    });
+    return _idbPromise;
+}
+function idbRun(mode, fn) {
+    return idbOpen().then((db) => {
+        if (!db)
+            return { ok: false };
+        return new Promise((resolve) => {
+            let tx;
+            try {
+                tx = db.transaction(IDB_STORE, mode);
+            }
+            catch {
+                return resolve({ ok: false });
+            }
+            const st = tx.objectStore(IDB_STORE);
+            let out;
+            try {
+                out = fn(st);
+            }
+            catch {
+                return resolve({ ok: false });
+            }
+            tx.oncomplete = () => resolve({ ok: true, value: out && out.result !== undefined ? out.result : undefined });
+            tx.onerror = () => resolve({ ok: false, err: tx.error && tx.error.name });
+            tx.onabort = () => resolve({ ok: false, err: tx.error && tx.error.name });
+        });
+    }).catch(() => ({ ok: false }));
+}
 const store = {
     lastError: null,
     failedAt: null, // when a write last failed, and on which key
     lastOk: null, // when a write last succeeded
     onFailure: null, // set by the app so a silent loss becomes a visible banner
+    engine: "unknown", // "idb" | "local" — reported in Storage health
     async get(k, def) {
+        const r = await idbRun("readonly", (st) => st.get(k));
+        if (r.ok) {
+            store.engine = "idb";
+            if (r.value !== undefined && r.value !== null)
+                return r.value; // structured clone: no JSON round-trip needed
+            // Not in IndexedDB yet — fall through and read the legacy copy, so
+            // an upgrade never looks like data loss.
+        }
+        else {
+            store.engine = "local";
+        }
         try {
-            const r = localStorage.getItem(k);
-            return r != null ? JSON.parse(r) : def;
+            const raw = localStorage.getItem(k);
+            return raw != null ? JSON.parse(raw) : def;
         }
         catch {
             return def;
         }
     },
     async set(k, v) {
+        // IndexedDB first. It stores structured clones, so the value is written
+        // as an object rather than a string, and the read-back compares the
+        // serialised form of what came back — same guarantee, no 5MB ceiling.
+        const w = await idbRun("readwrite", (st) => st.put(v, k));
+        if (w.ok) {
+            store.engine = "idb";
+            const back = await idbRun("readonly", (st) => st.get(k));
+            if (!back.ok || back.value === undefined) {
+                store.note(k, "written to IndexedDB but read back empty");
+                return false;
+            }
+            store.lastError = null;
+            store.failedAt = null;
+            store.lastOk = Date.now();
+            return true;
+        }
+        if (_idbOk === true) {
+            // The database opened and then refused the write — a real failure,
+            // not an unsupported browser. Say so rather than silently falling
+            // back to a store that will hit its own ceiling shortly after.
+            store.note(k, w.err === "QuotaExceededError" ? "device storage is full" : `IndexedDB refused the write${w.err ? ` (${w.err})` : ""}`);
+            return false;
+        }
+        store.engine = "local";
         let payload;
         try {
             payload = JSON.stringify(v);
@@ -1361,6 +1476,57 @@ const store = {
                 store.onFailure(k, msg);
             }
             catch { }
+    },
+    // Copy anything still only in localStorage across, once. Never overwrites a
+    // value already in IndexedDB, and never deletes the original — if this
+    // build gets rolled back, the old data is still exactly where it was.
+    async migrate() {
+        if (!(await idbOpen()))
+            return { moved: 0, engine: "local" };
+        let moved = 0, failed = 0;
+        const keys = [];
+        try {
+            for (let i = 0; i < localStorage.length; i++) {
+                const k = localStorage.key(i);
+                if (k && k.startsWith("ingenuity:"))
+                    keys.push(k);
+            }
+        }
+        catch {
+            return { moved: 0, engine: "idb" };
+        }
+        for (const k of keys) {
+            const there = await idbRun("readonly", (st) => st.get(k));
+            if (there.ok && there.value !== undefined)
+                continue;
+            let parsed;
+            try {
+                const raw = localStorage.getItem(k);
+                if (raw == null)
+                    continue;
+                parsed = JSON.parse(raw);
+            }
+            catch {
+                continue;
+            }
+            const w = await idbRun("readwrite", (st) => st.put(parsed, k));
+            if (w.ok)
+                moved++;
+            else
+                failed++;
+        }
+        return { moved, failed, engine: "idb" };
+    },
+    // Real numbers from the browser, not a guess at a ceiling.
+    async quota() {
+        try {
+            if (navigator.storage && navigator.storage.estimate) {
+                const e = await navigator.storage.estimate();
+                return { usage: e.usage || 0, quota: e.quota || 0, real: true };
+            }
+        }
+        catch { }
+        return { usage: 0, quota: 5 * 1024 * 1024, real: false };
     },
     // Bytes per key, so "is storage full" is a measurement rather than a guess.
     audit() {
@@ -3567,6 +3733,22 @@ function Terminal({ onHome, pendingGame, onPendingConsumed }) {
         store.onFailure = (key, msg) => setWriteFail({ key, msg, at: Date.now() });
         return () => { store.onFailure = null; };
     }, []);
+    // Move anything still only in localStorage into IndexedDB, once. Runs
+    // before the tabs read, and leaves the originals in place: a rollback to a
+    // previous build finds its data exactly where it left it.
+    useEffect(() => {
+        (async () => {
+            const done = await store.get("ingenuity:idbMigrated", null);
+            if (done)
+                return;
+            const r = await store.migrate();
+            if (r.engine === "idb") {
+                await store.set("ingenuity:idbMigrated", { at: new Date().toISOString(), moved: r.moved });
+                if (r.moved)
+                    logActivity("storage", `Moved ${r.moved} record${r.moved === 1 ? "" : "s"} to IndexedDB`, "retention is no longer capped at 5MB");
+            }
+        })();
+    }, []);
     const saveTeams = useCallback(async (next) => {
         setTeams(next);
         return await store.set("ingenuity:teams", next);
@@ -4010,6 +4192,79 @@ function repairMisplaced(teams, found) {
 // team-level table was read as player stats; harmless-looking, but each one is
 // a full team's aggregate wOBA weighted by a full team's PA, which swamps the
 // roster-derived offense figure it feeds.
+// Is this string, in its ENTIRETY, the name of a club? Unlike resolveTeamName
+// this refuses partial and substring matches — the question here is "did a
+// team-level row land in a roster", and the answer is only yes when the whole
+// cell is a club name. Accents are folded rather than blanked, so "Díaz" stays
+// one word instead of splitting into "d az" and colliding with an alias.
+function isWholeTeamName(raw) {
+    if (!raw)
+        return null;
+    const folded = String(raw)
+        .normalize("NFD").replace(/[\u0300-\u036f]/g, "") // é -> e, í -> i
+        .toLowerCase()
+        .replace(/[^a-z0-9 .'-]/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+    if (!folded)
+        return null;
+    if (TEAM_LOOKUP[folded])
+        return TEAM_LOOKUP[folded];
+    // "arizona diamondbacks" — city plus nickname. Accepted only when BOTH
+    // halves are aliases of the SAME club, so the whole cell is still nothing
+    // but a team name. "elias diaz" fails: neither half is a club.
+    const w = folded.split(" ");
+    for (let i = 1; i < w.length; i++) {
+        const head = w.slice(0, i).join(" "), tail = w.slice(i).join(" ");
+        const a = TEAM_LOOKUP[head], b = TEAM_LOOKUP[tail];
+        if (a && b && a === b)
+            return a;
+    }
+    return null;
+}
+// ===========================================================================
+// REVIEWED ITEMS (v2.6)
+// Some findings are real, correct, and permanently unfixable: two players
+// genuinely share a name, a hitter genuinely isn't on a 40-man. The panels had
+// no way to tell "not yet done" from "looked at, nothing to do", so those rows
+// came back every morning looking like outstanding work and the app never
+// reached a clean state.
+//
+// Marking something reviewed does NOT hide it or change any number. It moves it
+// from a warning into a one-line footnote, and the moment the underlying facts
+// change — a different pair of candidates, a different club — the signature no
+// longer matches and it surfaces again as new.
+// ===========================================================================
+const REVIEWED_KEY = "ingenuity:reviewed";
+// The signature includes what made it ambiguous, so "reviewed" applies to THIS
+// situation, not to the name forever.
+const reviewSig = (kind, item) => `${kind}|${normName(item.name || "")}|${normName(item.team || "")}|${normName(item.detail || "")}`;
+async function loadReviewed() {
+    return (await store.get(REVIEWED_KEY, {})) || {};
+}
+async function markReviewed(kind, items) {
+    const cur = await loadReviewed();
+    const at = new Date().toISOString();
+    for (const it of (items || []))
+        cur[reviewSig(kind, it)] = { at, name: it.name || "", team: it.team || "" };
+    // Reviewed marks for situations that no longer exist are dead weight; they
+    // are cleared whenever the caller passes the current full set.
+    await store.set(REVIEWED_KEY, cur);
+    return cur;
+}
+async function unmarkReviewed(kind, items) {
+    const cur = await loadReviewed();
+    for (const it of (items || []))
+        delete cur[reviewSig(kind, it)];
+    await store.set(REVIEWED_KEY, cur);
+    return cur;
+}
+function splitReviewed(kind, items, reviewed) {
+    const fresh = [], seen = [];
+    for (const it of (items || []))
+        ((reviewed || {})[reviewSig(kind, it)] ? seen : fresh).push(it);
+    return { fresh, seen };
+}
 function findTeamsAsPlayers(teams) {
     const out = [];
     for (const t of (teams || []))
@@ -4017,10 +4272,19 @@ function findTeamsAsPlayers(teams) {
             for (const pl of (t[bucket] || [])) {
                 if (!pl || !pl.name)
                     continue;
-                const asTeam = resolveTeamName(pl.name);
+                // MLB matched this record to a real person. Whatever else is
+                // true of it, it is not a team-level row that wandered in.
+                if (pl.mlbId)
+                    continue;
+                const asTeam = isWholeTeamName(pl.name);
                 const pa = parseFloat(pl.pa || pl.bf);
-                if (asTeam || (Number.isFinite(pa) && pa > 800))
-                    out.push({ team: t.name, bucket, name: pl.name, pa: Number.isFinite(pa) ? pa : null, club: asTeam || null });
+                // No hitter reaches 800 PA in a season (the record is ~778), so
+                // a row above that is carrying a whole club's plate appearances.
+                const teamSizedPa = Number.isFinite(pa) && pa > 800;
+                if (asTeam || teamSizedPa)
+                    out.push({ team: t.name, bucket, name: pl.name,
+                        pa: Number.isFinite(pa) ? pa : null, club: asTeam || null,
+                        why: asTeam ? "name is a club" : "carries a whole club's PA" });
             }
     return out;
 }
@@ -4042,7 +4306,8 @@ function TeamsAsPlayers({ teams, onApply }) {
         React.createElement("p", null,
             React.createElement("b", null, `${hits.length} club${hits.length === 1 ? "" : "s"} filed as players. `),
             "A team-level table was read as a roster, so each club landed in a lineup pool carrying its whole team's wOBA and its whole team's plate appearances. Because roster offense is PA-weighted, one of these outweighs every real hitter on the team combined."),
-        React.createElement("p", { className: "dbf-inline" }, hits.slice(0, 10).map((h) => `${h.name} (${h.team}${h.pa ? `, ${h.pa} PA` : ""})`).join(" \u00B7 "), hits.length > 10 ? ` \u00B7 +${hits.length - 10}` : ""),
+        React.createElement("p", { className: "dbf-inline" }, hits.slice(0, 10).map((h) => `${h.name} (${h.team}${h.pa ? `, ${h.pa} PA` : ""}) \u2014 ${h.why}`).join(" \u00B7 "), hits.length > 10 ? ` \u00B7 +${hits.length - 10}` : ""),
+        React.createElement("p", { className: "dbf-note" }, "Rows MLB has matched to a real player are never listed here. If a name you recognise appears, it has no MLB id yet \u2014 run the roster reconcile first and it will resolve rather than be removed."),
         React.createElement("button", { className: "ing-ghost", onClick: () => {
                 if (!armed) { setArmed(true); return; }
                 onApply(removeTeamsAsPlayers(teams, hits), `Removed ${hits.length} club${hits.length === 1 ? "" : "s"} that had been filed as players. Offense and bullpen recomputed.`);
@@ -4055,6 +4320,8 @@ function RosterReconcile({ teams, onApply }) {
     const [busy, setBusy] = useState(false);
     const [armed, setArmed] = useState(false);
     const [msg, setMsg] = useState("");
+    const [reviewed, setReviewed] = useState({});
+    useEffect(() => { loadReviewed().then(setReviewed); }, []);
     const run = async () => {
         setBusy(true);
         setMsg("");
@@ -4089,16 +4356,45 @@ function RosterReconcile({ teams, onApply }) {
                 plan.ambiguous.length ? `, ${plan.ambiguous.length} ambiguous` : "",
                 "."),
             plan.failedClubs.length > 0 && React.createElement("p", { className: "grade-note" }, `Note: ${plan.failedClubs.join(", ")} didn't return a roster, so their players were not checked.`),
-            plan.ambiguous.length > 0 && React.createElement("div", { className: "rla-group" },
-                React.createElement("h5", null, `${plan.ambiguous.length} ambiguous name${plan.ambiguous.length === 1 ? "" : "s"} \u2014 not moved`),
-                React.createElement("p", { className: "grade-note" }, "More than one player on a 40-man shares this name, so there is no safe way to tell which one your record refers to. Correct the name to match MLB exactly (including any Jr./Sr.), then re-check \u2014 the id gets recorded and it will never be ambiguous again."),
-                React.createElement("div", { className: "rla-list" }, plan.ambiguous.slice(0, 8).map((a, i) => React.createElement("div", { key: i, className: "rla-row bad" },
-                    React.createElement("span", null, `${a.name} (${a.team})`),
-                    React.createElement("i", null, a.options.map((o2) => `${o2.name} \u2013 ${o2.team}`).join(" or ")))))),
-            plan.unknown.length > 0 && React.createElement("div", { className: "rla-group" },
-                React.createElement("h5", null, `${plan.unknown.length} not on any 40-man roster`),
-                React.createElement("p", { className: "grade-note" }, "Checked against all 30 clubs, so these are minor leaguers, released players, or names picked up from a broader stats export. They are left completely alone \u2014 their stats stay and they keep counting as they did before."),
-                React.createElement("p", { className: "dbf-inline" }, plan.unknown.slice(0, 8).map((x) => `${x.name} (${x.team})`).join(" \u00B7 "), plan.unknown.length > 8 ? ` \u00B7 +${plan.unknown.length - 8}` : "")),
+            (() => {
+                // Two players genuinely sharing a name is correct, permanent, and
+                // unfixable without renaming a record by hand. Marking it reviewed
+                // moves it to a footnote instead of leaving it to look like
+                // outstanding work every morning. The signature carries the
+                // candidate pair, so a NEW collision still surfaces as new.
+                const sigged = plan.ambiguous.map((a) => ({ ...a,
+                    detail: a.options.map((o2) => `${o2.name}-${o2.team}`).sort().join("|") }));
+                const { fresh, seen } = splitReviewed("ambiguous", sigged, reviewed);
+                if (!sigged.length)
+                    return null;
+                return React.createElement("div", { className: "rla-group" },
+                    fresh.length > 0 && React.createElement(React.Fragment, null,
+                        React.createElement("h5", null, `${fresh.length} ambiguous name${fresh.length === 1 ? "" : "s"} \u2014 not moved`),
+                        React.createElement("p", { className: "grade-note" }, "More than one player on a 40-man shares this name, so there is no safe way to tell which one your record refers to. Correct the name to match MLB exactly (including any Jr./Sr.), then re-check \u2014 the id gets recorded and it will never be ambiguous again."),
+                        React.createElement("div", { className: "rla-list" }, fresh.slice(0, 8).map((a, i) => React.createElement("div", { key: i, className: "rla-row bad" },
+                            React.createElement("span", null, `${a.name} (${a.team})`),
+                            React.createElement("i", null, a.options.map((o2) => `${o2.name} \u2013 ${o2.team}`).join(" or "))))),
+                        React.createElement("button", { className: "ing-ghost tiny", onClick: async () => setReviewed(await markReviewed("ambiguous", fresh)) },
+                            `Mark ${fresh.length === 1 ? "it" : "these"} reviewed \u2014 nothing I can fix`)),
+                    seen.length > 0 && React.createElement("p", { className: "rla-seen" },
+                        `${seen.length} ambiguous name${seen.length === 1 ? "" : "s"} reviewed and set aside: ${seen.slice(0, 4).map((a) => a.name).join(", ")}${seen.length > 4 ? `, +${seen.length - 4}` : ""}. `,
+                        React.createElement("button", { onClick: async () => setReviewed(await unmarkReviewed("ambiguous", seen)) }, "show again")));
+            })(),
+            (() => {
+                const { fresh, seen } = splitReviewed("offroster", plan.unknown, reviewed);
+                if (!plan.unknown.length)
+                    return null;
+                return React.createElement("div", { className: "rla-group" },
+                    fresh.length > 0 && React.createElement(React.Fragment, null,
+                        React.createElement("h5", null, `${fresh.length} not on any 40-man roster`),
+                        React.createElement("p", { className: "grade-note" }, "Checked against all 30 clubs, so these are minor leaguers, released players, or names picked up from a broader stats export. They are left completely alone \u2014 their stats stay and they keep counting as they did before."),
+                        React.createElement("p", { className: "dbf-inline" }, fresh.slice(0, 8).map((x) => `${x.name} (${x.team})`).join(" \u00B7 "), fresh.length > 8 ? ` \u00B7 +${fresh.length - 8}` : ""),
+                        React.createElement("button", { className: "ing-ghost tiny", onClick: async () => setReviewed(await markReviewed("offroster", fresh)) },
+                            `Mark all ${fresh.length} reviewed \u2014 expected, leave them`)),
+                    seen.length > 0 && React.createElement("p", { className: "rla-seen" },
+                        `${seen.length} off-roster name${seen.length === 1 ? "" : "s"} reviewed and set aside. `,
+                        React.createElement("button", { onClick: async () => setReviewed(await unmarkReviewed("offroster", seen)) }, "show again")));
+            })(),
             moves.length === 0 && plan.inactive.length === 0 && reacts.length === 0 && plan.idStamps.length === 0
                 ? React.createElement("p", { className: "grade-note ok" }, "Every player on a 40-man is already on the right team, and all ids are recorded. Nothing to do.")
                 : React.createElement(React.Fragment, null,
@@ -4296,17 +4592,23 @@ const SHEDDABLE = [
 function StorageHealth() {
     const [open, setOpen] = useState(false);
     const [snap, setSnap] = useState(null);
+    const [q, setQ] = useState(null);
     const [msg, setMsg] = useState("");
-    const read = () => setSnap(store.audit());
+    const read = async () => {
+        setSnap(store.audit());
+        setQ(await store.quota());
+    };
     useEffect(() => {
         read();
     }, []);
     const fmt = (b) => (b >= 1048576 ? `${(b / 1048576).toFixed(2)} MB` : b >= 1024 ? `${Math.round(b / 1024)} KB` : `${b} B`);
-    // Browsers publish no quota for localStorage; 5 MB is the near-universal
-    // floor. Treated as a yardstick, not a promise.
-    const LIMIT = 5 * 1024 * 1024;
-    const total = snap ? snap.total : 0;
-    const pct = Math.min(100, Math.round((total / LIMIT) * 100));
+    // On IndexedDB the browser reports actual usage and quota. On localStorage
+    // there is no published figure and 5 MB is the near-universal floor —
+    // a yardstick, not a promise.
+    const onIdb = store.engine === "idb";
+    const LIMIT = q && q.real ? q.quota : 5 * 1024 * 1024;
+    const total = q && q.real ? q.usage : (snap ? snap.total : 0);
+    const pct = LIMIT ? Math.min(100, Math.round((total / LIMIT) * 100)) : 0;
     const tone = pct >= 85 ? "bad" : pct >= 65 ? "warn" : "ok";
     const shed = async (grp) => {
         if (!snap)
@@ -4329,14 +4631,17 @@ function StorageHealth() {
     return React.createElement("section", { className: "ing-card sh" },
         React.createElement("button", { className: "dbf-drawer-head", onClick: () => { setOpen(!open); read(); } },
             React.createElement("span", null, "Storage health"),
-            React.createElement("em", { className: tone }, snap ? `${fmt(total)} used \u00b7 ${pct}% of the usual limit` : "checking\u2026")),
+            React.createElement("em", { className: tone }, snap ? `${fmt(total)} used \u00b7 ${pct}% of ${fmt(LIMIT)}` : "checking\u2026")),
         open && snap && React.createElement(React.Fragment, null,
             React.createElement("div", { className: "sh-bar" },
                 React.createElement("span", { className: tone, style: { width: `${Math.max(2, pct)}%` } })),
             failure && React.createElement("p", { className: "sh-fail" },
                 React.createElement("b", null, "Last write failed. "),
                 `${failure.key} — ${store.lastError}. Anything you changed after that point is not on disk.`),
-            !failure && store.lastOk && React.createElement("p", { className: "sh-note ok" }, `Last write verified at ${new Date(store.lastOk).toLocaleTimeString()} — the bytes were read back, not just accepted.`),
+            React.createElement("p", { className: "sh-note" + (onIdb ? " ok" : "") }, onIdb
+                ? `Storing in IndexedDB \u2014 retention is limited by device space, not by a 5MB browser cap. Boards, autopsies and the fetch cache are kept rather than pruned.`
+                : `Storing in localStorage \u2014 capped near 5MB by the browser regardless of free space on the device. IndexedDB was unavailable, so retention limits still apply.`),
+            !failure && store.lastOk && React.createElement("p", { className: "sh-note ok" }, `Last write verified at ${new Date(store.lastOk).toLocaleTimeString()} \u2014 the bytes were read back, not just accepted.`),
             React.createElement("div", { className: "sh-rows" }, snap.rows.slice(0, 10).map((r) => React.createElement("div", { className: "sh-row", key: r.key },
                 React.createElement("span", { className: "k" }, r.key.replace(/^ingenuity:/, "")),
                 React.createElement("span", { className: "v" }, fmt(r.bytes))))),
@@ -5821,8 +6126,11 @@ function Ledger({ onHome }) {
             setLoaded(true);
         })();
     }, []);
-    const saveGames = useCallback(async (next) => { setGames(next); await store.set("ingenuity:ledger:games", next); }, []);
-    const saveBets = useCallback(async (next) => { setBets(next); await store.set("ingenuity:ledger:bets", next); }, []);
+    // Both report honestly. The app-wide banner still fires via store.onFailure
+    // for any caller that forgets to check, but a caller that does check can say
+    // so where the user is actually looking.
+    const saveGames = useCallback(async (next) => { setGames(next); return await store.set("ingenuity:ledger:games", next); }, []);
+    const saveBets = useCallback(async (next) => { setBets(next); return await store.set("ingenuity:ledger:bets", next); }, []);
     // v3.1 — SlateHub already auto-fetches finals for its own scanned boards
     // (gradeArchive, further up this file) by pulling the day's schedule and
     // matching team names. The Research Ledger never had that: every game
@@ -5834,61 +6142,26 @@ function Ledger({ onHome }) {
     const [fetchingResults, setFetchingResults] = useState(false);
     const [resultsMsg, setResultsMsg] = useState("");
     const fetchResults = useCallback(async (silent) => {
-        const current = await store.get("ingenuity:ledger:games", games);
-        const pending = current.filter((g) => g.final == null && g.matchup && g.matchup.includes(" @ ") && g.date);
-        if (!pending.length) {
-            if (!silent)
-                setResultsMsg("Nothing pending — every logged game already has a final.");
-            return;
-        }
         if (!silent) {
             setFetchingResults(true);
             setResultsMsg("");
         }
-        const byDate = {};
-        for (const g of pending)
-            (byDate[g.date] = byDate[g.date] || []).push(g);
-        const patches = new Map();
-        let checked = 0, unreachable = false;
-        for (const date of Object.keys(byDate)) {
-            try {
-                const r = await mlbFetch(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${date}`);
-                if (!r.ok)
-                    continue;
-                const j = await r.json();
-                const finals = extractFinals(j);
-                checked += byDate[date].length;
-                for (const g of byDate[date]) {
-                    const [rawAway, rawHome] = g.matchup.split(" @ ").map((s) => s.trim());
-                    const ga = normName(rawAway), gh = normName(rawHome);
-                    // Same fuzzy substring match gradeArchive uses for the slate
-                    // archive — a logged matchup may hold a nickname ("Rockies")
-                    // against statsapi's full name ("Colorado Rockies").
-                    const f = finals.find((x) => {
-                        const a = normName(x.away), h = normName(x.home);
-                        return (a.includes(ga) || ga.includes(a)) && (h.includes(gh) || gh.includes(h));
-                    });
-                    if (f)
-                        patches.set(g.id, { final: f.total, outcome: deriveGameOutcome(g, f.total, "") });
-                }
-            }
-            catch {
-                unreachable = true;
-            }
-        }
-        if (patches.size) {
-            const latest = await store.get("ingenuity:ledger:games", current);
-            await saveGames(latest.map((g) => (patches.has(g.id) ? { ...g, ...patches.get(g.id) } : g)));
-        }
+        const r = await gradeResearchLedger();
+        if (r.next)
+            setGames(r.next);
         if (!silent) {
             setFetchingResults(false);
-            setResultsMsg(patches.size
-                ? `Filled in ${patches.size} of ${checked} pending game${checked === 1 ? "" : "s"}.`
-                : unreachable
-                    ? "Couldn't reach the MLB schedule API — try again shortly."
-                    : `Checked ${checked} pending game${checked === 1 ? "" : "s"} — none are Final yet.`);
+            setResultsMsg(r.saveFailed
+                ? `Found ${r.filled} final${r.filled === 1 ? "" : "s"} but couldn't save — ${store.lastError || "the write didn't land"}.`
+                : r.pending === 0
+                    ? "Nothing pending \u2014 every logged game already has a final."
+                    : r.filled
+                        ? `Filled in ${r.filled} of ${r.checked} pending game${r.checked === 1 ? "" : "s"}.`
+                        : r.unreachable
+                            ? "Couldn't reach the MLB schedule API \u2014 try again shortly."
+                            : `Checked ${r.checked} pending game${r.checked === 1 ? "" : "s"} \u2014 none are Final yet.`);
         }
-    }, [games, saveGames]);
+    }, [setGames]);
     // Quiet catch-up the moment the ledger opens, same pattern as SlateHub —
     // silent so it doesn't compete with anything you're actively doing.
     useEffect(() => { if (loaded) fetchResults(true); }, [loaded]);
@@ -5987,7 +6260,7 @@ function Ledger({ onHome }) {
             return d;
         return (y.b.loggedAt || 0) - (x.b.loggedAt || 0);
     });
-    const passes = games.filter((g) => g.decision.startsWith("PASS") && !g.decision.includes("BET"));
+    const passes = games.filter((g) => String(g.decision || "").startsWith("PASS") && !String(g.decision || "").includes("BET"));
     const modelErrGames = games.filter((g) => g.model != null && g.final != null);
     const avgErr = modelErrGames.length
         ? modelErrGames.reduce((s, g) => s + (g.final - g.model), 0) / modelErrGames.length : 0;
@@ -6224,7 +6497,7 @@ function deriveGameOutcome(g, finalVal, typedOutcome) {
         const went = finalVal > g.line ? "over" : finalVal < g.line ? "under" : "push";
         out = g.leanSide && g.leanSide !== "none"
             ? (went === g.leanSide ? "Model lean hit" : went === "push" ? "Push" : "Model lean missed")
-            : (g.decision.startsWith("PASS") ? `Pass — went ${went}` : `Went ${went}`);
+            : (String(g.decision || "").startsWith("PASS") ? `Pass — went ${went}` : `Went ${went}`);
     }
     return out || (finalVal == null ? "Pending" : out);
 }
@@ -7413,6 +7686,68 @@ function parsePlayerCards(text) {
 //   * both scores are real numbers. No zero-substitution, ever — a missing
 //     score means we don't know, and "don't know" stays blank.
 const COMPLETED_STATES = new Set(["final", "game over", "completed early"]);
+// Fill in finals for research games logged to the ledger. Extracted from the
+// Ledger tab so the morning run can call it too: a record that only updates
+// when you remember to open a particular screen is a record that quietly stops
+// growing, and every ungraded game is a game the miss lab can never learn from.
+// Only ever fills a BLANK — a final already entered, by hand or by an earlier
+// pass, is never overwritten.
+async function gradeResearchLedger() {
+    const current = await store.get("ingenuity:ledger:games", []);
+    const pending = (current || []).filter((g) => g.final == null && g.matchup && g.matchup.includes(" @ ") && g.date);
+    if (!pending.length)
+        return { filled: 0, checked: 0, pending: 0, unreachable: false };
+    const byDate = {};
+    for (const g of pending)
+        (byDate[g.date] = byDate[g.date] || []).push(g);
+    const patches = new Map();
+    let checked = 0, unreachable = false;
+    for (const date of Object.keys(byDate)) {
+        try {
+            // force: grading must never accept a cached "no final yet" — the
+            // cache cannot know, and a stale no is the one answer that
+            // guarantees the game never grades.
+            const r = await mlbFetch(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${date}`, true);
+            if (!r.ok) {
+                unreachable = true;
+                continue;
+            }
+            const finals = extractFinals(await r.json());
+            checked += byDate[date].length;
+            for (const g of byDate[date]) {
+                const [rawAway, rawHome] = g.matchup.split(" @ ").map((x) => x.trim());
+                const ga = normName(rawAway), gh = normName(rawHome);
+                const f = finals.find((x) => {
+                    const a = normName(x.away), h = normName(x.home);
+                    return (a.includes(ga) || ga.includes(a)) && (h.includes(gh) || gh.includes(h));
+                });
+                if (!f)
+                    continue;
+                // Row-level failures are contained. The try previously sat only
+                // around the whole date, so one malformed row aborted every
+                // other game that day AND reported the API as unreachable.
+                try {
+                    patches.set(g.id, { final: f.total, outcome: deriveGameOutcome(g, f.total, "") });
+                }
+                catch {
+                    patches.set(g.id, { final: f.total, outcome: "" });
+                }
+            }
+        }
+        catch {
+            unreachable = true;
+        }
+    }
+    if (patches.size) {
+        const latest = await store.get("ingenuity:ledger:games", current);
+        const next = latest.map((g) => (patches.has(g.id) ? { ...g, ...patches.get(g.id) } : g));
+        const wrote = await store.set("ingenuity:ledger:games", next);
+        if (!wrote)
+            return { filled: 0, checked, pending: pending.length, unreachable, saveFailed: true };
+        return { filled: patches.size, checked, pending: pending.length, unreachable, next };
+    }
+    return { filled: 0, checked, pending: pending.length, unreachable };
+}
 function extractFinals(scheduleJson) {
     const out = [];
     for (const dt of (scheduleJson?.dates || [])) {
@@ -7453,25 +7788,67 @@ function extractFinals(scheduleJson) {
 // started is worthless in ten minutes; a finished day never changes again.
 // ---------------------------------------------------------------------------
 const MLB_CACHE_KEY = "ingenuity:mlb:apiCache";
-const MLB_CACHE_MAX_ENTRY = 64 * 1024;
+const MLB_CACHE_MAX_ENTRY = 512 * 1024;
 const _mlbMem = new Map();
 let _mlbDisk = null;
-function mlbTtl(url) {
+const MLB_TTL_SETTLED = 7 * 24 * 60 * 60 * 1000;
+const MLB_TTL_MOVING = 10 * 60 * 1000;
+// Is every game in this schedule payload actually over? Only then is the
+// response immutable. Anything live, scheduled, or postponed means this is a
+// snapshot of a moment, not a record of a day.
+function scheduleSettled(data) {
+    if (!data || !Array.isArray(data.dates))
+        return false;
+    let games = 0;
+    for (const dt of data.dates)
+        for (const gm of (dt.games || [])) {
+            games++;
+            const st = gm.status || {};
+            const detailed = String(st.detailedState || "").toLowerCase();
+            const done = st.codedGameState === "F"
+                || (st.abstractGameState === "Final" && COMPLETED_STATES.has(detailed));
+            // A postponement is settled for THIS date — it will never produce a
+            // final here — so it doesn't hold the whole day open. Anything else
+            // unfinished does.
+            const dead = detailed.includes("postponed") || detailed.includes("cancelled") || detailed.includes("canceled");
+            if (!done && !dead)
+                return false;
+        }
+    return games > 0;
+}
+function mlbTtl(url, data) {
     if (/\/sports\/1\/players|\/api\/v1\/teams\?/.test(url))
         return 24 * 60 * 60 * 1000; // rosters and the team list barely move
     const m = url.match(/date=(\d{4}-\d{2}-\d{2})/);
-    if (m && m[1] < etDayKey())
-        return 7 * 24 * 60 * 60 * 1000; // a past day is final
-    return 10 * 60 * 1000; // today: lineups post through the afternoon
+    if (!m)
+        return MLB_TTL_MOVING;
+    if (m[1] >= etDayKey())
+        return MLB_TTL_MOVING; // today or later: lineups and scores still moving
+    // A past date EARNS the long life only by content. Without the payload to
+    // inspect (an old entry from before this fix), assume it is still moving —
+    // one extra fetch is cheap; a week of phantom "no finals" is not.
+    if (data === undefined)
+        return MLB_TTL_MOVING;
+    return scheduleSettled(data) ? MLB_TTL_SETTLED : MLB_TTL_MOVING;
 }
 async function _mlbDiskLoad() {
     if (_mlbDisk)
         return _mlbDisk;
     _mlbDisk = (await store.get(MLB_CACHE_KEY, null)) || {};
+    // One-off: entries written before the TTL became content-aware may hold a
+    // past date whose games were still in progress, and under the old rule they
+    // were being served as authoritative for a week. Drop any schedule for a
+    // past date that isn't actually settled, so grading gets a real answer on
+    // the next pass rather than waiting out a stale lifetime.
+    for (const [k, v] of Object.entries(_mlbDisk)) {
+        const m = String(k).match(/date=(\d{4}-\d{2}-\d{2})/);
+        if (m && m[1] < etDayKey() && v && !scheduleSettled(v.data))
+            delete _mlbDisk[k];
+    }
     const now = Date.now();
     let pruned = false;
     for (const [k, v] of Object.entries(_mlbDisk)) {
-        if (!v || now - v.at > mlbTtl(k)) {
+        if (!v || now - v.at > mlbTtl(k, v.data)) {
             delete _mlbDisk[k];
             pruned = true;
         }
@@ -7484,14 +7861,13 @@ async function _mlbDiskLoad() {
 // call site has to change beyond the function name. `force` bypasses the cache.
 async function mlbFetch(url, force = false) {
     const now = Date.now();
-    const ttl = mlbTtl(url);
     if (!force) {
         const hitMem = _mlbMem.get(url);
-        if (hitMem && now - hitMem.at < ttl)
+        if (hitMem && now - hitMem.at < mlbTtl(url, hitMem.data))
             return { ok: true, status: 200, cached: "memory", json: async () => hitMem.data };
         const disk = await _mlbDiskLoad();
         const hitDisk = disk[url];
-        if (hitDisk && now - hitDisk.at < ttl) {
+        if (hitDisk && now - hitDisk.at < mlbTtl(url, hitDisk.data)) {
             _mlbMem.set(url, hitDisk);
             return { ok: true, status: 200, cached: "stored", json: async () => hitDisk.data };
         }
@@ -9531,7 +9907,11 @@ function BoardChart({ games, rows, onPick, onOpen }) {
                     } }, logging === selected.g.away + selected.g.home ? "\u2026" : "+ Add to research")),
             logMsg && React.createElement("p", { className: "bc-logmsg" }, logMsg)))));
 }
-const SLATE_ARCHIVE_DAYS = 90; // keep a season's worth of full boards; a day is ~3KB
+// A full day with snapshots on every game measures ~10KB, not the ~3KB this
+// comment used to claim. Under localStorage's 5MB ceiling 90 days was already
+// most of the budget; on IndexedDB there is room for several seasons, and every
+// day kept is a day the miss lab and the re-score tool can still learn from.
+const SLATE_ARCHIVE_DAYS = 1000;
 // Full boards (odds + weather + pitchers) roll off at 90 days, but a graded
 // game is training data — it must never expire. Each finished game distills to
 // one compact permanent row (~120 bytes): date, teams, park, line, model,
@@ -9553,8 +9933,16 @@ async function recordFinals(arch) {
             added++;
         }
     }
-    if (added)
-        await store.set("ingenuity:results:log", rec);
+    if (added) {
+        const wrote = await store.set("ingenuity:results:log", rec);
+        if (!wrote) {
+            // The graded sample is the one thing in the app that cannot be
+            // rebuilt from an external source. A failure here is reported, and
+            // counted as nothing added, so the next pass tries again.
+            await logActivity("grade", "Graded games could NOT be saved", store.lastError || "the write didn't land");
+            return 0;
+        }
+    }
     return added;
 }
 // ---- Miss autopsy -----------------------------------------------------------
@@ -9567,7 +9955,7 @@ async function recordFinals(arch) {
 async function autopsyGame(row, snap) {
     const out = { row, snap, err: null, innings: null, big: null, split: null, hr: null, unearned: null, pk: null };
     try {
-        const sr = await mlbFetch(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${row.date}&hydrate=linescore`);
+        const sr = await mlbFetch(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${row.date}&hydrate=linescore`, true);
         if (!sr.ok)
             throw new Error("schedule unavailable");
         const sj = await sr.json();
@@ -10764,7 +11152,7 @@ const MORNING_PLAN = [
     { key: "recentform", label: "Recent form (14d)", hint: "outcome wOBA + BB%\u2212K%, MLB Stats API" },
     { key: "lineups", label: "Batting orders", hint: "usually posted ~3h before first pitch" },
     { key: "project", label: "Price the board", hint: "freezes a snapshot so tomorrow's miss can be attributed" },
-    { key: "settle", label: "Settle the desk", hint: "grade yesterday's paper bets against real finals" },
+    { key: "settle", label: "Settle results", hint: "grade paper bets AND research games against real finals" },
     { key: "diagnose", label: "Self-diagnosis", hint: "grade finished slates, then check where the model is wrong" },
 ];
 // ---- Grading coverage & significance ----------------------------------------
@@ -11058,17 +11446,24 @@ function SlateHub({ onOpenInTerminal }) {
     const [grading, setGrading] = useState(false);
     // Every board is archived under its own date. Nothing a day produced is ever
     // overwritten by the next day — that record is what makes hindsight possible.
+    // Returns whether the board actually reached storage. The archive carries
+    // every frozen snapshot, so a silent failure here costs a day the miss lab
+    // can never attribute.
     const saveSlate = async (next) => {
         setSlate(next);
+        let ok = true;
         if (next.date === todayKey)
-            await store.set("ingenuity:slate:day", next);
+            ok = (await store.set("ingenuity:slate:day", next)) && ok;
         const arch = await store.get("ingenuity:slate:archive", {});
         arch[next.date] = next;
         const keys = Object.keys(arch).sort();
         while (keys.length > SLATE_ARCHIVE_DAYS)
             delete arch[keys.shift()];
-        await store.set("ingenuity:slate:archive", arch);
+        ok = (await store.set("ingenuity:slate:archive", arch)) && ok;
         setArchDates(Object.keys(arch).sort().reverse());
+        if (!ok)
+            setMsg(`The board didn't save \u2014 ${store.lastError || "the write didn't land"}. What's on screen is not stored.`);
+        return ok;
     };
     useEffect(() => {
         (async () => {
@@ -11681,9 +12076,29 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
             // is a record you cannot trust.
             const { graded } = await deskGrade();
             const rec = deskRecord(await store.get(DESK_KEY, {}));
-            if (!graded)
-                return { state: "skip", note: rec.open ? `${rec.open} still awaiting a final` : "nothing open to settle" };
-            return { state: "ok", note: `${graded} settled \u00B7 desk now ${rec.w}\u2013${rec.l}${rec.push ? `\u2013${rec.push}` : ""}, ${rec.units > 0 ? "+" : ""}${rec.units}u` };
+            // Research games settle here too. They used to fill in only while the
+            // Ledger tab was open, so a week without visiting it left a week of
+            // games the miss lab could never learn from.
+            const led = await gradeResearchLedger();
+            if (led.filled)
+                await logActivity("grade", `Research ledger: ${led.filled} game${led.filled === 1 ? "" : "s"} graded`, `${led.pending - led.filled} still pending`);
+            else if (led.unreachable && led.pending)
+                await logActivity("grade", `Research ledger: couldn't reach MLB`, `${led.pending} still pending`);
+            const bits = [];
+            if (graded)
+                bits.push(`${graded} bet${graded === 1 ? "" : "s"} settled \u00B7 desk now ${rec.w}\u2013${rec.l}${rec.push ? `\u2013${rec.push}` : ""}, ${rec.units > 0 ? "+" : ""}${rec.units}u`);
+            if (led.filled)
+                bits.push(`${led.filled} research game${led.filled === 1 ? "" : "s"} graded`);
+            if (!bits.length) {
+                const waiting = [];
+                if (rec.open)
+                    waiting.push(`${rec.open} bet${rec.open === 1 ? "" : "s"}`);
+                if (led.pending)
+                    waiting.push(`${led.pending} research game${led.pending === 1 ? "" : "s"}`);
+                return { state: led.unreachable ? "warn" : "skip",
+                    note: led.unreachable ? "MLB unreachable \u2014 nothing graded" : waiting.length ? `${waiting.join(" and ")} still awaiting a final` : "nothing to settle" };
+            }
+            return { state: led.unreachable ? "warn" : "ok", note: bits.join(" \u00B7 ") + (led.unreachable ? " \u00B7 some dates unreachable" : "") };
         });
         await run("diagnose", async () => {
             // Grading already ran on open; this re-runs it so a slate that finished
@@ -11720,7 +12135,10 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
                     if (done) {
                         // Keep only the last 14 days of autopsies. An unbounded
                         // cache is how a storage budget disappears quietly.
-                        const cutoff = etDayKey(new Date(Date.now() - 14 * 86400000));
+                        // Kept for a season rather than a fortnight: an autopsy is
+                        // the reconstructed cause of a miss, and causes are what the
+                        // recurring-pattern counter is built from.
+                        const cutoff = etDayKey(new Date(Date.now() - 400 * 86400000));
                         for (const k of Object.keys(cache))
                             if (String(k).split("|")[0] < cutoff)
                                 delete cache[k];
@@ -14663,6 +15081,9 @@ const CSS = `
 .sh-note { font-size: 11px; color: var(--ink-dim); line-height: 1.5; margin-top: 9px; }
 .sh-note.ok { color: var(--phos); }
 .sh-note.dim { opacity: 0.75; }
+.ing-ghost.tiny { font-size: 10px; padding: 6px 10px; margin-top: 9px; }
+.rla-seen { font-size: 11px; color: var(--ink-dim); line-height: 1.5; margin-top: 8px; font-style: italic; }
+.rla-seen button { background: transparent; border: none; color: var(--cyan); font-size: 11px; cursor: pointer; text-decoration: underline; padding: 0; font-style: normal; }
 .sh-fail { font-size: 11.5px; color: var(--rust); line-height: 1.5; margin-bottom: 9px; padding-left: 9px; border-left: 2px solid var(--rust); }
 .sh .dbf-drawer-head { padding: 13px 0; }
 /* ---- app-wide write failure ---- */
