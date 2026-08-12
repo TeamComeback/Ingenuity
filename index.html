@@ -109,9 +109,18 @@ const DEFAULT_CFG = {
     // weighted heaviest) plus a penalty for arms working back-to-back. Effect is
     // deliberately small and capped — this is a nudge, not a thesis.
     PEN_FATIGUE_BASE: 120, // weighted 3-day reliever pitch count treated as "normal"
-    PEN_FATIGUE_MAX_PENALTY: 0.012, // wOBA added to a maximally gassed pen
+    // v2.7: sized from replacement-arm arithmetic, not chosen. An elite reliever
+    // allows ~.270 wOBA, a replacement ~.340 — a .070 gap. A maximally gassed pen
+    // sends roughly half its innings to the wrong end of that, which is ~+.035.
+    // .030 holds slightly short of that estimate rather than reaching past it.
+    PEN_FATIGUE_MAX_PENALTY: 0.030, // wOBA added to a maximally gassed pen
     PEN_FATIGUE_MAX_BONUS: 0.005, // wOBA removed from a fully rested pen (smaller: rest helps less than fatigue hurts)
     PEN_B2B_WEIGHT: 0.10, // each arm pitching back-to-back days adds this to the fatigue score
+    ARM_HEAVY_PITCHES: 28, // one appearance this size rules an arm out for tomorrow
+    // A bullpen missing its leverage arms is worse than the same bullpen merely
+    // tired. Applied on top of the workload penalty; the two together stay inside
+    // the replacement-arm gap they are both approximating.
+    ARM_UNAVAILABLE_MAX: 0.022,
     DEFENSE_OAA_SCALE: 0.0025, // fractional runs shift per team OAA
     FRAMING_FACTOR_SCALE: 0.0015, // fractional runs shift per catcher framing run
     // v1.6 — platoon splits. A lineup's run output depends heavily on the
@@ -137,8 +146,9 @@ const DEFAULT_CFG = {
 // v2.5: matchup went from (offense+pitcher)/2 to the additive form, which had
 // been halving every talent signal; home and away were un-reversed; tied
 // nine-inning games now play extras. Any of those alone reprices every game.
-const ENGINE_VERSION = "2.5";
+const ENGINE_VERSION = "2.7";
 const ENGINE_HISTORY = [
+    { v: "2.7", date: "2026-08-11", what: "Bullpen fatigue un-saturated (tanh, was flat past ~163 pitches), penalty .012\u2192.030, unavailable leverage arms priced separately" },
     { v: "2.5", date: "2026-08-10", what: "Additive matchup (was halving every input), home/away un-reversed, extra innings, 20k sims" },
     { v: "1.7", date: "2026-07-28", what: "Bullpen fatigue from recent workload" },
     { v: "1.6", date: "2026-07-22", what: "Platoon splits by starter handedness" },
@@ -255,22 +265,71 @@ function penFatigueScore(usage) {
         return null;
     const d1 = parseFloat(usage.d1) || 0, d2 = parseFloat(usage.d2) || 0, d3 = parseFloat(usage.d3) || 0;
     const weighted = d1 * 1.0 + d2 * 0.65 + d3 * 0.35; // yesterday matters most
-    let s = (weighted - CFG.PEN_FATIGUE_BASE) / (CFG.PEN_FATIGUE_BASE * 0.8);
-    s += (parseFloat(usage.backToBack) || 0) * CFG.PEN_B2B_WEIGHT;
-    // note: usage.arms may be a list (per-arm detail) or a count — neither feeds the score
-    return Math.max(-1, Math.min(1, s));
+    let raw = (weighted - CFG.PEN_FATIGUE_BASE) / (CFG.PEN_FATIGUE_BASE * 0.8);
+    raw += (parseFloat(usage.backToBack) || 0) * CFG.PEN_B2B_WEIGHT;
+    // v2.7: tanh instead of a hard clamp. The old Math.min(1, ...) meant every
+    // pen past ~163 weighted pitches produced exactly 1.00 — a merely tired pen
+    // and one with three arms unavailable were the same number to the engine,
+    // and the second is the whole reason to look at bullpens. Near zero tanh is
+    // almost exactly the old linear scale, so ordinary pens do not move; the
+    // extremes now have somewhere to go, bounded by the function rather than
+    // flattened by a clamp.
+    return Math.tanh(raw);
+}
+// WHICH arms are unavailable, as opposed to how hard the pen has worked. A book
+// prices aggregate workload; it cannot see from a team total that the closer and
+// the primary setup man both threw 30 pitches yesterday. This is the part of the
+// bullpen picture most likely to still be mispriced.
+// Rest conventions, not guesses: one heavy outing, or back-to-back days.
+function unavailableArms(rec) {
+    const arms = (rec && Array.isArray(rec.arms)) ? rec.arms : [];
+    if (!arms.length)
+        return { out: [], n: 0, share: 0 };
+    const out = [];
+    for (const a of arms) {
+        const p1 = parseFloat(a.p1) || 0, p2 = parseFloat(a.p2) || 0, p3 = parseFloat(a.p3) || 0;
+        const daysUsed = (p1 > 0 ? 1 : 0) + (p2 > 0 ? 1 : 0) + (p3 > 0 ? 1 : 0);
+        let why = null;
+        if (p1 >= CFG.ARM_HEAVY_PITCHES)
+            why = `${Math.round(p1)}p yesterday`;
+        else if (p1 > 0 && p2 > 0)
+            why = "threw both of the last two days";
+        else if (daysUsed === 3)
+            why = "threw three days running";
+        if (why)
+            out.push({ name: a.name || "?", why, load: a.load });
+    }
+    // Share of a normal-sized pen that is gone. Denominator floors at 6 so a
+    // club with only three arms on record can't read as 100% unavailable.
+    return { out, n: out.length, share: Math.min(1, out.length / Math.max(6, arms.length)) };
 }
 // Apply that score to the bullpen's effective wOBA allowed. Tired pen = worse
 // (higher wOBA against); rested pen = slightly better. Both ends are capped.
-function applyPenFatigue(penWoba, score) {
+function applyPenFatigue(penWoba, score, armShare) {
     const s = parseFloat(score);
-    if (isNaN(s))
-        return penWoba;
-    const c = Math.max(-1, Math.min(1, s));
-    return penWoba + (c >= 0 ? c * CFG.PEN_FATIGUE_MAX_PENALTY : c * CFG.PEN_FATIGUE_MAX_BONUS);
+    let out = penWoba;
+    if (!isNaN(s)) {
+        const c = Math.max(-1, Math.min(1, s));
+        out += (c >= 0 ? c * CFG.PEN_FATIGUE_MAX_PENALTY : c * CFG.PEN_FATIGUE_MAX_BONUS);
+    }
+    // Who is unavailable, on top of how hard the pen has worked. Related but
+    // distinct: a pen can be lightly used overall and still have its closer and
+    // primary setup man both out.
+    const share = parseFloat(armShare);
+    if (Number.isFinite(share) && share > 0)
+        out += Math.min(1, share) * CFG.ARM_UNAVAILABLE_MAX;
+    return out;
 }
 // Only trust a fatigue reading taken TODAY — yesterday's workload picture is
 // stale the moment a new slate starts, and a stale nudge is worse than none.
+// Same day-stamp discipline as the fatigue score: yesterday's picture of who is
+// unavailable is wrong the moment a new slate starts.
+function teamPenOutShare(t) {
+    if (!t || t.penFatigueAsOf !== etDayKey())
+        return null;
+    const v = parseFloat(t.penOutShare);
+    return isNaN(v) ? null : v;
+}
 function teamPenFatigue(t) {
     if (!t || t.penFatigueAsOf !== etDayKey())
         return null;
@@ -657,6 +716,12 @@ function applyPenFatigueToTeams(fatigue, teams) {
         t.penFatigueAsOf = today;
         t.penFatigueDetail = `${Math.round(rec.d1)}/${Math.round(rec.d2)}/${Math.round(rec.d3)} pitches (last 3d), ${rec.backToBack} arm${rec.backToBack === 1 ? "" : "s"} back-to-back`;
         t.penArms = Array.isArray(rec.arms) ? rec.arms : [];
+        // WHICH arms are gone, not just how hard the pen worked. A book prices
+        // aggregate workload; it cannot see from a team total that the closer
+        // and the primary setup man both threw 30 pitches yesterday.
+        const ua = unavailableArms(rec);
+        t.penOutArms = ua.n ? ua.out.map((x) => `${x.name} (${x.why})`).join(" \u00B7 ") : "";
+        t.penOutShare = ua.share ? ua.share.toFixed(3) : "";
         applied++;
     }
     return { next, applied, missing };
@@ -2676,7 +2741,7 @@ function dedupeTeams(teams) {
             "penIp", "penEra", "penSiera", "penWhip", "penBaa", "penK", "penBb", "penChase", "penZcon", "penFb", "penHr",
             "pen14Ip", "pen14Era", "pen14Siera", "pen14Whip", "pen14Baa", "pen14K", "pen14Bb",
             "pen14Chase", "pen14Zcon", "pen14Fb", "pen14Hr", "pen14Barrel", "pen14HardHit", "pen14Woba",
-            "penFatigueDetail", "lineup"])
+            "penFatigueDetail", "penOutArms", "penOutShare", "lineup"])
             out[f] = pick(f);
         // Timestamps are not "keep whichever exists" — a merge that pairs newer
         // data with an older stamp would report the result as fresher or staler
@@ -3235,7 +3300,7 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
                 recent: num(t.recent), recentPA: num(t.recentPA), recentBbk: num(t.recentBbk),
                 sp: num(arm.xwoba) ?? 0.32, spBf: num(arm.bf) ?? 200, spIp: num(arm.ip) ?? 5, spEra: num(arm.era), spHand: (arm.hand === "L" || arm.hand === "R") ? arm.hand : null,
                 pen: penFor(t).pen ?? 0.318, penBf: penFor(t).penBf ?? 800, penBarrel: num(t.penBarrel), penHardHit: num(t.penHardHit),
-                penFatigue: teamPenFatigue(t),
+                penFatigue: teamPenFatigue(t), penOutShare: teamPenOutShare(t),
                 oaa: num(t.oaa), framing: num(t.framing),
             });
             const a = side(A, aArm), h = side(H, hArm);
@@ -3244,12 +3309,12 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
                 awayOff: a.off, awayXoff: a.xoff, awayPA: a.pa, awayRecent: a.recent, awayRecentPA: a.recentPA, awayRecentBbk: a.recentBbk,
                 awayOffVsL: splitsFor(A).offVsL, awayPaVsL: splitsFor(A).paVsL, awayOffVsR: splitsFor(A).offVsR, awayPaVsR: splitsFor(A).paVsR,
                 awaySP: a.sp, awaySPbf: a.spBf, awaySPip: a.spIp, awaySPera: a.spEra, awaySPHand: a.spHand,
-                awayPen: a.pen, awayPenBf: a.penBf, awayPenBarrel: a.penBarrel, awayPenHardHit: a.penHardHit, awayPenFatigue: a.penFatigue,
+                awayPen: a.pen, awayPenBf: a.penBf, awayPenBarrel: a.penBarrel, awayPenHardHit: a.penHardHit, awayPenFatigue: a.penFatigue, awayPenOutShare: a.penOutShare,
                 awayOAA: a.oaa, awayFraming: a.framing,
                 homeOff: h.off, homeXoff: h.xoff, homePA: h.pa, homeRecent: h.recent, homeRecentPA: h.recentPA, homeRecentBbk: h.recentBbk,
                 homeOffVsL: splitsFor(H).offVsL, homePaVsL: splitsFor(H).paVsL, homeOffVsR: splitsFor(H).offVsR, homePaVsR: splitsFor(H).paVsR,
                 homeSP: h.sp, homeSPbf: h.spBf, homeSPip: h.spIp, homeSPera: h.spEra, homeSPHand: h.spHand,
-                homePen: h.pen, homePenBf: h.penBf, homePenBarrel: h.penBarrel, homePenHardHit: h.penHardHit, homePenFatigue: h.penFatigue,
+                homePen: h.pen, homePenBf: h.penBf, homePenBarrel: h.penBarrel, homePenHardHit: h.penHardHit, homePenFatigue: h.penFatigue, homePenOutShare: h.penOutShare,
                 homeOAA: h.oaa, homeFraming: h.framing,
             });
             if (dead)
@@ -4004,12 +4069,12 @@ function Terminal({ onHome, pendingGame, onPendingConsumed }) {
                 awayOff: num(A.off) ?? CFG.LEAGUE_WOBA, awayXoff: num(A.xoff), awayPA: num(A.pa) ?? 600,
                 awayRecent: num(A.recent), awayRecentPA: num(A.recentPA), awayRecentBbk: num(A.recentBbk),
                 awaySP: num(A.sp) ?? 0.32, awaySPbf: num(A.spBf) ?? 200, awaySPip: num(A.spIp) ?? 5, awaySPera: num(A.spEra),
-                awayPen: num(A.pen) ?? 0.318, awayPenBf: num(A.penBf) ?? 800, awayPenBarrel: num(A.penBarrel), awayPenHardHit: num(A.penHardHit), awayPenFatigue: teamPenFatigue(A),
+                awayPen: num(A.pen) ?? 0.318, awayPenBf: num(A.penBf) ?? 800, awayPenBarrel: num(A.penBarrel), awayPenHardHit: num(A.penHardHit), awayPenFatigue: teamPenFatigue(A), awayPenOutShare: teamPenOutShare(A),
                 awayOAA: num(A.oaa), awayFraming: num(A.framing),
                 homeOff: num(H.off) ?? CFG.LEAGUE_WOBA, homeXoff: num(H.xoff), homePA: num(H.pa) ?? 600,
                 homeRecent: num(H.recent), homeRecentPA: num(H.recentPA), homeRecentBbk: num(H.recentBbk),
                 homeSP: num(H.sp) ?? 0.32, homeSPbf: num(H.spBf) ?? 200, homeSPip: num(H.spIp) ?? 5, homeSPera: num(H.spEra),
-                homePen: num(H.pen) ?? 0.318, homePenBf: num(H.penBf) ?? 800, homePenBarrel: num(H.penBarrel), homePenHardHit: num(H.penHardHit), homePenFatigue: teamPenFatigue(H),
+                homePen: num(H.pen) ?? 0.318, homePenBf: num(H.penBf) ?? 800, homePenBarrel: num(H.penBarrel), homePenHardHit: num(H.penHardHit), homePenFatigue: teamPenFatigue(H), homePenOutShare: teamPenOutShare(H),
                 homeOAA: num(H.oaa), homeFraming: num(H.framing),
             };
             setResult({
@@ -5625,7 +5690,20 @@ function BullpenBoard({ A, H, compact }) {
                 return (React.createElement("div", { className: "pen-side", key: i },
                     React.createElement("div", { className: "pen-side-head" },
                         React.createElement("span", { className: "pen-team" }, t.name || s.label),
-                        fw && React.createElement("span", { className: "pen-chip " + fw.k }, fw.txt)),
+                        fw && React.createElement("span", { className: "pen-chip " + fw.k }, fw.txt),
+                        (() => {
+                            // The single most actionable line in this tab: not how
+                            // tired the pen is, but who is not available to pitch
+                            // the seventh through ninth tonight.
+                            const share = fresh(t) ? parseFloat(t.penOutShare) : NaN;
+                            if (!Number.isFinite(share) || share <= 0)
+                                return null;
+                            const n = (t.penOutArms || "").split(" \u00B7 ").filter(Boolean).length;
+                            return React.createElement("span", { className: "pen-chip out" }, `${n} arm${n === 1 ? "" : "s"} down`);
+                        })()),
+                    fresh(t) && t.penOutArms && React.createElement("p", { className: "pen-out" },
+                        React.createElement("b", null, "Unavailable: "),
+                        t.penOutArms),
                     (() => {
                         // Show the number the ENGINE resolves to, with its source, and
                         // the season-to-last-14 gap beside it. Workload says how many
@@ -10312,7 +10390,14 @@ function detectMissPatterns(log, boards, engine) {
     add("Model called OVER", (r) => r.model > r.line, "A lean that misses in one direction more than the other is a calibration signal, not luck.");
     add("Snapshot: hot park (1.02+)", (r) => r.snap && r.snap.parkF != null && r.snap.parkF >= 1.02, "Park factors are applied multiplicatively; an error here shows up only in hitter parks.");
     add("Snapshot: wind blowing out", (r) => r.snap && r.snap.windOut === true, "The weather boost is capped at +/-6%; this tests whether the cap is right.");
-    add("Snapshot: tired pen (fatigue 0.5+)", (r) => r.snap && (parseFloat(r.snap.aFat) >= 0.5 || parseFloat(r.snap.hFat) >= 0.5), "Fatigue is one of the newest inputs and the least validated.");
+    // The bullpen question, split three ways. These exist to ANSWER whether
+    // tired pens are mispriced rather than to assume it: if the model is now
+    // over-penalising fatigue these will come back negative, and that is the
+    // outcome the constants should answer to.
+    add("Snapshot: tired pen (fatigue 0.5+)", (r) => r.snap && (parseFloat(r.snap.aFat) >= 0.5 || parseFloat(r.snap.hFat) >= 0.5), "Does the model miss differently when a bullpen has been worked hard? A positive bias here means it still under-prices fatigue; negative means v2.7 went too far.");
+    add("Snapshot: pen at the extreme (0.8+)", (r) => r.snap && (parseFloat(r.snap.aFat) >= 0.8 || parseFloat(r.snap.hFat) >= 0.8), "The range that used to be flattened by a hard clamp \u2014 every pen past ~163 weighted pitches scored exactly 1.00 before v2.7, so this band is newly visible.");
+    add("Snapshot: leverage arms unavailable (25%+)", (r) => r.snap && (parseFloat(r.snap.aOut) >= 0.25 || parseFloat(r.snap.hOut) >= 0.25), "WHICH arms are gone, as distinct from how hard the pen worked. A book prices aggregate workload; if there is an edge left in bullpens, the most likely place is here.");
+    add("Snapshot: rested pen (fatigue under -0.4)", (r) => r.snap && (parseFloat(r.snap.aFat) <= -0.4 && parseFloat(r.snap.hFat) <= -0.4), "The other end. The rest bonus is deliberately smaller than the fatigue penalty; this tests whether that asymmetry is right.");
     const withSnap = rows.filter((r) => r.snap).length;
     return { rows, all, otherEng, engine: engine || null, overall,
         splits: splits.sort((a, b) => Math.abs(b.gap || 0) - Math.abs(a.gap || 0)), withSnap };
@@ -11506,8 +11591,8 @@ function projectSlate(games, teams, dayKey, sims) {
         const homePark = parkForTeam(H.name);
         const r = projectGame({
             park: homePark, line, temp: g.wx ? g.wx.temp : null, windOut: g.wx ? g.wx.windOut : null,
-            awayOff: a.off, awayXoff: a.xoff, awayPA: a.pa, awayRecent: a.recent, awayRecentPA: a.recentPA, awayRecentBbk: a.recentBbk, awaySP: a.sp, awaySPbf: a.spBf, awaySPip: a.spIp, awaySPera: a.spEra, awayPen: a.pen, awayPenBf: a.penBf, awayPenBarrel: a.penBarrel, awayPenHardHit: a.penHardHit, awayPenFatigue: a.penFatigue, awayOAA: a.oaa, awayFraming: a.framing,
-            homeOff: h.off, homeXoff: h.xoff, homePA: h.pa, homeRecent: h.recent, homeRecentPA: h.recentPA, homeRecentBbk: h.recentBbk, homeSP: h.sp, homeSPbf: h.spBf, homeSPip: h.spIp, homeSPera: h.spEra, homePen: h.pen, homePenBf: h.penBf, homePenBarrel: h.penBarrel, homePenHardHit: h.penHardHit, homePenFatigue: h.penFatigue, homeOAA: h.oaa, homeFraming: h.framing,
+            awayOff: a.off, awayXoff: a.xoff, awayPA: a.pa, awayRecent: a.recent, awayRecentPA: a.recentPA, awayRecentBbk: a.recentBbk, awaySP: a.sp, awaySPbf: a.spBf, awaySPip: a.spIp, awaySPera: a.spEra, awayPen: a.pen, awayPenBf: a.penBf, awayPenBarrel: a.penBarrel, awayPenHardHit: a.penHardHit, awayPenFatigue: a.penFatigue, awayPenOutShare: a.penOutShare, awayOAA: a.oaa, awayFraming: a.framing,
+            homeOff: h.off, homeXoff: h.xoff, homePA: h.pa, homeRecent: h.recent, homeRecentPA: h.recentPA, homeRecentBbk: h.recentBbk, homeSP: h.sp, homeSPbf: h.spBf, homeSPip: h.spIp, homeSPera: h.spEra, homePen: h.pen, homePenBf: h.penBf, homePenBarrel: h.penBarrel, homePenHardHit: h.penHardHit, homePenFatigue: h.penFatigue, homePenOutShare: h.penOutShare, homeOAA: h.oaa, homeFraming: h.framing,
         }, sims || 8000);
         const pW = r.pOver / (r.pOver + r.pUnder);
         const dO = amToDec(over), dU = amToDec(under);
@@ -11540,6 +11625,7 @@ function projectSlate(games, teams, dayKey, sims) {
                 aLu: a.lu ? a.lu.source : null, hLu: h.lu ? h.lu.source : null,
                 aLuEst: a.lu ? a.lu.est : null, hLuEst: h.lu ? h.lu.est : null,
                 aFat: a.penFatigue ?? null, hFat: h.penFatigue ?? null,
+                aOut: a.penOutShare ?? null, hOut: h.penOutShare ?? null,
             },
         });
     }
@@ -15325,6 +15411,9 @@ const CSS = `
 .mr-adopt strong { font-size: 12.5px; color: var(--ink); }
 .mr-adopt p { font-size: 11px; color: var(--ink-dim); line-height: 1.45; margin-top: 3px; }
 .mr-adopt button { white-space: nowrap; }
+.pen-chip.out { background: rgba(232,115,79,0.12); border: 1px solid rgba(232,115,79,0.45); color: var(--rust); }
+.pen-out { font-size: 11px; color: var(--rust); line-height: 1.5; margin-top: 6px; padding-left: 9px; border-left: 2px solid rgba(232,115,79,0.4); }
+.pen-out b { color: var(--rust); }
 .miss-eng { font-size: 8.5px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--amber); border: 1px solid rgba(245,196,81,0.4); border-radius: 4px; padding: 1px 4px; margin-left: 6px; }
 .br-log-row.engine { border-left: 2px solid var(--amber); padding-left: 9px; }
 .fresh-audit-note.split-src { border-left: 2px solid var(--phos); padding-left: 9px; }
