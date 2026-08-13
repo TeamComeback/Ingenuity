@@ -13731,13 +13731,32 @@ function cortexHealth(teams, report, params, staleRecent, engHealth) {
                 gaps.push(`${r.label}: ${r.total - r.ok} ${r.unit} blank (±${r.impact.toFixed(2)} runs)`);
         }
         const fill = total ? ok / total : 0;
-        let note = total ? `${ok} of ${total} ${byKey[R.fields[0]] ? byKey[R.fields[0]].unit : "fields"} on file.` : "No teams saved yet.";
+        const perField = R.fields.map((f) => byKey[f]).filter(Boolean)
+            .map((r) => `${r.label.replace(/ \(.*\)/, "")} ${r.ok}/${r.total}`).join(" \u00B7 ");
+        let note = total ? `${Math.round((ok / total) * 100)}% of required inputs on file \u2014 ${perField}.` : "No teams saved yet.";
         if (R.key === "off" && staleRecent)
             gaps.push(`${staleRecent} team${staleRecent === 1 ? "" : "s"} on 14-day form older than a week`);
         return { ...R, fill, note, gaps };
     });
 }
 // ---- the visual -----------------------------------------------------------
+// Where each council agent sits relative to the cortex, what it watches, and
+// which way its signals travel. Data-in agents push into the brain; verdict
+// agents receive from it; the Historian closes the loop back to the Calibrator.
+const CORTEX_AGENTS = {
+    interpreter: { dir: [-0.88, 0.52, 0.70], anchor: 1, flow: "in" },
+    scout: { dir: [0.88, 0.52, 0.70], anchor: 0, flow: "in" },
+    scanner: { dir: [0.00, 0.98, -0.45], anchor: 4, flow: "in" },
+    calibrator: { dir: [0.00, -0.30, 1.20], anchor: 6, flow: "in" },
+    market: { dir: [1.08, -0.50, 0.15], anchor: 2, flow: "in" },
+    risk: { dir: [-1.08, -0.50, 0.15], anchor: 6, flow: "out" },
+    historian: { dir: [0.00, -0.92, -0.72], anchor: 6, flow: "out" },
+};
+const TONE_HEX = { ok: 0x34e6a8, warn: 0xf5c451, alert: 0xe8734f, idle: 0x7a998c };
+const TONE_CSS = { ok: "#34e6a8", warn: "#f5c451", alert: "#e8734f", idle: "#7a998c" };
+// How hard an agent fires: an alerting agent is genuinely busy, an idle one has
+// no feed to work from, so the pulse rate is the status rather than decoration.
+const TONE_RATE = { alert: 2.4, warn: 1.3, ok: 0.6, idle: 0.08 };
 let THREE_LOADING = null;
 function loadThree() {
     if (window.THREE)
@@ -13753,37 +13772,43 @@ function loadThree() {
     });
     return THREE_LOADING;
 }
-function ModelCortex({ health }) {
+function ModelCortex({ health, agents }) {
     const hostRef = React.useRef(null);
-    const [sel, setSel] = useState(-1);
-    const [mode, setMode] = useState("loading"); // loading | live | flat
-    const apiRef = React.useRef(null);
+    const [sel, setSel] = useState(null); // {kind:"engine"|"agent", i}
+    const [mode, setMode] = useState("loading");
+    const cleanupRef = React.useRef(null);
     const healthRef = React.useRef(health);
     healthRef.current = health;
     const selRef = React.useRef(sel);
     selRef.current = sel;
+    // Only the live agents that have a seat in the cortex, in pipeline order.
+    const council = useMemo(() => ["interpreter", "scout", "scanner", "calibrator", "market", "risk", "historian"]
+        .map((id) => (agents || []).find((a) => a.id === id))
+        .filter(Boolean), [agents]);
+    const councilRef = React.useRef(council);
+    councilRef.current = council;
     useEffect(() => {
         let dead = false, raf = 0, renderer = null;
         loadThree().then((THREE) => {
             if (dead || !hostRef.current)
                 return;
-            setMode("live");
             const host = hostRef.current;
-            const W = () => host.clientWidth || 320, H = () => 240;
+            setMode("live");
+            const W = () => host.clientWidth || 320, H = () => 300;
             const scene = new THREE.Scene();
             const camera = new THREE.PerspectiveCamera(46, W() / H(), 0.1, 100);
-            camera.position.set(0, 0.05, 4.0);
+            camera.position.set(0, 0.05, 5.2);
             renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
             renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
             renderer.setSize(W(), H());
             host.appendChild(renderer.domElement);
-            const brain = new THREE.Group();
-            scene.add(brain);
-            // --- point cloud shaped like a brain ---
+            const world = new THREE.Group();
+            scene.add(world);
+            // ---------------- cortex: engines -------------------------------
             const N = 900, P = new Float32Array(N * 3), reg = new Uint8Array(N);
             for (let i = 0; i < N; i++) {
                 let x, y, z;
-                if (i / N > 0.88) { // cerebellum lobe — carries the silhouette
+                if (i / N > 0.88) {
                     const u = Math.random() * Math.PI * 2, v = Math.acos(2 * Math.random() - 1), rr = 0.72 + 0.28 * Math.random();
                     x = Math.sin(v) * Math.cos(u) * 0.40 * rr;
                     y = -0.60 + Math.cos(v) * 0.24 * rr;
@@ -13801,18 +13826,27 @@ function ModelCortex({ health }) {
                     if (z < 0)
                         z *= 0.94;
                     if (Math.abs(x) < 0.10)
-                        x = (x >= 0 ? 1 : -1) * (0.10 + Math.random() * 0.05); // fissure
+                        x = (x >= 0 ? 1 : -1) * (0.10 + Math.random() * 0.05);
                 }
                 P[i * 3] = x; P[i * 3 + 1] = y; P[i * 3 + 2] = z;
                 let best = 0, bd = 1e9;
                 for (let k = 0; k < CORTEX_REGIONS.length; k++) {
                     const a = CORTEX_REGIONS[k].at;
-                    let d = (x - a[0]) ** 2 + (y - a[1]) ** 2 + (z - a[2]) ** 2;
-                    d /= CORTEX_REGIONS[k].share * 6;
+                    let d = ((x - a[0]) ** 2 + (y - a[1]) ** 2 + (z - a[2]) ** 2) / (CORTEX_REGIONS[k].share * 6);
                     if (d < bd) { bd = d; best = k; }
                 }
                 reg[i] = best;
             }
+            // region centroids — where an agent's tether lands
+            const cent = CORTEX_REGIONS.map(() => new THREE.Vector3());
+            const cN = new Array(CORTEX_REGIONS.length).fill(0);
+            for (let i = 0; i < N; i++) {
+                cent[reg[i]].x += P[i * 3];
+                cent[reg[i]].y += P[i * 3 + 1];
+                cent[reg[i]].z += P[i * 3 + 2];
+                cN[reg[i]]++;
+            }
+            cent.forEach((c, k) => { if (cN[k]) c.divideScalar(cN[k]); });
             const nodeCol = new Float32Array(N * 3);
             const nodeGeo = new THREE.BufferGeometry();
             nodeGeo.setAttribute("position", new THREE.BufferAttribute(P, 3));
@@ -13827,9 +13861,8 @@ function ModelCortex({ health }) {
             cx.fillStyle = gr;
             cx.fillRect(0, 0, 64, 64);
             const sprite = new THREE.CanvasTexture(cv);
-            brain.add(new THREE.Points(nodeGeo, new THREE.PointsMaterial({ size: 0.055, map: sprite, vertexColors: true,
+            world.add(new THREE.Points(nodeGeo, new THREE.PointsMaterial({ size: 0.05, map: sprite, vertexColors: true,
                 transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, sizeAttenuation: true })));
-            // --- wiring: nearest neighbours ---
             const edges = [], adj = [];
             for (let i = 0; i < N; i++)
                 adj.push([]);
@@ -13856,28 +13889,89 @@ function ModelCortex({ health }) {
             const E = edges.length, eP = new Float32Array(E * 6), eC = new Float32Array(E * 6), eReg = new Uint8Array(E);
             for (let i = 0; i < E; i++) {
                 const a = edges[i][0], b = edges[i][1];
-                eP[i * 6] = P[a * 3]; eP[i * 6 + 1] = P[a * 3 + 1]; eP[i * 6 + 2] = P[a * 3 + 2];
-                eP[i * 6 + 3] = P[b * 3]; eP[i * 6 + 4] = P[b * 3 + 1]; eP[i * 6 + 5] = P[b * 3 + 2];
+                for (let c = 0; c < 3; c++) {
+                    eP[i * 6 + c] = P[a * 3 + c];
+                    eP[i * 6 + 3 + c] = P[b * 3 + c];
+                }
                 eReg[i] = reg[a];
             }
             const eGeo = new THREE.BufferGeometry();
             eGeo.setAttribute("position", new THREE.BufferAttribute(eP, 3));
             eGeo.setAttribute("color", new THREE.BufferAttribute(eC, 3));
-            brain.add(new THREE.LineSegments(eGeo, new THREE.LineBasicMaterial({ vertexColors: true, transparent: true,
+            world.add(new THREE.LineSegments(eGeo, new THREE.LineBasicMaterial({ vertexColors: true, transparent: true,
                 opacity: 0.55, blending: THREE.AdditiveBlending, depthWrite: false })));
             const core = new THREE.Mesh(new THREE.SphereGeometry(0.10, 20, 20), new THREE.MeshBasicMaterial({ color: 0xd8e8e0, transparent: true, opacity: 0.9 }));
             const halo = new THREE.Mesh(new THREE.SphereGeometry(0.22, 20, 20), new THREE.MeshBasicMaterial({ color: 0x34e6a8, transparent: true,
                 opacity: 0.1, blending: THREE.AdditiveBlending, depthWrite: false }));
-            brain.add(core);
-            brain.add(halo);
-            // --- signals ---
+            world.add(core);
+            world.add(halo);
+            // ---------------- council: agents orbiting the cortex ------------
+            const A = councilRef.current;
+            const agentMesh = [], agentPos = [], agentAnchor = [], agentFlow = [];
+            const pickables = [];
+            A.forEach((ag, i) => {
+                const site = CORTEX_AGENTS[ag.id];
+                const p = new THREE.Vector3(site.dir[0], site.dir[1], site.dir[2]).multiplyScalar(1.62);
+                const m = new THREE.Mesh(new THREE.SphereGeometry(0.075, 16, 16), new THREE.MeshBasicMaterial({ color: 0x7a998c, transparent: true, opacity: 0.95 }));
+                m.position.copy(p);
+                m.userData.agentIndex = i;
+                world.add(m);
+                const g = new THREE.Mesh(new THREE.SphereGeometry(0.17, 16, 16), new THREE.MeshBasicMaterial({ color: 0x7a998c, transparent: true,
+                    opacity: 0.12, blending: THREE.AdditiveBlending, depthWrite: false }));
+                g.position.copy(p);
+                world.add(g);
+                // generous invisible hit target — these are small on a phone
+                const hit = new THREE.Mesh(new THREE.SphereGeometry(0.30, 8, 8), new THREE.MeshBasicMaterial({ visible: false }));
+                hit.position.copy(p);
+                hit.userData.agentIndex = i;
+                world.add(hit);
+                pickables.push(hit);
+                agentMesh.push({ core: m, glow: g });
+                agentPos.push(p);
+                agentAnchor.push(site.anchor);
+                agentFlow.push(site.flow);
+            });
+            // tethers: agent → the region it watches
+            const T = A.length;
+            const tP = new Float32Array(T * 6), tC = new Float32Array(T * 6);
+            A.forEach((ag, i) => {
+                const p = agentPos[i], c = cent[agentAnchor[i]];
+                tP[i * 6] = p.x; tP[i * 6 + 1] = p.y; tP[i * 6 + 2] = p.z;
+                tP[i * 6 + 3] = c.x; tP[i * 6 + 4] = c.y; tP[i * 6 + 5] = c.z;
+            });
+            const tGeo = new THREE.BufferGeometry();
+            tGeo.setAttribute("position", new THREE.BufferAttribute(tP, 3));
+            tGeo.setAttribute("color", new THREE.BufferAttribute(tC, 3));
+            world.add(new THREE.LineSegments(tGeo, new THREE.LineBasicMaterial({ vertexColors: true, transparent: true,
+                opacity: 0.45, blending: THREE.AdditiveBlending, depthWrite: false })));
+            // the feedback loop: Historian's record is what the Calibrator learns from
+            const iHist = A.findIndex((a) => a.id === "historian"), iCal = A.findIndex((a) => a.id === "calibrator");
+            let loopCurve = null;
+            if (iHist >= 0 && iCal >= 0) {
+                const mid = agentPos[iHist].clone().add(agentPos[iCal]).multiplyScalar(0.5).multiplyScalar(1.75);
+                loopCurve = new THREE.QuadraticBezierCurve3(agentPos[iHist], mid, agentPos[iCal]);
+                const pts = loopCurve.getPoints(40);
+                const lg = new THREE.BufferGeometry().setFromPoints(pts);
+                world.add(new THREE.Line(lg, new THREE.LineBasicMaterial({ color: 0x1a7a5c, transparent: true, opacity: 0.5 })));
+            }
+            // ---------------- signals ---------------------------------------
             const SIG = 300, sig = [], sP = new Float32Array(SIG * 3), sC = new Float32Array(SIG * 3);
             for (let i = 0; i < SIG; i++)
                 sig.push({ live: false, a: 0, b: 0, t: 0, sp: 1, col: new THREE.Color() });
             const sGeo = new THREE.BufferGeometry();
             sGeo.setAttribute("position", new THREE.BufferAttribute(sP, 3));
             sGeo.setAttribute("color", new THREE.BufferAttribute(sC, 3));
-            brain.add(new THREE.Points(sGeo, new THREE.PointsMaterial({ size: 0.10, map: sprite, vertexColors: true,
+            world.add(new THREE.Points(sGeo, new THREE.PointsMaterial({ size: 0.095, map: sprite, vertexColors: true,
+                transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, sizeAttenuation: true })));
+            // agent traffic rides the tethers and the feedback arc
+            const AP = 140, apk = [], apP = new Float32Array(AP * 3), apC = new Float32Array(AP * 3);
+            const v3 = new THREE.Vector3();
+            for (let i = 0; i < AP; i++)
+                apk.push({ live: false, from: new THREE.Vector3(), to: new THREE.Vector3(), t: 0, sp: 1, col: new THREE.Color(), loop: false });
+            const apGeo = new THREE.BufferGeometry();
+            apGeo.setAttribute("position", new THREE.BufferAttribute(apP, 3));
+            apGeo.setAttribute("color", new THREE.BufferAttribute(apC, 3));
+            world.add(new THREE.Points(apGeo, new THREE.PointsMaterial({ size: 0.13, map: sprite, vertexColors: true,
                 transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, sizeAttenuation: true })));
             const byRegion = CORTEX_REGIONS.map(() => []);
             for (let i = 0; i < N; i++)
@@ -13907,26 +14001,70 @@ function ModelCortex({ health }) {
                     return;
                 }
             };
-            // --- interaction ---
+            const fireAgent = (i, hex, loop) => {
+                for (let q = 0; q < AP; q++) {
+                    if (apk[q].live)
+                        continue;
+                    const inbound = agentFlow[i] === "in";
+                    apk[q].live = true; apk[q].t = 0; apk[q].sp = 0.55 + Math.random() * 0.35;
+                    apk[q].loop = !!loop;
+                    apk[q].agent = i;
+                    if (loop) {
+                        apk[q].from.copy(agentPos[iHist]);
+                        apk[q].to.copy(agentPos[iCal]);
+                    }
+                    else if (inbound) {
+                        apk[q].from.copy(agentPos[i]);
+                        apk[q].to.copy(cent[agentAnchor[i]]);
+                    }
+                    else {
+                        apk[q].from.copy(cent[agentAnchor[i]]);
+                        apk[q].to.copy(agentPos[i]);
+                    }
+                    apk[q].col.setHex(hex);
+                    return;
+                }
+            };
+            // ---------------- interaction -----------------------------------
             let rotX = 0, rotY = 0, vel = 0.0016, drag = false, lx = 0, ly = 0, moved = 0;
             const el = renderer.domElement;
             el.style.touchAction = "none";
-            el.addEventListener("pointerdown", (e) => { drag = true; lx = e.clientX; ly = e.clientY; moved = 0; });
+            const ray = new THREE.Raycaster(), ndc = new THREE.Vector2();
+            const onDown = (e) => { drag = true; lx = e.clientX; ly = e.clientY; moved = 0; };
             const onMove = (e) => {
                 if (!drag)
                     return;
                 moved += Math.abs(e.clientX - lx) + Math.abs(e.clientY - ly);
                 rotY += (e.clientX - lx) * 0.006;
                 rotX = Math.max(-1.1, Math.min(1.1, rotX + (e.clientY - ly) * 0.005));
-                vel = (e.clientX - lx) * 0.0006; lx = e.clientX; ly = e.clientY;
+                vel = (e.clientX - lx) * 0.0006;
+                lx = e.clientX; ly = e.clientY;
             };
-            const onUp = () => { drag = false; };
+            const onUp = (e) => {
+                if (drag && moved < 6 && e.target === el) { // a tap, not a drag
+                    const r = el.getBoundingClientRect();
+                    ndc.x = ((e.clientX - r.left) / r.width) * 2 - 1;
+                    ndc.y = -((e.clientY - r.top) / r.height) * 2 + 1;
+                    ray.setFromCamera(ndc, camera);
+                    const hits = ray.intersectObjects(pickables, false);
+                    if (hits.length) {
+                        const i = hits[0].object.userData.agentIndex;
+                        setSel((s) => (s && s.kind === "agent" && s.i === i ? null : { kind: "agent", i }));
+                    }
+                    else
+                        setSel(null);
+                }
+                drag = false;
+            };
+            el.addEventListener("pointerdown", onDown);
             addEventListener("pointermove", onMove);
             addEventListener("pointerup", onUp);
-            addEventListener("pointercancel", onUp);
+            addEventListener("pointercancel", () => { drag = false; });
             const act = new Float32Array(CORTEX_REGIONS.length);
+            const aAct = new Float32Array(Math.max(1, T));
             const tmp = new THREE.Color();
             const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+            const clock = { t: 0 };
             let last = performance.now();
             const loop = (now) => {
                 if (dead)
@@ -13934,18 +14072,46 @@ function ModelCortex({ health }) {
                 raf = requestAnimationFrame(loop);
                 const dt = Math.min(0.05, (now - last) / 1000);
                 last = now;
-                const hs = healthRef.current, s = selRef.current;
+                clock.t += dt;
+                const hs = healthRef.current, cl = councilRef.current, s = selRef.current;
+                const selEng = s && s.kind === "engine" ? s.i : -1;
+                const selAg = s && s.kind === "agent" ? s.i : -1;
+                // engine activity = coverage, unless something is pinned
                 for (let k = 0; k < CORTEX_REGIONS.length; k++) {
                     const f = hs[k] ? hs[k].fill : 0.5;
-                    const want = s < 0 ? 0.12 + 0.88 * f : (k === s ? Math.max(0.5, f) : 0.06);
+                    let want = 0.12 + 0.88 * f;
+                    if (selEng >= 0)
+                        want = k === selEng ? Math.max(0.5, f) : 0.05;
+                    else if (selAg >= 0)
+                        want = k === agentAnchor[selAg] ? Math.max(0.55, f) : 0.05;
                     act[k] += (want - act[k]) * Math.min(1, dt * 3.2);
                 }
-                if (!reduce)
+                // agent activity = its live tone
+                for (let i = 0; i < T; i++) {
+                    const tone = (cl[i] && cl[i].tone) || "idle";
+                    let want = tone === "alert" ? 1 : tone === "warn" ? 0.75 : tone === "ok" ? 0.5 : 0.16;
+                    if (selAg >= 0)
+                        want = i === selAg ? 1 : 0.08;
+                    else if (selEng >= 0)
+                        want = agentAnchor[i] === selEng ? want : 0.08;
+                    aAct[i] += (want - aAct[i]) * Math.min(1, dt * 3.2);
+                }
+                if (!reduce) {
                     for (let i = 0; i < 10; i++) {
-                        const k = s >= 0 ? s : (Math.random() * CORTEX_REGIONS.length) | 0;
+                        const k = selEng >= 0 ? selEng : (Math.random() * CORTEX_REGIONS.length) | 0;
                         if (Math.random() < act[k])
-                            fire(k); // firing rate IS the coverage rate
+                            fire(k);
                     }
+                    for (let i = 0; i < T; i++) {
+                        const tone = (cl[i] && cl[i].tone) || "idle";
+                        const rate = TONE_RATE[tone] || 0.2;
+                        if (Math.random() < rate * dt * (0.35 + aAct[i]))
+                            fireAgent(i, TONE_HEX[tone] || TONE_HEX.idle, false);
+                    }
+                    if (loopCurve && Math.random() < 0.35 * dt)
+                        fireAgent(iHist, 0x34e6a8, true);
+                }
+                // move cortex signals
                 for (let i = 0; i < SIG; i++) {
                     const g = sig[i];
                     if (!g.live) { sP[i * 3 + 2] = -999; sC[i * 3] = sC[i * 3 + 1] = sC[i * 3 + 2] = 0; continue; }
@@ -13963,6 +14129,23 @@ function ModelCortex({ health }) {
                 }
                 sGeo.attributes.position.needsUpdate = true;
                 sGeo.attributes.color.needsUpdate = true;
+                // move agent traffic
+                for (let i = 0; i < AP; i++) {
+                    const g = apk[i];
+                    if (!g.live) { apP[i * 3 + 2] = -999; apC[i * 3] = apC[i * 3 + 1] = apC[i * 3 + 2] = 0; continue; }
+                    g.t += dt * g.sp;
+                    if (g.t >= 1) { g.live = false; continue; }
+                    if (g.loop && loopCurve)
+                        loopCurve.getPoint(g.t, v3);
+                    else
+                        v3.copy(g.from).lerp(g.to, g.t);
+                    apP[i * 3] = v3.x; apP[i * 3 + 1] = v3.y; apP[i * 3 + 2] = v3.z;
+                    const dim = g.loop ? 1 : (0.25 + 0.75 * aAct[g.agent]);
+                    apC[i * 3] = g.col.r * dim; apC[i * 3 + 1] = g.col.g * dim; apC[i * 3 + 2] = g.col.b * dim;
+                }
+                apGeo.attributes.position.needsUpdate = true;
+                apGeo.attributes.color.needsUpdate = true;
+                // recolor cortex
                 for (let i = 0; i < N; i++) {
                     const a = 0.10 + 0.90 * act[reg[i]];
                     tmp.setHex(CORTEX_REGIONS[reg[i]].hex);
@@ -13977,31 +14160,52 @@ function ModelCortex({ health }) {
                     eC[i * 6 + 2] = eC[i * 6 + 5] = tmp.b * a;
                 }
                 eGeo.attributes.color.needsUpdate = true;
-                const beat = 0.9 + 0.08 * Math.sin(now * 0.003);
-                core.scale.setScalar(0.7 + 0.6 * act[6] * beat);
-                halo.scale.setScalar(0.8 + 1.5 * act[6] * beat);
+                // agents + tethers wear their tone
+                for (let i = 0; i < T; i++) {
+                    const tone = (cl[i] && cl[i].tone) || "idle";
+                    const hex = TONE_HEX[tone] || TONE_HEX.idle;
+                    tmp.setHex(hex);
+                    const beat = tone === "alert" ? 0.75 + 0.35 * Math.sin(clock.t * 7)
+                        : tone === "warn" ? 0.8 + 0.22 * Math.sin(clock.t * 3.2)
+                            : 0.85 + 0.12 * Math.sin(clock.t * 1.4);
+                    const m = agentMesh[i];
+                    m.core.material.color.setHex(hex);
+                    m.core.material.opacity = 0.25 + 0.72 * aAct[i] * beat;
+                    m.core.scale.setScalar(0.7 + 0.55 * aAct[i] * beat);
+                    m.glow.material.color.setHex(hex);
+                    m.glow.material.opacity = 0.04 + 0.24 * aAct[i] * beat;
+                    m.glow.scale.setScalar(0.75 + 0.9 * aAct[i]);
+                    const ta = 0.05 + 0.4 * aAct[i];
+                    tC[i * 6] = tC[i * 6 + 3] = tmp.r * ta;
+                    tC[i * 6 + 1] = tC[i * 6 + 4] = tmp.g * ta;
+                    tC[i * 6 + 2] = tC[i * 6 + 5] = tmp.b * ta;
+                }
+                tGeo.attributes.color.needsUpdate = true;
+                const cb = 0.9 + 0.08 * Math.sin(clock.t * 3);
+                core.scale.setScalar(0.7 + 0.6 * act[6] * cb);
+                halo.scale.setScalar(0.8 + 1.5 * act[6] * cb);
                 halo.material.opacity = 0.05 + 0.22 * act[6];
                 core.material.opacity = 0.35 + 0.6 * act[6];
                 if (!drag) { rotY += vel; vel += (0.0016 - vel) * 0.02; }
-                brain.rotation.y = rotY;
-                brain.rotation.x = rotX;
+                world.rotation.y = rotY;
+                world.rotation.x = rotX;
                 renderer.render(scene, camera);
             };
             raf = requestAnimationFrame(loop);
             const onResize = () => { if (!dead) { camera.aspect = W() / H(); camera.updateProjectionMatrix(); renderer.setSize(W(), H()); } };
             addEventListener("resize", onResize);
-            apiRef.current = () => {
+            cleanupRef.current = () => {
+                el.removeEventListener("pointerdown", onDown);
                 removeEventListener("pointermove", onMove);
                 removeEventListener("pointerup", onUp);
-                removeEventListener("pointercancel", onUp);
                 removeEventListener("resize", onResize);
             };
         }).catch(() => { if (!dead) setMode("flat"); });
         return () => {
             dead = true;
             cancelAnimationFrame(raf);
-            if (apiRef.current)
-                apiRef.current();
+            if (cleanupRef.current)
+                cleanupRef.current();
             if (renderer) {
                 renderer.dispose();
                 if (renderer.domElement && renderer.domElement.parentNode)
@@ -14009,30 +14213,46 @@ function ModelCortex({ health }) {
             }
         };
     }, []);
-    const shown = sel >= 0 ? health[sel] : null;
+    const engine = sel && sel.kind === "engine" ? health[sel.i] : null;
+    const agent = sel && sel.kind === "agent" ? council[sel.i] : null;
     const blind = health.filter((h) => h.fill < 0.999 && h.fields.length).length;
+    const loud = council.filter((a) => a.tone === "alert" || a.tone === "warn").length;
     return (React.createElement("section", { className: "cortex" },
         React.createElement("div", { className: "cortex-head" },
             React.createElement("h2", { className: "lg-formtitle" }, "Model cortex"),
-            React.createElement("span", { className: "ing-hint", style: { margin: 0 } }, "Each region is an engine, and its brightness is its real coverage \u2014 a dim region is one the model is filling with league average. Drag to rotate; tap a region to read its numbers.")),
-        mode === "live" && React.createElement("div", { className: "cortex-stage", ref: hostRef }),
-        mode === "loading" && React.createElement("div", { className: "cortex-stage loading" }, "building cortex\u2026"),
-        mode === "flat" && React.createElement("div", { className: "cortex-stage loading" }, "3D view needs a connection \u2014 the numbers below are live either way."),
-        React.createElement("div", { className: "cortex-chips" }, health.map((h, k) => React.createElement("button", { key: h.key, className: "cortex-chip" + (sel === k ? " on" : ""),
+            React.createElement("span", { className: "ing-hint", style: { margin: 0 } }, "Inside the brain, each region is an engine and its brightness is its real coverage. Around it, the seven council agents pulse at whatever their live status is \u2014 tethered to whatever they watch. Drag to rotate; tap an agent or a chip to read it.")),
+        React.createElement("div", { className: "cortex-stage", ref: hostRef }, mode !== "live" && React.createElement("span", { className: "cortex-veil" }, mode === "loading"
+            ? "building cortex\u2026"
+            : "3D view needs a connection \u2014 the numbers below are live either way.")),
+        React.createElement("div", { className: "cortex-rowlabel" }, "Engines \u00B7 brightness = coverage"),
+        React.createElement("div", { className: "cortex-chips" }, health.map((h, k) => React.createElement("button", { key: h.key,
+            className: "cortex-chip" + (sel && sel.kind === "engine" && sel.i === k ? " on" : ""),
             style: { color: h.css, opacity: 0.45 + 0.55 * h.fill },
-            onClick: () => setSel(sel === k ? -1 : k) },
+            onClick: () => setSel(sel && sel.kind === "engine" && sel.i === k ? null : { kind: "engine", i: k }) },
             React.createElement("u", null),
             h.name,
             React.createElement("b", null, Math.round(h.fill * 100) + "%")))),
-        React.createElement("div", { className: "cortex-read" }, shown
+        React.createElement("div", { className: "cortex-rowlabel" }, "Council \u00B7 pulse = live status"),
+        React.createElement("div", { className: "cortex-chips" }, council.map((a, i) => React.createElement("button", { key: a.id,
+            className: "cortex-chip" + (sel && sel.kind === "agent" && sel.i === i ? " on" : ""),
+            style: { color: TONE_CSS[a.tone] || TONE_CSS.idle },
+            onClick: () => setSel(sel && sel.kind === "agent" && sel.i === i ? null : { kind: "agent", i }) },
+            React.createElement("u", null),
+            a.glyph + " " + a.name,
+            React.createElement("b", null, a.status)))),
+        React.createElement("div", { className: "cortex-read" }, engine
             ? React.createElement(React.Fragment, null,
-                React.createElement("strong", { style: { color: shown.css } }, shown.name),
-                React.createElement("p", null, shown.role),
-                React.createElement("p", { className: "cortex-note" }, shown.note),
-                shown.gaps.length > 0 && React.createElement("ul", { className: "cortex-gaps" }, shown.gaps.map((g, i) => React.createElement("li", { key: i }, g))))
-            : React.createElement("p", null, blind
-                ? `${blind} of the six input engines are running with gaps. Tap one to see what's missing and what the blank costs.`
-                : "Every input engine is fully covered. The model isn't substituting league average anywhere."))));
+                React.createElement("strong", { style: { color: engine.css } }, engine.name),
+                React.createElement("p", null, engine.role),
+                React.createElement("p", { className: "cortex-note" }, engine.note),
+                engine.gaps.length > 0 && React.createElement("ul", { className: "cortex-gaps" }, engine.gaps.map((g, i) => React.createElement("li", { key: i }, g))))
+            : agent
+                ? React.createElement(React.Fragment, null,
+                    React.createElement("strong", { style: { color: TONE_CSS[agent.tone] || TONE_CSS.idle } }, agent.glyph + " " + agent.name),
+                    React.createElement("p", null, agent.role),
+                    React.createElement("p", { className: "cortex-note" }, agent.read),
+                    React.createElement("p", { className: "cortex-watch" }, "Watching \u2192 " + CORTEX_REGIONS[(CORTEX_AGENTS[agent.id] || { anchor: 6 }).anchor].name))
+                : React.createElement("p", null, `${blind ? `${blind} of the six input engines have gaps. ` : "Every input engine is fully covered. "}${loud ? `${loud} agent${loud === 1 ? " is" : "s are"} flagging something.` : "No agent is flagging anything right now."}`))));
 }
 
 function Brain({ onHome }) {
@@ -14328,7 +14548,7 @@ Respond ONLY with JSON, no markdown fences, exactly this shape:
                 React.createElement("div", { className: "lg-stat" },
                     React.createElement("span", { className: "lg-stat-val" }, leans.length ? `${leanHits}–${leans.length - leanHits}` : "—"),
                     React.createElement("span", { className: "lg-stat-label" }, "ledger lean record"))),
-            React.createElement(ModelCortex, { health: cortexRows }),
+            React.createElement(ModelCortex, { health: cortexRows, agents: agents }),
             React.createElement("section", { className: "br-council" },
                 React.createElement("div", { className: "br-council-head" },
                     React.createElement("h2", { className: "lg-formtitle" }, "Agent council"),
@@ -15998,7 +16218,7 @@ const CSS = `
 /* ---- model cortex (3D pipeline view) ---- */
 .cortex { margin-bottom: 22px; }
 .cortex-head { margin-bottom: 12px; }
-.cortex-stage { width: 100%; height: 240px; border: 1px solid var(--line); border-radius: 12px; background: radial-gradient(ellipse 70% 60% at 50% 40%, rgba(52,230,168,0.07), transparent 70%), var(--field); overflow: hidden; position: relative; }
+.cortex-stage { width: 100%; height: 300px; border: 1px solid var(--line); border-radius: 12px; background: radial-gradient(ellipse 70% 60% at 50% 40%, rgba(52,230,168,0.07), transparent 70%), var(--field); overflow: hidden; position: relative; }
 .cortex-stage.loading { display: flex; align-items: center; justify-content: center; font-family: 'Archivo'; font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-dim); text-align: center; padding: 0 24px; }
 .cortex-stage canvas { display: block; }
 .cortex-chips { display: flex; gap: 6px; overflow-x: auto; margin-top: 10px; padding-bottom: 2px; scrollbar-width: none; }
@@ -16014,6 +16234,10 @@ const CSS = `
 .cortex-gaps { margin: 8px 0 0; padding-left: 15px; display: flex; flex-direction: column; gap: 5px; }
 .cortex-gaps li { font-size: 11px; color: var(--amber); line-height: 1.5; }
 @media (prefers-reduced-motion: reduce) { .cortex-stage { opacity: 0.95; } }
+.cortex-rowlabel { font-family: 'Archivo'; font-size: 8.5px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-dim); margin: 12px 0 6px; }
+.cortex-read p.cortex-watch { font-family: 'Archivo'; font-size: 9px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-dim); margin-top: 8px; }
+.cortex-chip b { text-transform: none; letter-spacing: 0; }
+.cortex-veil { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; text-align: center; padding: 0 24px; font-family: 'Archivo'; font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-dim); pointer-events: none; }
 `;
 // ---- mount ----
 ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
