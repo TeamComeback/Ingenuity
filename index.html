@@ -13671,9 +13671,374 @@ function SelfCheck() {
                                     ? "Your overrides are outperforming your agreements. Worth understanding what you are seeing that the model isn't."
                                     : "Your agreements are outperforming your overrides \u2014 evidence for trusting the model's side rather than talking yourself off it."))))));
 }
+// ===========================================================================
+// MODEL CORTEX — the pipeline as a brain, lit by the data actually on file.
+// Not decoration: each region's brightness and firing rate IS its coverage
+// percentage from coverageReport(), so a region that looks dim is a region
+// the model is genuinely flying blind in. Tap one to read the real numbers.
+// Falls back to a plain text panel with the same figures if three.js can't
+// load (offline), so nothing is lost — only the picture.
+// ===========================================================================
+const CORTEX_REGIONS = [
+    { key: "off", name: "Offense", hex: 0x34e6a8, css: "#34e6a8", at: [0.62, 0.30, 0.72], share: 0.16,
+        fields: ["off", "xoff", "splits", "recentform"],
+        role: "wOBA blended with xwOBA at 55%, platoon-nudged, regressed at ~200 PA." },
+    { key: "sp", name: "Starter", hex: 0x5fd9e8, css: "#5fd9e8", at: [-0.62, 0.30, 0.72], share: 0.15,
+        fields: ["rotation", "hands"],
+        role: "xwOBA 70% with an ERA-derived read at 30%, split across three times-through-order stretches." },
+    { key: "pen", name: "Bullpen", hex: 0xf5c451, css: "#f5c451", at: [0.72, -0.10, -0.28], share: 0.14,
+        fields: ["pen", "penContact"],
+        role: "Contact-quality rating regressed at ~200 BF, then penalized by the fatigue score from recent usage." },
+    { key: "def", name: "Defense", hex: 0xcae9f1, css: "#cae9f1", at: [-0.72, -0.10, -0.28], share: 0.12,
+        fields: ["oaa", "framing"],
+        role: "OAA plus catcher framing become one field factor, applied to the opposing lineup." },
+    { key: "park", name: "Park & weather", hex: 0xe3bc6a, css: "#e3bc6a", at: [0.00, 0.62, -0.20], share: 0.11,
+        fields: [], role: "Venue run multiplier times a temperature and wind boost, capped at +6%." },
+    { key: "env", name: "Run environment", hex: 0xe8734f, css: "#e8734f", at: [0.00, -0.62, 0.20], share: 0.13,
+        fields: [], role: "One shared draw handed to both sides before either rolls runs — the layer that correlates the two team totals." },
+    { key: "core", name: "Monte Carlo core", hex: 0xd8e8e0, css: "#d8e8e0", at: [0.00, 0.00, 0.00], share: 0.19,
+        fields: [], role: "20,000 games per matchup: Poisson runs, the skipped bottom 9th, extras with a ghost runner." },
+];
+// Turn the coverage report into per-region health the visual can read.
+function cortexHealth(teams, report, params, staleRecent, engHealth) {
+    const byKey = {};
+    for (const r of (report.rows || []))
+        byKey[r.key] = r;
+    return CORTEX_REGIONS.map((R) => {
+        if (R.key === "park")
+            return { ...R, fill: 1, note: "Built in — park table ships with the model; weather comes from the slate.", gaps: [] };
+        if (R.key === "env") {
+            const tuned = ["OVERDISP_SHAPE_GAME", "OVERDISP_SHAPE_SIDE", "RUN_ENV_CAL", "HOME_ADV"].filter((k) => params && params[k] != null);
+            return { ...R, fill: 1, gaps: [],
+                note: tuned.length ? `${tuned.length} of its constants tuned away from default.` : "Running on default constants." };
+        }
+        if (R.key === "core") {
+            const f = engHealth.n ? Math.max(0.25, Math.min(1, 1 - Math.abs(engHealth.bias || 0) / 2)) : 0.6;
+            return { ...R, fill: f, gaps: [],
+                note: engHealth.n
+                    ? `${engHealth.n} graded games on this engine · bias ${engHealth.bias > 0 ? "+" : ""}${(engHealth.bias || 0).toFixed(2)} runs.`
+                    : "No graded games on this engine yet — nothing to calibrate against." };
+        }
+        let ok = 0, total = 0;
+        const gaps = [];
+        for (const f of R.fields) {
+            const r = byKey[f];
+            if (!r || !r.total)
+                continue;
+            ok += r.ok;
+            total += r.total;
+            if (r.ok < r.total)
+                gaps.push(`${r.label}: ${r.total - r.ok} ${r.unit} blank (±${r.impact.toFixed(2)} runs)`);
+        }
+        const fill = total ? ok / total : 0;
+        let note = total ? `${ok} of ${total} ${byKey[R.fields[0]] ? byKey[R.fields[0]].unit : "fields"} on file.` : "No teams saved yet.";
+        if (R.key === "off" && staleRecent)
+            gaps.push(`${staleRecent} team${staleRecent === 1 ? "" : "s"} on 14-day form older than a week`);
+        return { ...R, fill, note, gaps };
+    });
+}
+// ---- the visual -----------------------------------------------------------
+let THREE_LOADING = null;
+function loadThree() {
+    if (window.THREE)
+        return Promise.resolve(window.THREE);
+    if (THREE_LOADING)
+        return THREE_LOADING;
+    THREE_LOADING = new Promise((res, rej) => {
+        const s = document.createElement("script");
+        s.src = "https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js";
+        s.onload = () => res(window.THREE);
+        s.onerror = () => rej(new Error("three.js unavailable"));
+        document.head.appendChild(s);
+    });
+    return THREE_LOADING;
+}
+function ModelCortex({ health }) {
+    const hostRef = React.useRef(null);
+    const [sel, setSel] = useState(-1);
+    const [mode, setMode] = useState("loading"); // loading | live | flat
+    const apiRef = React.useRef(null);
+    const healthRef = React.useRef(health);
+    healthRef.current = health;
+    const selRef = React.useRef(sel);
+    selRef.current = sel;
+    useEffect(() => {
+        let dead = false, raf = 0, renderer = null;
+        loadThree().then((THREE) => {
+            if (dead || !hostRef.current)
+                return;
+            setMode("live");
+            const host = hostRef.current;
+            const W = () => host.clientWidth || 320, H = () => 240;
+            const scene = new THREE.Scene();
+            const camera = new THREE.PerspectiveCamera(46, W() / H(), 0.1, 100);
+            camera.position.set(0, 0.05, 4.0);
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+            renderer.setSize(W(), H());
+            host.appendChild(renderer.domElement);
+            const brain = new THREE.Group();
+            scene.add(brain);
+            // --- point cloud shaped like a brain ---
+            const N = 900, P = new Float32Array(N * 3), reg = new Uint8Array(N);
+            for (let i = 0; i < N; i++) {
+                let x, y, z;
+                if (i / N > 0.88) { // cerebellum lobe — carries the silhouette
+                    const u = Math.random() * Math.PI * 2, v = Math.acos(2 * Math.random() - 1), rr = 0.72 + 0.28 * Math.random();
+                    x = Math.sin(v) * Math.cos(u) * 0.40 * rr;
+                    y = -0.60 + Math.cos(v) * 0.24 * rr;
+                    z = -0.86 + Math.sin(v) * Math.sin(u) * 0.30 * rr;
+                }
+                else {
+                    const t = Math.random() * Math.PI * 2, p = Math.acos(2 * Math.random() - 1);
+                    let r = 0.80 + 0.20 * Math.random();
+                    r *= 1 + 0.07 * Math.sin(7 * t) * Math.sin(5 * p) + 0.04 * Math.sin(11 * p);
+                    x = Math.sin(p) * Math.cos(t) * 0.98 * r;
+                    y = Math.cos(p) * 0.86 * r;
+                    z = Math.sin(p) * Math.sin(t) * 1.24 * r;
+                    if (y < 0)
+                        y *= 0.82;
+                    if (z < 0)
+                        z *= 0.94;
+                    if (Math.abs(x) < 0.10)
+                        x = (x >= 0 ? 1 : -1) * (0.10 + Math.random() * 0.05); // fissure
+                }
+                P[i * 3] = x; P[i * 3 + 1] = y; P[i * 3 + 2] = z;
+                let best = 0, bd = 1e9;
+                for (let k = 0; k < CORTEX_REGIONS.length; k++) {
+                    const a = CORTEX_REGIONS[k].at;
+                    let d = (x - a[0]) ** 2 + (y - a[1]) ** 2 + (z - a[2]) ** 2;
+                    d /= CORTEX_REGIONS[k].share * 6;
+                    if (d < bd) { bd = d; best = k; }
+                }
+                reg[i] = best;
+            }
+            const nodeCol = new Float32Array(N * 3);
+            const nodeGeo = new THREE.BufferGeometry();
+            nodeGeo.setAttribute("position", new THREE.BufferAttribute(P, 3));
+            nodeGeo.setAttribute("color", new THREE.BufferAttribute(nodeCol, 3));
+            const cv = document.createElement("canvas");
+            cv.width = cv.height = 64;
+            const cx = cv.getContext("2d");
+            const gr = cx.createRadialGradient(32, 32, 0, 32, 32, 32);
+            gr.addColorStop(0, "rgba(255,255,255,1)");
+            gr.addColorStop(0.35, "rgba(255,255,255,0.5)");
+            gr.addColorStop(1, "rgba(255,255,255,0)");
+            cx.fillStyle = gr;
+            cx.fillRect(0, 0, 64, 64);
+            const sprite = new THREE.CanvasTexture(cv);
+            brain.add(new THREE.Points(nodeGeo, new THREE.PointsMaterial({ size: 0.055, map: sprite, vertexColors: true,
+                transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, sizeAttenuation: true })));
+            // --- wiring: nearest neighbours ---
+            const edges = [], adj = [];
+            for (let i = 0; i < N; i++)
+                adj.push([]);
+            for (let i = 0; i < N; i++) {
+                const bi = [-1, -1, -1], bd = [1e9, 1e9, 1e9];
+                const ax = P[i * 3], ay = P[i * 3 + 1], az = P[i * 3 + 2];
+                for (let j = 0; j < N; j++) {
+                    if (j === i)
+                        continue;
+                    const d = (P[j * 3] - ax) ** 2 + (P[j * 3 + 1] - ay) ** 2 + (P[j * 3 + 2] - az) ** 2;
+                    if (d < bd[0]) { bd[2] = bd[1]; bi[2] = bi[1]; bd[1] = bd[0]; bi[1] = bi[0]; bd[0] = d; bi[0] = j; }
+                    else if (d < bd[1]) { bd[2] = bd[1]; bi[2] = bi[1]; bd[1] = d; bi[1] = j; }
+                    else if (d < bd[2]) { bd[2] = d; bi[2] = j; }
+                }
+                for (let k = 0; k < 3; k++) {
+                    if (bi[k] < 0)
+                        continue;
+                    if (bi[k] > i)
+                        edges.push([i, bi[k]]);
+                    adj[i].push(bi[k]);
+                    adj[bi[k]].push(i);
+                }
+            }
+            const E = edges.length, eP = new Float32Array(E * 6), eC = new Float32Array(E * 6), eReg = new Uint8Array(E);
+            for (let i = 0; i < E; i++) {
+                const a = edges[i][0], b = edges[i][1];
+                eP[i * 6] = P[a * 3]; eP[i * 6 + 1] = P[a * 3 + 1]; eP[i * 6 + 2] = P[a * 3 + 2];
+                eP[i * 6 + 3] = P[b * 3]; eP[i * 6 + 4] = P[b * 3 + 1]; eP[i * 6 + 5] = P[b * 3 + 2];
+                eReg[i] = reg[a];
+            }
+            const eGeo = new THREE.BufferGeometry();
+            eGeo.setAttribute("position", new THREE.BufferAttribute(eP, 3));
+            eGeo.setAttribute("color", new THREE.BufferAttribute(eC, 3));
+            brain.add(new THREE.LineSegments(eGeo, new THREE.LineBasicMaterial({ vertexColors: true, transparent: true,
+                opacity: 0.55, blending: THREE.AdditiveBlending, depthWrite: false })));
+            const core = new THREE.Mesh(new THREE.SphereGeometry(0.10, 20, 20), new THREE.MeshBasicMaterial({ color: 0xd8e8e0, transparent: true, opacity: 0.9 }));
+            const halo = new THREE.Mesh(new THREE.SphereGeometry(0.22, 20, 20), new THREE.MeshBasicMaterial({ color: 0x34e6a8, transparent: true,
+                opacity: 0.1, blending: THREE.AdditiveBlending, depthWrite: false }));
+            brain.add(core);
+            brain.add(halo);
+            // --- signals ---
+            const SIG = 300, sig = [], sP = new Float32Array(SIG * 3), sC = new Float32Array(SIG * 3);
+            for (let i = 0; i < SIG; i++)
+                sig.push({ live: false, a: 0, b: 0, t: 0, sp: 1, col: new THREE.Color() });
+            const sGeo = new THREE.BufferGeometry();
+            sGeo.setAttribute("position", new THREE.BufferAttribute(sP, 3));
+            sGeo.setAttribute("color", new THREE.BufferAttribute(sC, 3));
+            brain.add(new THREE.Points(sGeo, new THREE.PointsMaterial({ size: 0.10, map: sprite, vertexColors: true,
+                transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, sizeAttenuation: true })));
+            const byRegion = CORTEX_REGIONS.map(() => []);
+            for (let i = 0; i < N; i++)
+                byRegion[reg[i]].push(i);
+            const hop = (from) => {
+                const nb = adj[from];
+                if (!nb.length)
+                    return from;
+                let best = nb[0], bd = 1e9;
+                for (const j of nb) {
+                    const d = P[j * 3] ** 2 + P[j * 3 + 1] ** 2 + P[j * 3 + 2] ** 2;
+                    if (d < bd && Math.random() < 0.85) { bd = d; best = j; }
+                }
+                return best;
+            };
+            const fire = (k) => {
+                for (let i = 0; i < SIG; i++) {
+                    if (sig[i].live)
+                        continue;
+                    const pool = byRegion[k];
+                    if (!pool.length)
+                        return;
+                    const a = pool[(Math.random() * pool.length) | 0];
+                    sig[i].live = true; sig[i].a = a; sig[i].b = hop(a); sig[i].t = 0;
+                    sig[i].sp = 1.6 + Math.random() * 1.4;
+                    sig[i].col.setHex(CORTEX_REGIONS[k].hex);
+                    return;
+                }
+            };
+            // --- interaction ---
+            let rotX = 0, rotY = 0, vel = 0.0016, drag = false, lx = 0, ly = 0, moved = 0;
+            const el = renderer.domElement;
+            el.style.touchAction = "none";
+            el.addEventListener("pointerdown", (e) => { drag = true; lx = e.clientX; ly = e.clientY; moved = 0; });
+            const onMove = (e) => {
+                if (!drag)
+                    return;
+                moved += Math.abs(e.clientX - lx) + Math.abs(e.clientY - ly);
+                rotY += (e.clientX - lx) * 0.006;
+                rotX = Math.max(-1.1, Math.min(1.1, rotX + (e.clientY - ly) * 0.005));
+                vel = (e.clientX - lx) * 0.0006; lx = e.clientX; ly = e.clientY;
+            };
+            const onUp = () => { drag = false; };
+            addEventListener("pointermove", onMove);
+            addEventListener("pointerup", onUp);
+            addEventListener("pointercancel", onUp);
+            const act = new Float32Array(CORTEX_REGIONS.length);
+            const tmp = new THREE.Color();
+            const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+            let last = performance.now();
+            const loop = (now) => {
+                if (dead)
+                    return;
+                raf = requestAnimationFrame(loop);
+                const dt = Math.min(0.05, (now - last) / 1000);
+                last = now;
+                const hs = healthRef.current, s = selRef.current;
+                for (let k = 0; k < CORTEX_REGIONS.length; k++) {
+                    const f = hs[k] ? hs[k].fill : 0.5;
+                    const want = s < 0 ? 0.12 + 0.88 * f : (k === s ? Math.max(0.5, f) : 0.06);
+                    act[k] += (want - act[k]) * Math.min(1, dt * 3.2);
+                }
+                if (!reduce)
+                    for (let i = 0; i < 10; i++) {
+                        const k = s >= 0 ? s : (Math.random() * CORTEX_REGIONS.length) | 0;
+                        if (Math.random() < act[k])
+                            fire(k); // firing rate IS the coverage rate
+                    }
+                for (let i = 0; i < SIG; i++) {
+                    const g = sig[i];
+                    if (!g.live) { sP[i * 3 + 2] = -999; sC[i * 3] = sC[i * 3 + 1] = sC[i * 3 + 2] = 0; continue; }
+                    g.t += dt * g.sp;
+                    while (g.t >= 1) {
+                        g.t -= 1; g.a = g.b; g.b = hop(g.a);
+                        const d = P[g.a * 3] ** 2 + P[g.a * 3 + 1] ** 2 + P[g.a * 3 + 2] ** 2;
+                        if (d < 0.06 || Math.random() < 0.05) { g.live = false; break; }
+                    }
+                    if (!g.live)
+                        continue;
+                    for (let c = 0; c < 3; c++)
+                        sP[i * 3 + c] = P[g.a * 3 + c] + (P[g.b * 3 + c] - P[g.a * 3 + c]) * g.t;
+                    sC[i * 3] = g.col.r; sC[i * 3 + 1] = g.col.g; sC[i * 3 + 2] = g.col.b;
+                }
+                sGeo.attributes.position.needsUpdate = true;
+                sGeo.attributes.color.needsUpdate = true;
+                for (let i = 0; i < N; i++) {
+                    const a = 0.10 + 0.90 * act[reg[i]];
+                    tmp.setHex(CORTEX_REGIONS[reg[i]].hex);
+                    nodeCol[i * 3] = tmp.r * a; nodeCol[i * 3 + 1] = tmp.g * a; nodeCol[i * 3 + 2] = tmp.b * a;
+                }
+                nodeGeo.attributes.color.needsUpdate = true;
+                for (let i = 0; i < E; i++) {
+                    const a = 0.05 + 0.45 * act[eReg[i]];
+                    tmp.setHex(CORTEX_REGIONS[eReg[i]].hex);
+                    eC[i * 6] = eC[i * 6 + 3] = tmp.r * a;
+                    eC[i * 6 + 1] = eC[i * 6 + 4] = tmp.g * a;
+                    eC[i * 6 + 2] = eC[i * 6 + 5] = tmp.b * a;
+                }
+                eGeo.attributes.color.needsUpdate = true;
+                const beat = 0.9 + 0.08 * Math.sin(now * 0.003);
+                core.scale.setScalar(0.7 + 0.6 * act[6] * beat);
+                halo.scale.setScalar(0.8 + 1.5 * act[6] * beat);
+                halo.material.opacity = 0.05 + 0.22 * act[6];
+                core.material.opacity = 0.35 + 0.6 * act[6];
+                if (!drag) { rotY += vel; vel += (0.0016 - vel) * 0.02; }
+                brain.rotation.y = rotY;
+                brain.rotation.x = rotX;
+                renderer.render(scene, camera);
+            };
+            raf = requestAnimationFrame(loop);
+            const onResize = () => { if (!dead) { camera.aspect = W() / H(); camera.updateProjectionMatrix(); renderer.setSize(W(), H()); } };
+            addEventListener("resize", onResize);
+            apiRef.current = () => {
+                removeEventListener("pointermove", onMove);
+                removeEventListener("pointerup", onUp);
+                removeEventListener("pointercancel", onUp);
+                removeEventListener("resize", onResize);
+            };
+        }).catch(() => { if (!dead) setMode("flat"); });
+        return () => {
+            dead = true;
+            cancelAnimationFrame(raf);
+            if (apiRef.current)
+                apiRef.current();
+            if (renderer) {
+                renderer.dispose();
+                if (renderer.domElement && renderer.domElement.parentNode)
+                    renderer.domElement.parentNode.removeChild(renderer.domElement);
+            }
+        };
+    }, []);
+    const shown = sel >= 0 ? health[sel] : null;
+    const blind = health.filter((h) => h.fill < 0.999 && h.fields.length).length;
+    return (React.createElement("section", { className: "cortex" },
+        React.createElement("div", { className: "cortex-head" },
+            React.createElement("h2", { className: "lg-formtitle" }, "Model cortex"),
+            React.createElement("span", { className: "ing-hint", style: { margin: 0 } }, "Each region is an engine, and its brightness is its real coverage \u2014 a dim region is one the model is filling with league average. Drag to rotate; tap a region to read its numbers.")),
+        mode === "live" && React.createElement("div", { className: "cortex-stage", ref: hostRef }),
+        mode === "loading" && React.createElement("div", { className: "cortex-stage loading" }, "building cortex\u2026"),
+        mode === "flat" && React.createElement("div", { className: "cortex-stage loading" }, "3D view needs a connection \u2014 the numbers below are live either way."),
+        React.createElement("div", { className: "cortex-chips" }, health.map((h, k) => React.createElement("button", { key: h.key, className: "cortex-chip" + (sel === k ? " on" : ""),
+            style: { color: h.css, opacity: 0.45 + 0.55 * h.fill },
+            onClick: () => setSel(sel === k ? -1 : k) },
+            React.createElement("u", null),
+            h.name,
+            React.createElement("b", null, Math.round(h.fill * 100) + "%")))),
+        React.createElement("div", { className: "cortex-read" }, shown
+            ? React.createElement(React.Fragment, null,
+                React.createElement("strong", { style: { color: shown.css } }, shown.name),
+                React.createElement("p", null, shown.role),
+                React.createElement("p", { className: "cortex-note" }, shown.note),
+                shown.gaps.length > 0 && React.createElement("ul", { className: "cortex-gaps" }, shown.gaps.map((g, i) => React.createElement("li", { key: i }, g))))
+            : React.createElement("p", null, blind
+                ? `${blind} of the six input engines are running with gaps. Tap one to see what's missing and what the blank costs.`
+                : "Every input engine is fully covered. The model isn't substituting league average anywhere."))));
+}
+
 function Brain({ onHome }) {
     const { reloadN, reload, reloading } = useReload();
     const [params, setParams] = useState({});
+    const [teamsDb, setTeamsDb] = useState([]);
     const [rescored, setRescored] = useState(null);
     const [draft, setDraft] = useState({});
     const [log, setLog] = useState([]);
@@ -13703,6 +14068,7 @@ function Brain({ onHome }) {
             setGames(g);
             // Data Scout: how many teams are under half-filled on stats
             const teams = await store.get("ingenuity:teams", []);
+            setTeamsDb(teams);
             let thin = 0;
             for (const t of teams) {
                 const hp = (t.players || []);
@@ -13937,6 +14303,9 @@ Respond ONLY with JSON, no markdown fences, exactly this shape:
             return { ...base, tone: "warn", status: `${fails} of ${total} failed`, read: `${total - fails}/${total} recent conversions succeeded. Last failure: ${lastFail.kind} — "${lastFail.detail}". The pattern so far: local parses (game lines, CSVs) never fail; failures cluster on the vision/image path. When a screenshot bounces, the paste box is the instant fallback — and every failure logged here sharpens where the next fix goes.` };
         })(),
     ];
+    // Cortex health: the same coverage report the Database screen shows, rolled
+    // up per engine so the 3D view is reading real gaps rather than a mock.
+    const cortexRows = useMemo(() => cortexHealth(teamsDb, coverageReport(teamsDb), params, staleRecent, engOnly), [teamsDb, params, staleRecent, engOnly.n, engOnly.bias]);
     return (React.createElement(React.Fragment, null,
         React.createElement("header", { className: "ing-head" },
             React.createElement("div", { className: "ing-brand" },
@@ -13959,6 +14328,7 @@ Respond ONLY with JSON, no markdown fences, exactly this shape:
                 React.createElement("div", { className: "lg-stat" },
                     React.createElement("span", { className: "lg-stat-val" }, leans.length ? `${leanHits}–${leans.length - leanHits}` : "—"),
                     React.createElement("span", { className: "lg-stat-label" }, "ledger lean record"))),
+            React.createElement(ModelCortex, { health: cortexRows }),
             React.createElement("section", { className: "br-council" },
                 React.createElement("div", { className: "br-council-head" },
                     React.createElement("h2", { className: "lg-formtitle" }, "Agent council"),
@@ -15624,6 +15994,26 @@ const CSS = `
   .ing-logo, .ing-readout, .home-brand { animation: none; }
   .ing-bar { transition: none; }
 }
+
+/* ---- model cortex (3D pipeline view) ---- */
+.cortex { margin-bottom: 22px; }
+.cortex-head { margin-bottom: 12px; }
+.cortex-stage { width: 100%; height: 240px; border: 1px solid var(--line); border-radius: 12px; background: radial-gradient(ellipse 70% 60% at 50% 40%, rgba(52,230,168,0.07), transparent 70%), var(--field); overflow: hidden; position: relative; }
+.cortex-stage.loading { display: flex; align-items: center; justify-content: center; font-family: 'Archivo'; font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-dim); text-align: center; padding: 0 24px; }
+.cortex-stage canvas { display: block; }
+.cortex-chips { display: flex; gap: 6px; overflow-x: auto; margin-top: 10px; padding-bottom: 2px; scrollbar-width: none; }
+.cortex-chips::-webkit-scrollbar { display: none; }
+.cortex-chip { flex: 0 0 auto; display: flex; align-items: center; gap: 6px; cursor: pointer; font-family: 'Archivo'; font-size: 9.5px; letter-spacing: 0.06em; text-transform: uppercase; border: 1px solid var(--line); border-radius: 999px; padding: 6px 11px; background: transparent; transition: border-color .2s, background .2s; }
+.cortex-chip u { width: 6px; height: 6px; border-radius: 50%; background: currentColor; text-decoration: none; flex: 0 0 auto; }
+.cortex-chip b { font-family: 'Space Grotesk'; font-size: 10px; font-variant-numeric: tabular-nums; opacity: 0.75; }
+.cortex-chip.on { border-color: currentColor; background: rgba(255,255,255,0.05); }
+.cortex-read { margin-top: 12px; padding: 12px 13px; background: var(--field); border: 1px solid var(--line); border-radius: 10px; }
+.cortex-read strong { font-family: 'Archivo'; font-size: 12px; letter-spacing: 0.05em; text-transform: uppercase; }
+.cortex-read p { font-size: 11.5px; color: var(--ink-dim); line-height: 1.55; margin: 6px 0 0; }
+.cortex-read p.cortex-note { color: var(--ink); }
+.cortex-gaps { margin: 8px 0 0; padding-left: 15px; display: flex; flex-direction: column; gap: 5px; }
+.cortex-gaps li { font-size: 11px; color: var(--amber); line-height: 1.5; }
+@media (prefers-reduced-motion: reduce) { .cortex-stage { opacity: 0.95; } }
 `;
 // ---- mount ----
 ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
