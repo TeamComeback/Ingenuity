@@ -2740,7 +2740,7 @@ function dedupeTeams(teams) {
         const out = { ...a };
         for (const f of ["off", "xoff", "pa", "recent", "recentPA", "recentBbk", "offVsL", "paVsL", "offVsR", "paVsR",
             "rosterOffVsL", "rosterPaVsL", "rosterOffVsR", "rosterPaVsR", "playerSplitsAsOf", "splitsDerived",
-            "pen", "penBf", "penBarrel", "penHardHit", "oaa", "framing", "penFatigue", "penFatigueAsOf",
+            "pen", "penBf", "penBarrel", "penHardHit", "oaa", "framing", "framingFrom", "framingCatchers", "penFatigue", "penFatigueAsOf",
             "penRates", "penRatesBf", "penRatesFrom", "penStatsAsOf", "pen14AsOf",
             "penIp", "penEra", "penSiera", "penWhip", "penBaa", "penK", "penBb", "penChase", "penZcon", "penFb", "penHr",
             "pen14Ip", "pen14Era", "pen14Siera", "pen14Whip", "pen14Baa", "pen14K", "pen14Bb",
@@ -2894,7 +2894,14 @@ const TEAM_LOOKUP = (() => {
 function resolveTeamName(raw) {
     if (!raw)
         return null;
-    let t = raw.replace(/\([^)]*\)/g, "").replace(/[^A-Za-z. '-]/g, " ").replace(/\s+/g, " ").trim();
+    // Fold accents rather than blanking them. Stripping "í" to a SPACE turned
+    // "Díaz" into "D az", and "az" matches the Diamondbacks alias as a whole
+    // word — so a real player resolved to a club. Elias Díaz and Yandy Díaz both
+    // hit this. Same bug class as the roster-removal detector, in the general
+    // resolver every importer calls, so it is fixed at the source here.
+    let t = String(raw)
+        .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+        .replace(/\([^)]*\)/g, "").replace(/[^A-Za-z. '-]/g, " ").replace(/\s+/g, " ").trim();
     const low = t.toLowerCase();
     if (TEAM_LOOKUP[low])
         return TEAM_LOOKUP[low];
@@ -4742,6 +4749,8 @@ function provenanceLine(t) {
         bits.push(`player stats ${ago(t.statsAsOf)}`);
     if (t.recentAsOf)
         bits.push(`14-day form ${ago(t.recentAsOf)}`);
+    if (t.framingFrom)
+        bits.push(`framing from ${t.framingCatchers || "?"} catcher${t.framingCatchers === "1" ? "" : "s"}`);
     if (t.penStatsAsOf)
         bits.push(`bullpen season stats ${ago(t.penStatsAsOf)}${t.penRatesFrom === "rates" ? ", wOBA rebuilt from rates" : ""}`);
     if (t.pen14AsOf)
@@ -8590,6 +8599,9 @@ const IMPORT_KINDS = [
     { id: "bullpen", label: "Bullpen", sub: "season / 14d", tf: null,
         note: "Team bullpen rate stats \u2014 IP, ERA, SIERA, WHIP, BAA, K%, BB%, chase, Z-contact, FB%, hard-hit%, barrel%, HR. Season and last-14 are stored separately and never overwrite each other.",
         ph: "Paste straight from the sheet, header row included \u2014 the merged title above it is skipped.\n\n\tIP\tERA\tSIERA\tWHIP\tBAA\tK%\tBB%\tChase\tZ-\tFB%\tHH%\tBRL%\tHR\n1\tATL\tBraves\t47.2\t4.91\t4.51\t1.55\t.239\t22.5%\t13.8%\t36.5%\t82.9%\t42.5%\t37.9%\t6.8%\t7" },
+    { id: "framing", label: "Framing", sub: "by catcher", tf: null,
+        note: "Savant's catcher framing leaderboard, which has no team column \u2014 each catcher is routed through your roster and a club's framing is the SUM of its catchers' run values.",
+        ph: "Paste the Savant export with its header row.\n\nname,pitches,rv_tot,pct_tot,rv_11,pct_11,\u2026\n\"Realmuto, J.T.\",6625,0.565,0.470,\u2026\n\nOnly name and rv_tot are read. rv_11\u2013rv_19 are shadow zones, not years, and are ignored.\n\nRun \u27f3 rosters first \u2014 that is what maps a catcher to a club." },
     { id: "teamstats", label: "Team", sub: "OAA / framing", tf: null,
         note: "Team-level fielding and contact quality: OAA, catcher framing, barrel% and hard-hit% allowed, team wOBA / xwOBA, bullpen xwOBA.",
         ph: "Team\tOAA\tFraming\tBarrel%\tHardHit%\nGuardians\t18\t7\t7.1\t38.4\nRockies\t-12\t-3\t9.8\t42.1" },
@@ -8656,6 +8668,7 @@ const PREVIEW_TEAM_FIELDS = ["off", "pa", "xoff", "offVsL", "paVsL", "offVsR", "
     "rosterOff", "rosterPA", "rosterPen", "rosterPenBf",
     "rosterOffVsL", "rosterPaVsL", "rosterOffVsR", "rosterPaVsR",
     "recent", "recentPA", "recentBbk", "pen", "penBf", "penBarrel", "penHardHit", "oaa", "framing",
+    "framingFrom", "framingCatchers",
     "penRates", "penRatesBf", "penIp", "penEra", "penSiera", "penWhip", "penBaa", "penK", "penBb",
     "penChase", "penZcon", "penFb", "penHr",
     "pen14Ip", "pen14Era", "pen14Siera", "pen14Whip", "pen14Baa", "pen14K", "pen14Bb",
@@ -8673,6 +8686,7 @@ const FIELD_LABEL = {
     oaa: "OAA", framing: "framing", woba: "wOBA", bbk: "BB%\u2212K%",
     wobaVsL: "wOBA vs L", wobaVsR: "wOBA vs R", xwoba: "xwOBA", bf: "BF", ip: "IP",
     era: "ERA", gs: "GS", barrel: "barrel%", hardHit: "hard-hit%", hand: "throws",
+    framingFrom: "framing, by catcher", framingCatchers: "catchers counted",
     penRates: "pen wOBA (rebuilt)", penRatesBf: "pen PA (est)",
     penIp: "pen IP", penEra: "pen ERA", penSiera: "pen SIERA", penWhip: "pen WHIP",
     penBaa: "pen BAA", penK: "pen K%", penBb: "pen BB%", penChase: "pen chase%",
@@ -8821,6 +8835,20 @@ function planImport(o) {
         if (win === "recent")
             warns.push("14-day bullpen numbers are stored and displayed but do NOT yet feed the projection. Blending recent bullpen form into the sim is a model change with its own weight to justify, not something that should arrive attached to an import.");
         return done(res.next, `${p.rows.length} club${p.rows.length === 1 ? "" : "s"} read from the ${win === "recent" ? "last-14" : "season"} bullpen table \u2014 ${res.applied} matched, ${res.fieldsSet} value${res.fieldsSet === 1 ? "" : "s"} to write.`, warns);
+    }
+    // ---- catcher framing (player rows, no team column) ----
+    if (kind === "framing") {
+        const p = parseCatcherFraming(text);
+        if (!p.rows)
+            return fail(p.err || "couldn't read that as a catcher framing table.");
+        if (!rosterMap || !Object.keys(rosterMap).length)
+            return fail("this file has no team column, so catchers can only be routed through the roster map \u2014 and it's empty. Tap \u27f3 rosters first, then preview again. Guessing a club from a name is how \"Elias D\u00EDaz\" became the Diamondbacks.");
+        const res = applyCatcherFraming(p.rows, teams, rosterMap);
+        const warns = [];
+        if (res.unmatched.length)
+            warns.push(`${res.unmatched.length} catcher${res.unmatched.length === 1 ? "" : "s"} matched nobody on a roster (${res.unmatched.slice(0, 4).join(", ")}${res.unmatched.length > 4 ? "\u2026" : ""}) \u2014 usually a spelling difference, or a player no longer on a 40-man.`);
+        warns.push("Framing runs are a SEASON total with no team attached, so a catcher traded mid-year has all of his runs credited to his CURRENT club. For most clubs that is right; for one that changed catchers at the deadline it overstates the new club and understates the old.");
+        return done(res.next, `${p.rows.length} catcher${p.rows.length === 1 ? "" : "s"} read \u2014 ${res.matched} routed to a club, ${res.applied} team${res.applied === 1 ? "" : "s"} updated.`, warns);
     }
     // ---- team-level stats ----
     if (kind === "teamstats") {
@@ -9696,6 +9724,122 @@ function looksLikeTeamRows(rows) {
     const bulk = medPA != null && medPA > 800;
     const mostlyClubs = named / rows.length > 0.5;
     return { team: bulk || mostlyClubs, named, medPA, bulk, mostlyClubs, n: rows.length };
+}
+// ===========================================================================
+// CATCHER FRAMING (v2.9)
+// Savant's framing leaderboard publishes no team column — it is a player table,
+// and the model wants a team number. So each catcher is routed to a club through
+// the same roster identity map the player-splits import uses, and the club's
+// framing is the SUM of its catchers' run values.
+//
+// Sum, not average: rv_tot is a counting stat (runs saved across the season),
+// so two catchers each worth +3 make a club +6, and averaging them to +3 would
+// halve a real team-level effect. Bullpen wOBA is a rate and is averaged; this
+// is not, and the difference matters.
+//
+// Column note: rv_11..rv_19 are Savant's SHADOW ZONES — the edges of the strike
+// zone — not years. rv_tot is the season total and the only column the model
+// needs; the zone breakdown is diagnostic detail we deliberately ignore.
+// ===========================================================================
+function parseCatcherFraming(text) {
+    const raw = normalizeFangraphsPaste(String(text || ""));
+    const lines = raw.split(/\r?\n/).filter((l) => l.trim() !== "");
+    if (lines.length < 2)
+        return { rows: null, err: "nothing pasted." };
+    // A quote-aware split is REQUIRED here, not a nicety: Savant writes the name
+    // as "Realmuto, J.T." — a comma INSIDE a quoted cell. Splitting naively turns
+    // one cell into two and shifts every column after it left by one, so rv_tot
+    // is read from the wrong slot and lands as a plausible-looking wrong number.
+    // Same column-shift failure as the bullpen header bug, from a different cause.
+    const splitCsv = (l) => {
+        const out = [];
+        let cur = "", inQ = false;
+        for (let i = 0; i < l.length; i++) {
+            const ch = l[i];
+            if (ch === '"') {
+                if (inQ && l[i + 1] === '"') { cur += '"'; i++; }
+                else inQ = !inQ;
+                continue;
+            }
+            if (!inQ && (ch === "," || ch === "\t")) { out.push(cur); cur = ""; continue; }
+            cur += ch;
+        }
+        out.push(cur);
+        return out.map((c) => c.trim());
+    };
+    const hasComma = lines[0].includes(",") || (lines[1] || "").includes(",");
+    const split = hasComma ? splitCsv : (l) => l.split(/\t|\s*\|\s*/).map((c) => stripQuotes(c).trim());
+    const head = split(lines[0]).map((h) => h.toLowerCase().trim());
+    const find = (names) => head.findIndex((h) => names.includes(h));
+    const iName = find(["name", "player", "catcher", "last_name, first_name", "player_name"]);
+    // rv_tot is the season total. Accepting a bare "rv" is deliberate — some
+    // exports drop the suffix — but a ZONE column is never accepted as the
+    // total, because rv_19 is one slice of the zone and would understate a
+    // catcher by roughly an order of magnitude while looking perfectly valid.
+    const iRv = find(["rv_tot", "runs_extra_strikes", "framing_runs", "rv", "run_value"]);
+    const iPitches = find(["pitches", "n_called_pitches", "called_pitches"]);
+    if (iName === -1)
+        return { rows: null, err: `no catcher-name column found. Keep the header row \u2014 it needs a "name" column plus "rv_tot". Headers seen: ${head.slice(0, 8).join(", ")}.` };
+    if (iRv === -1)
+        return { rows: null, err: `no total run-value column found. This importer wants "rv_tot" (the season total). The rv_11\u2013rv_19 columns are individual shadow zones, not the total, and using one of those would understate every catcher. Headers seen: ${head.slice(0, 8).join(", ")}.` };
+    const rows = [];
+    for (const line of lines.slice(1)) {
+        const c = split(line);
+        let name = (c[iName] || "").trim();
+        if (!name)
+            continue;
+        // Savant exports "Last, First" — flip it so the roster map can match.
+        if (/^[^,]+,\s*[^,]+$/.test(name)) {
+            const [last, first] = name.split(",").map((x) => x.trim());
+            name = `${first} ${last}`;
+        }
+        const rv = parseFloat(c[iRv]);
+        if (!Number.isFinite(rv))
+            continue;
+        const pitches = iPitches >= 0 ? parseFloat(c[iPitches]) : NaN;
+        rows.push({ name, rv, pitches: Number.isFinite(pitches) ? pitches : null });
+    }
+    if (!rows.length)
+        return { rows: null, err: "found the header but no catcher rows parsed." };
+    // Sanity band. Season framing run values live roughly within ±25; anything
+    // far outside that means the wrong column was read, and a silent wrong
+    // number here shifts every game that club plays.
+    const wild = rows.filter((r) => Math.abs(r.rv) > 40).length;
+    if (wild > rows.length * 0.25)
+        return { rows: null, err: "the run-value column doesn't look like framing runs \u2014 too many values outside \u00B140. Check that rv_tot was included rather than a rate or a count." };
+    return { rows };
+}
+// Roll catchers up to clubs. Routing is by roster map only: this file has no
+// team column, and guessing one from a name is exactly the mistake that turned
+// "Elias Díaz" into the Diamondbacks.
+function applyCatcherFraming(rows, teams, rosterMap) {
+    const byTeam = new Map();
+    const unmatched = [];
+    for (const r of rows) {
+        const club = rosterMap ? rosterMap[normName(r.name)] : null;
+        if (!club) {
+            unmatched.push(r.name);
+            continue;
+        }
+        const key = normName(club);
+        const cur = byTeam.get(key) || { runs: 0, pitches: 0, names: [] };
+        cur.runs += r.rv;
+        cur.pitches += r.pitches || 0;
+        cur.names.push(`${r.name} ${r.rv > 0 ? "+" : ""}${r.rv.toFixed(1)}`);
+        byTeam.set(key, cur);
+    }
+    let applied = 0;
+    const next = teams.map((t) => {
+        const hit = byTeam.get(normName(t.name));
+        if (!hit)
+            return t;
+        applied++;
+        return { ...t, framing: hit.runs.toFixed(1),
+            framingFrom: hit.names.join(" \u00B7 "),
+            framingCatchers: String(hit.names.length),
+            teamStatsAsOf: etDayKey() };
+    });
+    return { next, applied, matched: rows.length - unmatched.length, unmatched };
 }
 function parseTeamStats(text) {
     const raw = normalizeFangraphsPaste(String(text || ""));
