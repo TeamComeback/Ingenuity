@@ -6802,13 +6802,47 @@ const ACTIVITY_LABELS = {
     calibration: ["Calibration", "\u25CE"],
     grade: ["Grading", "\u2713"],
 };
+const INTERP_WINDOW_DAYS = 14;
+const INTERP_KEEP = 60;
 async function logInterp(kind, ok, detail) {
     try {
         const log = await store.get("ingenuity:brain:interpLog", []);
-        const nl = [{ ts: new Date().toISOString().slice(5, 16).replace("T", " "), kind, ok, detail: String(detail || "").slice(0, 90) }, ...log].slice(0, 20);
+        // Full ISO date stored alongside the display stamp: the old format
+        // ("08-11 14:23") has no year, so it can't be compared across a season
+        // boundary, and the card needs a real age to know it is stale.
+        const nl = [{ ts: new Date().toISOString().slice(5, 16).replace("T", " "),
+                day: etDayKey(), kind, ok, detail: String(detail || "").slice(0, 90) }, ...log].slice(0, INTERP_KEEP);
         await store.set("ingenuity:brain:interpLog", nl);
     }
     catch { }
+}
+// Conversions inside the reporting window, plus whether the log is simply old.
+// A rate over a fixed count of entries is not a rate — 11 of the last 20 says
+// nothing about whether those 20 happened today or in July.
+function interpWindow(log, days) {
+    const all = (log || []);
+    const cutoff = etDayKey(new Date(Date.now() - (days || INTERP_WINDOW_DAYS) * 86400000));
+    // Entries written before day-stamping are dated only if they carry `day`;
+    // undated ones are treated as OUTSIDE the window rather than assumed recent.
+    const recent = all.filter((e) => e.day && e.day >= cutoff);
+    const newest = all.find((e) => e.day);
+    const ageDays = newest
+        ? Math.round((Date.now() - new Date(newest.day + "T12:00:00Z").getTime()) / 86400000)
+        : null;
+    const fails = recent.filter((e) => !e.ok);
+    // Group failures by kind so the read describes what is actually failing
+    // instead of asserting a pattern from prose.
+    const byKind = {};
+    for (const e of recent) {
+        const k = byKind[e.kind] = byKind[e.kind] || { n: 0, bad: 0 };
+        k.n++;
+        if (!e.ok)
+            k.bad++;
+    }
+    const worst = Object.entries(byKind).filter(([, v]) => v.bad > 0)
+        .sort((a, b) => b[1].bad - a[1].bad);
+    return { all, recent, n: recent.length, fails: fails.length,
+        lastFail: fails[0] || null, byKind, worst, ageDays, stale: ageDays != null && ageDays > days };
 }
 // NOTE: the artifact sandbox blocks blob: URLs, so files must be read as
 // data: URLs (FileReader). If canvas decode fails, fall back to sending the
@@ -8966,10 +9000,15 @@ function SmartImport({ teams, saveTeams, onGameLine, statsFocus }) {
             return;
         setBusy(true);
         try {
-            makePlan();
+            const p = makePlan();
+            // A refusal is a conversion outcome and belongs in the log — knowing
+            // WHICH kinds bounce is the half that tells you where to look.
+            if (p && !p.ok)
+                logInterp(kind, false, p.err || "refused");
         }
         catch (e) {
             setPlan({ ok: false, err: `couldn't read that — ${e.message}`, warns: [] });
+            logInterp(kind, false, e.message);
         }
         setBusy(false);
     };
@@ -9001,6 +9040,12 @@ function SmartImport({ teams, saveTeams, onGameLine, statsFocus }) {
         setMsg(ok
             ? `Applied — ${nt} team${nt === 1 ? "" : "s"} updated, ${n} value${n === 1 ? "" : "s"} written${nover ? `, ${nover} replacing an existing number` : ""}.`
             : `The write didn't stick — ${store.lastError || "storage refused it"}. Nothing was changed; try again.`);
+        // The conversion that actually happened. Without this the Brain's
+        // interpreter card had no source of truth for anything imported through
+        // the preview contract, which by now is everything.
+        logInterp(kind, ok, ok
+            ? `${nt} team${nt === 1 ? "" : "s"}, ${n} value${n === 1 ? "" : "s"}`
+            : (store.lastError || "write refused"));
     };
     // Catcher framing lands here just as often as in the team-level box.
     const framingAttempt = async (content, label) => {
@@ -14704,16 +14749,31 @@ Respond ONLY with JSON, no markdown fences, exactly this shape:
                     : { tone: "ok", status: "no candidates", read: `Last scan ${slateScan.ts}: ${slateScan.scanned} games, nothing beat the no-vig book by 4+ points. It reported 'pass' — which is the scanner doing its job, not failing at it.` }),
         },
         (() => {
-            const total = interpLog.length;
-            const fails = interpLog.filter((e) => !e.ok).length;
-            const lastFail = interpLog.find((e) => !e.ok);
-            const kinds = [...new Set(interpLog.map((e) => e.kind))].join(", ");
+            // Everything below is DERIVED. The previous version asserted a fixed
+            // narrative — "local parses never fail; failures cluster on the
+            // vision path" — as prose, while the log's own csv-paste failures
+            // contradicted it. A confident sentence that the data disagrees with
+            // is the exact failure this app is built to refuse.
+            const W = interpWindow(interpLog, INTERP_WINDOW_DAYS);
             const base = { id: "interpreter", glyph: "\u2318", name: "File Interpreter", role: "Converts anything you give it into model-readable data" };
-            if (total === 0)
-                return { ...base, tone: "idle", status: "ready", read: "Every paste and upload routes through it: game lines and CSVs parse locally and cannot fail; screenshots ride the vision bridge with the paste box as automatic fallback. It logs every conversion — success or failure — so the pipeline's error patterns become visible here instead of staying mysterious. That log is how the system debugs itself." };
-            if (fails === 0)
-                return { ...base, tone: "ok", status: `${total} converted`, read: `All ${total} recent conversions succeeded (${kinds}). Local parses are doing the heavy lifting; that's the architecture working — the reliable path carries the load, the fancy path is a bonus.` };
-            return { ...base, tone: "warn", status: `${fails} of ${total} failed`, read: `${total - fails}/${total} recent conversions succeeded. Last failure: ${lastFail.kind} — "${lastFail.detail}". The pattern so far: local parses (game lines, CSVs) never fail; failures cluster on the vision/image path. When a screenshot bounces, the paste box is the instant fallback — and every failure logged here sharpens where the next fix goes.` };
+            if (!W.all.length)
+                return { ...base, tone: "idle", status: "ready", read: "Every paste and upload routes through it, and each conversion is logged \u2014 success or failure, with the reason \u2014 so the pipeline's error patterns become visible here instead of staying mysterious. Nothing recorded yet." };
+            // An old log is not a health reading. Say so rather than presenting
+            // months-old records as current status.
+            if (!W.n)
+                return { ...base, tone: "idle", status: "no recent imports",
+                    read: `Nothing imported in the last ${INTERP_WINDOW_DAYS} days. The ${W.all.length} record${W.all.length === 1 ? "" : "s"} on file ${W.ageDays != null ? `end ${W.ageDays} days ago` : "are undated"} and describe a period that has passed, so they are not a reading on how the pipeline is working now.` };
+            const good = W.n - W.fails;
+            if (!W.fails)
+                return { ...base, tone: "ok", status: `${W.n} converted`,
+                    read: `All ${W.n} import${W.n === 1 ? "" : "s"} in the last ${INTERP_WINDOW_DAYS} days succeeded (${Object.keys(W.byKind).join(", ")}). Nothing to fix.` };
+            // Name the kinds that actually failed, from the log, in order.
+            const detail = W.worst.map(([k, v]) => `${k} ${v.bad}/${v.n}`).join(", ");
+            const oneKind = W.worst.length === 1;
+            return { ...base, tone: W.fails > good ? "warn" : "ok", status: `${W.fails} of ${W.n} failed`,
+                read: `${good}/${W.n} imports succeeded in the last ${INTERP_WINDOW_DAYS} days. Failures by kind: ${detail}. Last: ${W.lastFail.kind} \u2014 "${W.lastFail.detail}". ${oneKind
+                    ? `They are all the same kind, which usually means one source's format rather than a broken pipeline \u2014 worth checking what that export looks like.`
+                    : `Spread across kinds, so it is more likely the inputs vary than that any one parser is broken.`}` };
         })(),
     ];
     // Cortex health: the same coverage report the Database screen shows, rolled
