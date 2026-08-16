@@ -12545,7 +12545,10 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
             if (!games.length)
                 return { state: "fail", note: "board still empty" };
             // The quota the API just reported, so the one step that spends a
-            // request also tells you what spending it cost.
+            // request also tells you what spending it cost. Read from storage
+            // rather than from state: pullLive() writes it, and a setState from
+            // inside this async step is not visible here yet.
+            const q = oddsQuotaRead(await store.get(ODDS_QUOTA_KEY, null));
             return { state: priced ? "ok" : "warn",
                 note: `${priced}/${games.length} with a total${q ? ` \u00B7 ${q.remaining} API request${q.remaining === 1 ? "" : "s"} left` : ""}` };
         });
