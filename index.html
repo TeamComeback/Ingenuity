@@ -3154,6 +3154,46 @@ function gamesInCloseWindow(board, nowMs) {
         return Number.isFinite(t) && t > nowMs && t - nowMs <= CLOSE_WINDOW_MIN * 60000;
     });
 }
+const ODDS_QUOTA_KEY = "ingenuity:oddsapi:quota";
+// the-odds-api returns quota on every response, including error responses.
+// Header names are lowercase per the fetch spec, but some proxies pass the
+// original casing through, so both are tried.
+function readOddsQuota(res) {
+    if (!res || !res.headers || typeof res.headers.get !== "function")
+        return null;
+    const num = (a, b) => {
+        const v = res.headers.get(a) ?? res.headers.get(b);
+        const n = v == null ? NaN : parseFloat(v);
+        return Number.isFinite(n) ? n : null;
+    };
+    const remaining = num("x-requests-remaining", "X-Requests-Remaining");
+    const used = num("x-requests-used", "X-Requests-Used");
+    const last = num("x-requests-last", "X-Requests-Last");
+    if (remaining == null && used == null)
+        return null; // headers stripped (CORS or a proxy) — say nothing rather than guess
+    return { remaining, used, last, at: new Date().toISOString() };
+}
+// Requests left, and how many days that has to cover. Two pulls a day is the
+// pattern that actually captures closing lines — one in the morning, one in the
+// late afternoon — so the burn rate is measured against that, not against one.
+function oddsQuotaRead(q) {
+    if (!q || q.remaining == null)
+        return null;
+    const now = new Date();
+    // Quota resets on the 1st.
+    const reset = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
+    const daysLeft = Math.max(1, Math.ceil((reset.getTime() - now.getTime()) / 86400000));
+    const perDay = q.remaining / daysLeft;
+    const tone = perDay >= 2 ? "ok" : perDay >= 1 ? "warn" : "bad";
+    return { remaining: q.remaining, used: q.used, daysLeft, perDay,
+        tone, resetsIn: daysLeft,
+        text: `${q.remaining} request${q.remaining === 1 ? "" : "s"} left \u00B7 ${daysLeft} day${daysLeft === 1 ? "" : "s"} to reset`,
+        detail: perDay >= 2
+            ? `That is ${perDay.toFixed(1)} a day until the 1st \u2014 enough for the two daily pulls that capture closing lines (morning, then late afternoon).`
+            : perDay >= 1
+                ? `That is ${perDay.toFixed(1)} a day until the 1st. Enough for one pull a day, but not the second one that catches closing lines inside the 90-minute window.`
+                : `That is under one a day until the 1st. Pasting odds is free and does everything a pull does except capture the close.` };
+}
 function consensusFromOddsApi(events) {
     const out = [];
     for (const ev of events || []) {
@@ -11960,6 +12000,7 @@ function SlateHub({ onOpenInTerminal }) {
     const [pasteText, setPasteText] = useState("");
     const [liveOpen, setLiveOpen] = useState(false);
     const [apiKey, setApiKey] = useState("");
+    const [oddsQuota, setOddsQuota] = useState(null);
     const [rows, setRows] = useState(null);
     const [lean, setLean] = useState(null);
     const [acc, setAcc] = useState(null);
@@ -12017,6 +12058,7 @@ function SlateHub({ onOpenInTerminal }) {
                 await store.set("ingenuity:teams", dd.teams);
             setTeams(dd.teams);
             {
+                setOddsQuota(await store.get(ODDS_QUOTA_KEY, null));
                 const own = await store.get("ingenuity:oddsapi:key", "");
                 if (own) {
                     setApiKey(own);
@@ -12502,7 +12544,10 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
             const priced = games.filter((g) => g.line !== "" && g.line != null && !isNaN(parseFloat(g.line))).length;
             if (!games.length)
                 return { state: "fail", note: "board still empty" };
-            return { state: priced ? "ok" : "warn", note: `${priced}/${games.length} with a total` };
+            // The quota the API just reported, so the one step that spends a
+            // request also tells you what spending it cost.
+            return { state: priced ? "ok" : "warn",
+                note: `${priced}/${games.length} with a total${q ? ` \u00B7 ${q.remaining} API request${q.remaining === 1 ? "" : "s"} left` : ""}` };
         });
         // 4b — Closing lines. The odds pull above already captures anything inside
         // the window; this reports what is still outstanding. A total not frozen
@@ -12866,10 +12911,18 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
             catch (netErr) {
                 throw new Error("BLOCKED: this app can't reach the-odds-api.com — the sandbox only allows certain domains. Your key is fine; the request never left. Use the live feed from a browser/script outside this app, or paste the odds here instead.");
             }
+            // Quota comes back on the SAME response as the data, so recording it
+            // costs nothing. Read before the status checks: a 429 still carries
+            // the headers, and that is exactly when you most want the number.
+            const quota = readOddsQuota(r);
+            if (quota) {
+                await store.set(ODDS_QUOTA_KEY, quota);
+                setOddsQuota(quota);
+            }
             if (r.status === 401)
                 throw new Error("key rejected (401) — check it's copied exactly, with no spaces");
             if (r.status === 429)
-                throw new Error("rate limited (429) — the free tier quota may be used up for the month");
+                throw new Error(`rate limited (429) — the monthly quota is used up${quota && quota.used != null ? ` (${quota.used} requests used)` : ""}. It resets on the 1st; paste odds in the meantime.`);
             if (!r.ok)
                 throw new Error(`Odds API returned HTTP ${r.status}`);
             const events = await r.json();
@@ -15924,6 +15977,9 @@ const CSS = `
 .slate-daybanner.past { background: rgba(95,217,232,0.08); border: 1px solid var(--line); border-left: 3px solid var(--cyan); color: var(--ink); }
 .slate-daybanner .ing-ghost { margin-left: auto; }
 .slate-research strong { color: var(--cyan); }
+.slate-chip.quota.ok { border-color: rgba(52,230,168,0.35); color: var(--phos); }
+.slate-chip.quota.warn { border-color: rgba(245,196,81,0.45); color: var(--amber); }
+.slate-chip.quota.bad { border-color: rgba(232,115,79,0.5); color: var(--rust); }
 .slate-chip.move { background: rgba(245,196,81,0.12); color: var(--amber); }
 /* Full breakdown is a solid, opaque PAGE — the board never shows through. */
 .gd-page {
