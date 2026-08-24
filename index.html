@@ -6417,7 +6417,14 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
 // what's actually deployed. Newest first.
 // ===========================================================================
 const CHANGELOG = [
-    { date: "2026-08-17", items: [
+    { date: "2026-08-23", items: [
+            "ADOPTED RE-SCORES NOW REACH THE SPLITS. detectMissPatterns() took only log+boards, so the Debrief panel that instructs you to adopt could never show the result of adopting \u2014 it reported the same exclusion count forever no matter how many times the button was pressed. It now takes the adopted payload, folds those games in keyed on date+matchup so a natively-graded game is never double-counted, and attaches the board snapshot so park/wind/fatigue splits see them too.",
+            "The splits header now reads '(N native + M re-scored)' and the exclusion warning reports how many were already converted. Nothing was broken about the saving: adoptRescore wrote to ingenuity:rescored correctly and the Brain read it. The failure was that the panel making the request was structurally blind to the answer.",
+            "ADOPTION IS NOW A PERSISTED FACT. The adopted flag was useState(false), never hydrated, so the button read 'Adopt' again after every reload whether or not adoption had succeeded \u2014 a UI that cannot distinguish 'never done' from 'done and forgotten'. It now hydrates from ingenuity:rescored on mount, gated on engine version, and shows the count and date.",
+            "Adopt writes are verified by read-back rather than trusting the return of store.set. A set() that reports success but leaves nothing retrievable is the exact silent-failure class this app keeps getting bitten by; a failed adopt now says so in the panel instead of showing a green state over an empty store.",
+            "No simulation maths touched. ENGINE_VERSION stays 2.7 and the graded sample is unaffected.",
+        ] },
+        { date: "2026-08-17", items: [
             "TWO LEDGERS \u2014 rebuilt correctly. A first attempt put the August bets in a separate array the Ledger never read, and a panel in the Brain tab; the bets were invisible where they mattered. They now live in BET_HISTORY itself, day-stamped to the date each game was played, with a tenth field marking them off-model. They appear in the History list, the equity curve, the week/month/year filters and the breakdown \u2014 everywhere every other bet appears.",
             "BETTOR_PROFILE is no longer a frozen constant. It is computed from BET_HISTORY rows at load by computeBettorProfile(). Verified against the old frozen values first: recomputing from rows reproduced the previous numbers exactly (2,638 settled bets, -$2,639.71, straights -5.1%, parlays -16.6%) before the new rows were added, which is what makes the recomputation trustworthy rather than merely different.",
             "Drawdown, longest losing streak, most-bet teams, top-5 wins and staked-by-year are now genuinely recomputed. An earlier build labelled these 'seedOnly' on the claim that row-level history was unavailable. That claim was false \u2014 BET_HISTORY held 2,640 rows the whole time. Real max drawdown is now -$3,377.97 and the longest skid stands at 49.",
@@ -13526,7 +13533,12 @@ function splitSignificance(errs) {
 }
 // `engine` filters to one engine version; omit it to pool everything, which is
 // only honest for describing games, never for measuring the model.
-function detectMissPatterns(log, boards, engine) {
+// `adopted` holds games re-scored through the CURRENT maths on their ORIGINAL
+// inputs. They are legitimate current-engine evidence — that is the whole point
+// of adopting them — so the splits must see them. Previously this function took
+// only log+boards, which meant the panel telling you to adopt could never show
+// the result of adopting, and reported the same exclusion count forever.
+function detectMissPatterns(log, boards, engine, adopted) {
     // Pull every graded row and attach whatever snapshot the board kept.
     const all = [];
     for (const r of Object.values(log || {})) {
@@ -13548,6 +13560,39 @@ function detectMissPatterns(log, boards, engine) {
                     closeLine = parseFloat(g.closeLine);
         const eng = r.eng || (snap && snap.eng) || "pre-2.5";
         all.push({ ...r, err: r.final - r.model, snap, eng, closeLine });
+    }
+    // Adopted rows are re-scores of games that ALREADY sit in `all` under an
+    // older engine — so deduping against every row would skip all of them, and
+    // appending alongside would leave the stale copy inflating otherEng. The
+    // adopted row REPLACES its older-engine twin in place. A game since graded
+    // natively on the current engine wins outright: that is a real projection,
+    // this is a reconstruction.
+    let adoptedIn = 0;
+    if (adopted && adopted.engine === engine && Array.isArray(adopted.rows)) {
+        const key = (r) => r.date + "|" + normName(r.away) + "@" + normName(r.home);
+        const idx = new Map();
+        all.forEach((r, n) => { if (!idx.has(key(r))) idx.set(key(r), n); });
+        for (const a of adopted.rows) {
+            const k = key(a);
+            const at = idx.get(k);
+            if (at != null && all[at].eng === engine) continue; // native wins
+            // Attach the board snapshot so snapshot-conditioned splits (park,
+            // wind, pen fatigue) can see these games too, not just the totals.
+            let snap = null, closeLine = null;
+            const b = (boards || {})[a.date];
+            if (b && b.games)
+                for (const g of b.games) {
+                    if (normName(g.away) !== normName(a.away) || normName(g.home) !== normName(a.home)) continue;
+                    if (g.proj && g.proj.snap) snap = g.proj.snap;
+                    if (g.closeLine != null) closeLine = parseFloat(g.closeLine);
+                }
+            const row = { date: a.date, away: a.away, home: a.home, line: a.line,
+                          final: a.final, model: a.model, err: a.err, snap,
+                          eng: engine, closeLine, rescored: true };
+            adoptedIn++;
+            if (at != null) all[at] = row;
+            else { idx.set(k, all.length); all.push(row); }
+        }
     }
     // The splits below are the ones most sensitive to a maths change — the
     // high/low-total asymmetry IS the compression v2.5 removed — so a pooled
@@ -13583,7 +13628,8 @@ function detectMissPatterns(log, boards, engine) {
     add("Model agreed with the close (within 0.25)", (r) => Number.isFinite(r.closeLine) && Math.abs(r.model - r.closeLine) <= 0.25, "The control group. Error here is pure variance, and it sets the floor everything else should be measured against.");
     add("Snapshot: rested pen (fatigue under -0.4)", (r) => r.snap && (parseFloat(r.snap.aFat) <= -0.4 && parseFloat(r.snap.hFat) <= -0.4), "The other end. The rest bonus is deliberately smaller than the fatigue penalty; this tests whether that asymmetry is right.");
     const withSnap = rows.filter((r) => r.snap).length;
-    return { rows, all, otherEng, engine: engine || null, overall,
+    return { rows, all, otherEng, engine: engine || null, overall, adoptedIn,
+        nativeN: rows.length - adoptedIn,
         splits: splits.sort((a, b) => Math.abs(b.gap || 0) - Math.abs(a.gap || 0)), withSnap };
 }
 // ---- Results log verifier ---------------------------------------------------
@@ -14093,8 +14139,12 @@ function MissLab({ log }) {
     const [showAll, setShowAll] = useState(false);
     const [rescore, setRescore] = useState(null);
     const [rescoring, setRescoring] = useState(false);
+    const [rescoreErr, setRescoreErr] = useState("");
     const [showRows, setShowRows] = useState(12);
-    const [adopted, setAdopted] = useState(false);
+    // Adoption is a persisted fact, not session state. Reading it back on mount
+    // is what makes the button an honest report rather than a thing that resets
+    // to "Adopt" after every reload regardless of what actually happened.
+    const [adopted, setAdopted] = useState(null);
     // Write the re-scored errors where the Brain reads them, stamped with the
     // current engine so they clear its version gate. The ORIGINAL model numbers
     // are never altered: the record of what was actually projected on the day
@@ -14106,8 +14156,14 @@ function MissLab({ log }) {
             rows: rescore.rows.map((r) => ({ date: r.date, away: r.away, home: r.home,
                 line: r.line, final: r.final, model: r.newModel, err: +(r.final - r.newModel).toFixed(2) })) };
         const wrote = await store.set("ingenuity:rescored", payload);
-        setAdopted(wrote);
-        if (wrote)
+        // Verified read-back: store.set returning true is not proof the value
+        // is retrievable, and a false confirmation here is worse than none.
+        const back = wrote ? await store.get("ingenuity:rescored", null) : null;
+        const ok = !!(back && back.at === payload.at && (back.rows || []).length === payload.rows.length);
+        setAdopted(ok ? back : null);
+        if (!ok)
+            setRescoreErr("Adopt did not persist — nothing was saved. Try again.");
+        if (ok)
             await logActivity("calibration", `Adopted ${payload.rows.length} re-scored games as v${ENGINE_VERSION} evidence`,
                 "original projections untouched; the Brain now has a current-engine sample");
     };
@@ -14130,14 +14186,16 @@ function MissLab({ log }) {
             const c = await store.get(AUTOPSY_KEY, {});
             if (!live)
                 return;
+            const ad = await store.get("ingenuity:rescored", null);
             setBoards(a || {});
             setCache(c || {});
+            setAdopted(ad && ad.engine === ENGINE_VERSION ? ad : null);
         })();
         return () => { live = false; };
     }, []);
     // Gated to the current engine: the high/low-total split IS the asymmetry
     // v2.5 removed, so pooling across the change would measure the change.
-    const pat = detectMissPatterns(log, boards, ENGINE_VERSION);
+    const pat = detectMissPatterns(log, boards, ENGINE_VERSION, adopted);
     const D = missDay(log, boards, day);
     const top5 = D.rows.slice(0, 5);
     const causes = missCauses(pat.rows.slice().sort((a, b) => Math.abs(b.err) - Math.abs(a.err)).slice(0, 12), cache);
@@ -14262,17 +14320,22 @@ function MissLab({ log }) {
                             React.createElement("span", { className: "fin" }, r.final)))),
                     rescore.rows.length > showRows && React.createElement("button", { className: "dbf-more", onClick: () => setShowRows(showRows + 25) },
                         `Show ${Math.min(25, rescore.rows.length - showRows)} more of ${rescore.rows.length}`),
+                    rescoreErr && React.createElement("p", { className: "dbf-warn" }, rescoreErr),
                     React.createElement("div", { className: "mr-adopt" },
                         React.createElement("div", null,
                             React.createElement("strong", null, `Count these as v${ENGINE_VERSION} evidence`),
                             React.createElement("p", null, "These games were priced by an older engine, so the Brain excludes them from calibration. A re-scored error comes from the CURRENT maths on the ORIGINAL inputs, which is exactly what calibration needs \u2014 adopting them rebuilds the sample today instead of over the next fortnight. Approximate: snapshots carry no sample sizes, so regression runs at defaults. The stored projections are not altered.")),
-                        React.createElement("button", { className: "ing-run small", onClick: adoptRescore, disabled: adopted }, adopted ? "Adopted" : "Adopt")));
+                        React.createElement("div", { className: "mr-adopt-act" },
+                            React.createElement("button", { className: "ing-run small", onClick: adoptRescore },
+                                adopted ? "Re-adopt" : "Adopt"),
+                            adopted && React.createElement("span", { className: "mr-adopt-ok" },
+                                `\u2713 ${(adopted.rows || []).length} adopted \u00B7 ${String(adopted.at).slice(0, 10)}`))));
             })()),
         // ---- the part that carries statistical weight ----
         React.createElement("h4", null, "Patterns across all graded games"),
-        React.createElement("p", { className: "dbf-note" }, `${pat.rows.length} graded on engine v${ENGINE_VERSION}, ${pat.withSnap} with a saved snapshot. One miss is an anecdote. A lean that holds across dozens of games is the only thing worth changing a parameter for.`),
+        React.createElement("p", { className: "dbf-note" }, `${pat.rows.length} graded on engine v${ENGINE_VERSION}${pat.adoptedIn ? ` (${pat.nativeN} native + ${pat.adoptedIn} re-scored)` : ""}, ${pat.withSnap} with a saved snapshot. One miss is an anecdote. A lean that holds across dozens of games is the only thing worth changing a parameter for.`),
         pat.otherEng > 0 && React.createElement("p", { className: "dbf-warn" },
-            `${pat.otherEng} further graded game${pat.otherEng === 1 ? " is" : "s are"} on an earlier engine and excluded here. These splits test how the model errs, and the v2.5 matchup fix changed exactly that \u2014 mixing the two would describe the fix rather than the model. Re-score above to convert them into current-engine evidence.`),
+            `${pat.otherEng} further graded game${pat.otherEng === 1 ? " is" : "s are"} on an earlier engine and excluded here. These splits test how the model errs, and the v2.5 matchup fix changed exactly that \u2014 mixing the two would describe the fix rather than the model. ${pat.adoptedIn ? `${pat.adoptedIn} already re-scored and counted above; re-score again to convert the rest.` : "Re-score above to convert them into current-engine evidence."}`),
         pat.overall.n > 0 && React.createElement("p", { className: "miss-fact" }, `Overall: ${pat.overall.mean > 0 ? "+" : ""}${pat.overall.mean.toFixed(2)} runs over ${pat.overall.n} games, noise band \u00B1${pat.overall.ci.toFixed(2)}. ${pat.overall.real ? "This clears its own noise band." : "Inside the noise band \u2014 not yet a finding."}`),
         pat.splits.length === 0
             ? React.createElement("p", { className: "dbf-note" }, "No split has 8+ games yet. Splits appear as the sample grows; treating fewer than that as a pattern is how a model gets tuned onto noise.")
@@ -19373,6 +19436,8 @@ const CSS = `
 .mr-adopt strong { font-size: 12.5px; color: var(--ink); }
 .mr-adopt p { font-size: 11px; color: var(--ink-dim); line-height: 1.45; margin-top: 3px; }
 .mr-adopt button { white-space: nowrap; }
+.mr-adopt-act { display: flex; flex-direction: column; align-items: flex-end; gap: 5px; }
+.mr-adopt-ok { font-family: 'Archivo'; font-size: 9.5px; letter-spacing: .06em; color: var(--mint); white-space: nowrap; }
 .pen-chip.out { background: rgba(232,115,79,0.12); border: 1px solid rgba(232,115,79,0.45); color: var(--rust); }
 .pen-out { font-size: 11px; color: var(--rust); line-height: 1.5; margin-top: 6px; padding-left: 9px; border-left: 2px solid rgba(232,115,79,0.4); }
 .pen-out b { color: var(--rust); }
