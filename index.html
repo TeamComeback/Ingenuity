@@ -6417,7 +6417,13 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
 // what's actually deployed. Newest first.
 // ===========================================================================
 const CHANGELOG = [
-    { date: "2026-08-23", items: [
+    { date: "2026-09-01", items: [
+            "MODEL-VS-CLOSE IS NOW THE PRIMARY ACCURACY READ. The strip and the panel lead with the model's lean against the closing total once 20+ current-engine games carry a captured close; the finals read drops to a secondary block underneath. Same rows, same maths \u2014 the change is which number you see first. A final is one draw from a ~3.5-run-wide distribution, so a 3.5 MAE against finals is near the floor a perfect model would post and mostly measures baseball. The close is the market's estimate of the same quantity at low variance: bias against it resolves in dozens of games where finals need hundreds.",
+            "Finals MAE is reported on the SAME games that have a close, so the two figures are directly comparable and the gap between them is exactly the variance the close strips out. Noise band on the close-lean is a real 95% interval from the gap distribution, not a rule of thumb.",
+            "SCAN-TIMING CHIP. Today's board shows time to the earliest remaining first pitch, how many games are already underway, and turns amber when the board has no scan today and the clock is inside three hours. 77 games and rising had been lost as 'scanned too late' \u2014 a game that starts before its board is scanned can never carry a frozen projection, and is gone from the sample permanently. This is the fastest available route to the ~1,034 games the -0.27 bias question needs.",
+            "No simulation maths touched. ENGINE_VERSION stays 2.7; the graded sample is unaffected.",
+        ] },
+        { date: "2026-08-23", items: [
             "ADOPTED RE-SCORES NOW REACH THE SPLITS. detectMissPatterns() took only log+boards, so the Debrief panel that instructs you to adopt could never show the result of adopting \u2014 it reported the same exclusion count forever no matter how many times the button was pressed. It now takes the adopted payload, folds those games in keyed on date+matchup so a natively-graded game is never double-counted, and attaches the board snapshot so park/wind/fatigue splits see them too.",
             "The splits header now reads '(N native + M re-scored)' and the exclusion warning reports how many were already converted. Nothing was broken about the saving: adoptRescore wrote to ingenuity:rescored correctly and the Brain read it. The failure was that the panel making the request was structurally blind to the answer.",
             "ADOPTION IS NOW A PERSISTED FACT. The adopted flag was useState(false), never hydrated, so the button read 'Adopt' again after every reload whether or not adoption had succeeded \u2014 a UI that cannot distinguish 'never done' from 'done and forgotten'. It now hydrates from ingenuity:rescored on mount, gated on engine version, and shows the count and date.",
@@ -16045,7 +16051,8 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
                 continue;
             const k = r.date + "|" + normName(r.away) + "@" + normName(r.home);
             seen.add(k);
-            rows2.push({ date: r.date, away: r.away, home: r.home, model: r.model, line: r.line, final: r.final, err: r.final - r.model, eng: r.eng || null });
+            rows2.push({ date: r.date, away: r.away, home: r.home, model: r.model, line: r.line, final: r.final, err: r.final - r.model, eng: r.eng || null,
+                closeLine: Number.isFinite(parseFloat(r.closeLine)) ? parseFloat(r.closeLine) : null, closeEng: r.closeEng || null });
         }
         // then any still-in-window boards not yet distilled
         for (const d of Object.keys(arch)) {
@@ -16054,13 +16061,14 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
                     const k = d + "|" + normName(g.away) + "@" + normName(g.home);
                     if (seen.has(k))
                         continue;
-                    rows2.push({ date: d, away: g.away, home: g.home, model: g.proj.model, line: g.proj.atLine, final: g.final, err: g.final - g.proj.model, eng: (g.proj.snap && g.proj.snap.eng) || null });
+                    rows2.push({ date: d, away: g.away, home: g.home, model: g.proj.model, line: g.proj.atLine, final: g.final, err: g.final - g.proj.model, eng: (g.proj.snap && g.proj.snap.eng) || null,
+                        closeLine: Number.isFinite(parseFloat(g.closeLine)) ? parseFloat(g.closeLine) : null, closeEng: g.closeEng || null });
                 }
             }
         }
         const n = rows2.length;
         if (!n)
-            return { n: 0 };
+            return { n: 0, close: { n: 0, ready: false } };
         const bias = rows2.reduce((s, r) => s + r.err, 0) / n;
         const mae = rows2.reduce((s, r) => s + Math.abs(r.err), 0) / n;
         const big = rows2.filter((r) => Math.abs(r.err) > 3.5).length;
@@ -16079,7 +16087,27 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
             mae: errs.reduce((a, b) => a + Math.abs(b), 0) / errs.length,
         })).sort((a, b) => (a.v < b.v ? 1 : -1));
         const cur = engines.find((e) => e.v === ENGINE_VERSION) || null;
-        return { n, bias, mae, big, engines, current: cur,
+        // ---- the primary read: model vs the CLOSING LINE ---------------------
+        // A final is one draw from a distribution roughly 3.5 runs wide; a 3.5-run
+        // MAE against finals is near the floor a PERFECT model would post, so it
+        // mostly measures baseball. The close is the market's estimate of the SAME
+        // quantity the model estimates, at low variance. Bias against the close
+        // resolves in dozens of games where finals need hundreds. Gated to the
+        // current engine: a close captured under v2.5 grades v2.5's number.
+        const closed = rows2.filter((r) => r.closeLine != null && (r.closeEng || "pre-2.5") === ENGINE_VERSION);
+        let close = { n: closed.length, ready: closed.length >= 20 };
+        if (closed.length) {
+            const gaps = closed.map((r) => r.model - r.closeLine);
+            const cb = gaps.reduce((s, x) => s + x, 0) / gaps.length;
+            const cm = gaps.reduce((s, x) => s + Math.abs(x), 0) / gaps.length;
+            const sd = Math.sqrt(gaps.reduce((s, x) => s + (x - cb) ** 2, 0) / Math.max(1, gaps.length - 1));
+            const ci = 1.96 * sd / Math.sqrt(gaps.length);
+            // Finals MAE on the SAME games, so the two numbers are comparable.
+            const fm = closed.reduce((s, r) => s + Math.abs(r.err), 0) / closed.length;
+            close = { n: closed.length, ready: closed.length >= 20, bias: cb, mae: cm, ci,
+                      real: Math.abs(cb) > ci && Math.abs(cb) > 0.25, finalsMae: fm };
+        }
+        return { n, bias, mae, big, engines, current: cur, close,
             rows: rows2.sort((a, b) => (a.date < b.date ? 1 : -1)) };
     };
     // Catch-up grading: a static page can't work while it's closed, so it settles
@@ -16204,22 +16232,52 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
             React.createElement("button", { className: "grade-strip", onClick: () => setGradeOpen(!gradeOpen), "aria-expanded": gradeOpen },
                 React.createElement("span", { className: "gs-label" }, "Model accuracy"),
                 acc && acc.n > 0
-                    ? React.createElement("span", { className: "gs-nums" },
-                        React.createElement("b", null, acc.n),
-                        React.createElement("i", null, "graded"),
-                        React.createElement("b", { className: biasSignal(acc.n, acc.bias, acc.mae).real ? "warn" : "" }, `${acc.bias > 0 ? "+" : ""}${acc.bias.toFixed(2)}`),
-                        React.createElement("i", null, "bias"),
-                        React.createElement("b", null, acc.mae.toFixed(2)),
-                        React.createElement("i", null, "typical miss"))
+                    ? (acc.close && acc.close.ready
+                        ? React.createElement("span", { className: "gs-nums" },
+                            React.createElement("b", null, acc.close.n),
+                            React.createElement("i", null, "vs close"),
+                            React.createElement("b", { className: acc.close.real ? "warn" : "" }, `${acc.close.bias > 0 ? "+" : ""}${acc.close.bias.toFixed(2)}`),
+                            React.createElement("i", null, "lean"),
+                            React.createElement("b", null, acc.close.mae.toFixed(2)),
+                            React.createElement("i", null, "gap"),
+                            React.createElement("i", { className: "gs-sub" }, `\u00B7 ${acc.n} vs finals`))
+                        : React.createElement("span", { className: "gs-nums" },
+                            React.createElement("b", null, acc.n),
+                            React.createElement("i", null, "graded"),
+                            React.createElement("b", { className: biasSignal(acc.n, acc.bias, acc.mae).real ? "warn" : "" }, `${acc.bias > 0 ? "+" : ""}${acc.bias.toFixed(2)}`),
+                            React.createElement("i", null, "bias"),
+                            React.createElement("b", null, acc.mae.toFixed(2)),
+                            React.createElement("i", null, "typical miss"),
+                            acc.close && React.createElement("i", { className: "gs-sub" }, `\u00B7 close ${acc.close.n}/20`)))
                     : React.createElement("span", { className: "gs-nums" }, React.createElement("i", null, "nothing graded yet")),
                 React.createElement("span", { className: "gs-caret" }, gradeOpen ? "\u25B4" : "\u25BE")),
             gradeOpen && React.createElement("div", { className: "grade-head" },
-                React.createElement("span", { className: "bc-title" }, "Graded against real finals"),
+                React.createElement("span", { className: "bc-title" }, acc && acc.close && acc.close.ready ? "Graded against the close \u00B7 then finals" : "Graded against real finals"),
                 React.createElement("button", { className: "ing-ghost", onClick: () => gradeArchive(false), disabled: grading }, grading ? "Grading…" : "Grade past boards")),
             gradeOpen && (acc && acc.n > 0 ? (React.createElement(React.Fragment, null,
-                React.createElement("div", { className: "grade-stats" },
+                acc.close && acc.close.ready && React.createElement("div", { className: "grade-stats close" },
                     React.createElement("div", null,
-                        React.createElement("em", null, "Graded"),
+                        React.createElement("em", null, "vs close"),
+                        React.createElement("strong", null, acc.close.n)),
+                    React.createElement("div", null,
+                        React.createElement("em", null, "Lean"),
+                        React.createElement("strong", { className: acc.close.real ? "neg" : "" },
+                            acc.close.bias > 0 ? "+" : "", acc.close.bias.toFixed(2), " runs")),
+                    React.createElement("div", null,
+                        React.createElement("em", null, "Gap"),
+                        React.createElement("strong", null, acc.close.mae.toFixed(2), " runs")),
+                    React.createElement("div", null,
+                        React.createElement("em", null, "Noise band"),
+                        React.createElement("strong", null, "\u00B1", acc.close.ci.toFixed(2)))),
+                acc.close && acc.close.ready && React.createElement("p", { className: "grade-note lead" }, (() => {
+                    const c = acc.close, mag = Math.abs(c.bias).toFixed(2), dir = c.bias > 0 ? "ABOVE" : "BELOW";
+                    if (c.real)
+                        return `The model sits ${mag} runs ${dir} the closing market across ${c.n} games, clearing its \u00B1${c.ci.toFixed(2)} band. That is a systematic disagreement with the sharpest public number \u2014 the one signal here that can justify a calibration look. Against finals the same games miss by ${c.finalsMae.toFixed(2)}; the close strips out the part of that which is just baseball.`;
+                    return `The model leans ${c.bias > 0 ? "+" : ""}${c.bias.toFixed(2)} runs from the close across ${c.n} games \u2014 inside its \u00B1${c.ci.toFixed(2)} band, so no real disagreement with the market yet. Typical gap to the close is ${c.mae.toFixed(2)} runs against ${c.finalsMae.toFixed(2)} to the final on the same games: the difference is variance no model removes. This is the number to watch; the finals read below is the noisy version of it.`;
+                })()),
+                React.createElement("div", { className: "grade-stats" + (acc.close && acc.close.ready ? " secondary" : "") },
+                    React.createElement("div", null,
+                        React.createElement("em", null, acc.close && acc.close.ready ? "vs finals" : "Graded"),
                         React.createElement("strong", null, acc.n)),
                     React.createElement("div", null,
                         React.createElement("em", null, "Mean error"),
@@ -16255,6 +16313,30 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
         games.length > 0 && (rows || games.some((g) => g.proj)) && (React.createElement(BoardChart, { games: games, rows: rows, onOpen: (g) => (onOpenInTerminal ? onOpenInTerminal(g) : setDetailGame(g)) })),
         detailGame && (React.createElement(GameDetail, { g: detailGame, teams: teams, dateKey: viewDate, isToday: isToday, onClose: () => setDetailGame(null) })),
         games.length > 0 && (React.createElement("div", { className: "slate-chips" },
+            // Time to first pitch. 77 games and rising were lost to "scanned too
+            // late" — a board scanned after a game starts cannot freeze a
+            // projection for it, and that game is gone from the sample forever.
+            // Amber when the board has no scan and the clock is inside 3h.
+            isToday && (() => {
+                const now = Date.now();
+                const starts = games.map((g) => Date.parse(g.start || g.firstPitch || g.sched || "")).filter((t) => Number.isFinite(t));
+                if (!starts.length) return null;
+                const pending = starts.filter((t) => t > now);
+                if (!pending.length)
+                    return React.createElement("span", { className: "slate-chip stamp" }, "all games underway");
+                const next = Math.min(...pending);
+                const min = Math.round((next - now) / 60000);
+                const txt = min >= 60 ? `${Math.floor(min / 60)}h ${String(min % 60).padStart(2, "0")}m` : `${min}m`;
+                const unscanned = !scanAt || etDayKey(new Date(scanAt)) !== todayKey;
+                const urgent = unscanned && min <= 180;
+                const gone = starts.length - pending.length;
+                return React.createElement("span", {
+                    className: "slate-chip stamp" + (urgent ? " warn" : unscanned ? " dim" : ""),
+                    title: `Earliest first pitch ${new Date(next).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}${gone ? ` \u00B7 ${gone} already started` : ""}` },
+                    urgent ? "\u26A0 unscanned \u00B7 " : "",
+                    `first pitch in ${txt}`,
+                    gone ? ` \u00B7 ${gone} underway` : "");
+            })(),
             (() => {
                 const sa = agoOf(scanAt), ma = agoOf(morningAt);
                 if (!sa && !ma)
@@ -18664,6 +18746,11 @@ const CSS = `
 .gs-label { font-family: 'Archivo'; font-size: 9.5px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-dim); white-space: nowrap; }
 .gs-nums { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 7px; flex: 1; }
 .gs-nums b { font-family: 'Archivo'; font-size: 12.5px; font-weight: 700; color: var(--ink); }
+.gs-nums .gs-sub { opacity: .55; margin-left: 4px; }
+.grade-stats.close strong { color: var(--mint); }
+.grade-stats.secondary { opacity: .72; margin-top: 10px; }
+.grade-note.lead { border-left: 2px solid var(--mint); padding-left: 10px; }
+.slate-chip.dim { opacity: .6; }
 .gs-nums b.warn { color: var(--amber); }
 .gs-nums i { font-style: normal; font-size: 9.5px; color: var(--ink-dim); margin-right: 3px; }
 .gs-caret { color: var(--ink-dim); font-size: 10px; }
