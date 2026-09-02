@@ -6417,7 +6417,14 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
 // what's actually deployed. Newest first.
 // ===========================================================================
 const CHANGELOG = [
-    { date: "2026-09-01", items: [
+    { date: "2026-09-02", items: [
+            "THE DECIDING TEST. The close-line panel now answers the question the lean alone cannot: on the same games, who was closer to the final \u2014 the model or the close? A +0.48 lean has two opposite readings. H1: the model is miscalibrated and the close is right, in which case CALIBRATION_OFFSET is the lever. H2: the market is low and the model sees it, in which case the lean is edge and calibrating it away would destroy the one thing the model exists to find. The panel now names which, with a 0.05-run tie band so a coin-flip difference is reported as a tie rather than a verdict.",
+            "Over hit rate against the close on the same games, with a \u00B1 band under p=.5. A correctly-priced market hits 50%; a market that ran low over the stretch clears the band. This is the second, independent read on H1 vs H2.",
+            "WHERE THE LEAN LIVES. The lean is split by the mechanism suspected \u2014 tired bullpens (fatigue 0.5+), weak starters (xwOBA allowed .340+), and both together \u2014 with lean, n, and model-vs-close miss inside each segment. If the lean concentrates in tired-pen games, the fix is the fatigue penalty, not a global offset; that is a more surgical correction and it points at WHY. The last column is the test inside each segment: model miss smaller than close miss there means the market is slow on that situation; larger means the model over-prices it.",
+            "Accuracy rows now carry the frozen pregame snapshot where the board is still on file, which is what makes the splits possible. Older permanent-log rows may lack one; every split reports its own n.",
+            "No parameter was changed. No simulation maths touched. ENGINE_VERSION stays 2.7. This build tells you what to do; it does not do it.",
+        ] },
+        { date: "2026-09-01", items: [
             "MODEL-VS-CLOSE IS NOW THE PRIMARY ACCURACY READ. The strip and the panel lead with the model's lean against the closing total once 20+ current-engine games carry a captured close; the finals read drops to a secondary block underneath. Same rows, same maths \u2014 the change is which number you see first. A final is one draw from a ~3.5-run-wide distribution, so a 3.5 MAE against finals is near the floor a perfect model would post and mostly measures baseball. The close is the market's estimate of the same quantity at low variance: bias against it resolves in dozens of games where finals need hundreds.",
             "Finals MAE is reported on the SAME games that have a close, so the two figures are directly comparable and the gap between them is exactly the variance the close strips out. Noise band on the close-lean is a real 95% interval from the gap distribution, not a rule of thumb.",
             "SCAN-TIMING CHIP. Today's board shows time to the earliest remaining first pitch, how many games are already underway, and turns amber when the board has no scan today and the clock is inside three hours. 77 games and rising had been lost as 'scanned too late' \u2014 a game that starts before its board is scanned can never carry a frozen projection, and is gone from the sample permanently. This is the fastest available route to the ~1,034 games the -0.27 bias question needs.",
@@ -16066,6 +16073,16 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
                 }
             }
         }
+        // Attach the frozen pregame snapshot where the board is still on file.
+        // Permanent-log rows outlive the 90-day boards, so older games may have
+        // no snapshot; the splits below report their own n for that reason.
+        for (const r of rows2) {
+            if (r.snap) continue;
+            const b = arch[r.date];
+            if (!b || !b.games) continue;
+            for (const g of b.games)
+                if (normName(g.away) === normName(r.away) && normName(g.home) === normName(r.home) && g.proj && g.proj.snap) { r.snap = g.proj.snap; break; }
+        }
         const n = rows2.length;
         if (!n)
             return { n: 0, close: { n: 0, ready: false } };
@@ -16104,8 +16121,40 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
             const ci = 1.96 * sd / Math.sqrt(gaps.length);
             // Finals MAE on the SAME games, so the two numbers are comparable.
             const fm = closed.reduce((s, r) => s + Math.abs(r.err), 0) / closed.length;
+            // ---- THE DECIDING TEST: who was closer to the final, on the SAME games?
+            // A real lean against the close has two readings. H1: the model is
+            // miscalibrated and the close is right. H2: the market is low and the
+            // model sees it. They call for opposite actions — one is a parameter
+            // fix, the other is edge you must not calibrate away — and the lean
+            // alone cannot distinguish them. This can.
+            const closeMae = closed.reduce((s, r) => s + Math.abs(r.final - r.closeLine), 0) / closed.length;
+            const decided = closed.filter((r) => r.final !== r.closeLine);
+            const overs = decided.filter((r) => r.final > r.closeLine).length;
+            const overHit = decided.length ? overs / decided.length : null;
+            // Standard error of the hit rate under p=.5 — a market that is right
+            // hits 50% and the model's Over calls are noise around it.
+            const overSe = decided.length ? Math.sqrt(0.25 / decided.length) : null;
+            const marketLow = overHit != null && (overHit - 0.5) > 1.96 * overSe;
+            const verdict = fm < closeMae - 0.05 ? "model" : closeMae < fm - 0.05 ? "close" : "tie";
+            // ---- MECHANISM SPLITS: is the lean concentrated where the thesis says?
+            const seg = (pred, label) => {
+                const inn = closed.filter((r) => r.snap && pred(r.snap)), out = closed.filter((r) => r.snap && !pred(r.snap));
+                const lean = (rs) => rs.length ? rs.reduce((s, r) => s + (r.model - r.closeLine), 0) / rs.length : null;
+                const mm = (rs) => rs.length ? rs.reduce((s, r) => s + Math.abs(r.err), 0) / rs.length : null;
+                const cmm = (rs) => rs.length ? rs.reduce((s, r) => s + Math.abs(r.final - r.closeLine), 0) / rs.length : null;
+                return { label, n: inn.length, lean: lean(inn), modelMae: mm(inn), closeMae: cmm(inn),
+                         otherN: out.length, otherLean: lean(out), withSnap: inn.length + out.length };
+            };
+            const fat = (s) => Math.max(s.aFat ?? 0, s.hFat ?? 0);
+            const weakSP = (s) => Math.max(s.aSPx ?? 0, s.hSPx ?? 0);
+            const splits = [
+                seg((s) => fat(s) >= 0.5, "Tired pen (fatigue 0.5+)"),
+                seg((s) => weakSP(s) >= 0.340, "Weak starter (xwOBA .340+)"),
+                seg((s) => fat(s) >= 0.5 && weakSP(s) >= 0.340, "Both: tired pen AND weak starter"),
+            ];
             close = { n: closed.length, ready: closed.length >= 20, bias: cb, mae: cm, ci,
-                      real: Math.abs(cb) > ci && Math.abs(cb) > 0.25, finalsMae: fm };
+                      real: Math.abs(cb) > ci && Math.abs(cb) > 0.25, finalsMae: fm,
+                      closeMae, overHit, overN: decided.length, overSe, marketLow, verdict, splits };
         }
         return { n, bias, mae, big, engines, current: cur, close,
             rows: rows2.sort((a, b) => (a.date < b.date ? 1 : -1)) };
@@ -16275,6 +16324,61 @@ Rules: total = the O/U number. over/under = American prices for Over and Under (
                         return `The model sits ${mag} runs ${dir} the closing market across ${c.n} games, clearing its \u00B1${c.ci.toFixed(2)} band. That is a systematic disagreement with the sharpest public number \u2014 the one signal here that can justify a calibration look. Against finals the same games miss by ${c.finalsMae.toFixed(2)}; the close strips out the part of that which is just baseball.`;
                     return `The model leans ${c.bias > 0 ? "+" : ""}${c.bias.toFixed(2)} runs from the close across ${c.n} games \u2014 inside its \u00B1${c.ci.toFixed(2)} band, so no real disagreement with the market yet. Typical gap to the close is ${c.mae.toFixed(2)} runs against ${c.finalsMae.toFixed(2)} to the final on the same games: the difference is variance no model removes. This is the number to watch; the finals read below is the noisy version of it.`;
                 })()),
+                acc.close && acc.close.ready && acc.close.verdict && (() => {
+                    const c = acc.close;
+                    const hit = c.overHit != null ? (c.overHit * 100).toFixed(1) : "—";
+                    const band = c.overSe != null ? (1.96 * c.overSe * 100).toFixed(1) : "—";
+                    const who = c.verdict === "model" ? "THE MODEL" : c.verdict === "close" ? "THE CLOSE" : "NEITHER";
+                    const read = c.verdict === "close"
+                        ? `On these ${c.n} games the close was closer to the final than the model (${c.closeMae.toFixed(2)} vs ${c.finalsMae.toFixed(2)} runs). The market was right and the model was adding runs it should not have. That is H1 \u2014 a calibration problem, not edge \u2014 and CALIBRATION_OFFSET is the correct lever.`
+                        : c.verdict === "model"
+                            ? `On these ${c.n} games the model was closer to the final than the close (${c.finalsMae.toFixed(2)} vs ${c.closeMae.toFixed(2)} runs). The market was low and the model saw it. That is H2 \u2014 edge, and the one thing you must NOT calibrate away. Treat this with suspicion until it survives another hundred games; beating the close by this margin is an extraordinary claim.`
+                            : `On these ${c.n} games the model and the close were equally close to the final (${c.finalsMae.toFixed(2)} vs ${c.closeMae.toFixed(2)} runs). The lean is real but it is not buying accuracy \u2014 the model disagrees with the market and neither is winning. Hold; do not fit the offset to a tie.`;
+                    return React.createElement(React.Fragment, null,
+                        React.createElement("div", { className: "grade-stats verdict" },
+                            React.createElement("div", null,
+                                React.createElement("em", null, "Closer to the final"),
+                                React.createElement("strong", { className: c.verdict === "model" ? "" : c.verdict === "close" ? "neg" : "" }, who)),
+                            React.createElement("div", null,
+                                React.createElement("em", null, "Model miss"),
+                                React.createElement("strong", null, c.finalsMae.toFixed(2), " runs")),
+                            React.createElement("div", null,
+                                React.createElement("em", null, "Close miss"),
+                                React.createElement("strong", null, c.closeMae.toFixed(2), " runs")),
+                            React.createElement("div", null,
+                                React.createElement("em", null, "Over hit vs close"),
+                                React.createElement("strong", { className: c.marketLow ? "" : "" }, hit, "%"),
+                                React.createElement("span", { className: "gs-sub" }, `\u00B1${band} \u00B7 ${c.overN} decided`))),
+                        React.createElement("p", { className: "grade-note lead" }, read,
+                            c.overHit != null ? ` Overs beat the close ${hit}% of the time${c.marketLow ? ", which clears the \u00B1" + band + "% band a fair market allows \u2014 the market genuinely ran low over this stretch." : ", inside the \u00B1" + band + "% band a fair market allows \u2014 consistent with a correctly-priced market."}` : ""),
+                        React.createElement("div", { className: "grade-splits" },
+                            React.createElement("span", { className: "bc-title" }, "Where the lean lives"),
+                            c.splits.map((s, i) => {
+                                const has = s.n >= 10 && s.otherN >= 10;
+                                const gap = has ? s.lean - s.otherLean : null;
+                                return React.createElement("div", { className: "grade-split-row", key: i },
+                                    React.createElement("span", { className: "gsr-label" }, s.label),
+                                    React.createElement("span", { className: "gsr-num" + (has && gap > 0.3 ? " warn" : "") },
+                                        s.lean != null ? `${s.lean > 0 ? "+" : ""}${s.lean.toFixed(2)}` : "\u2014",
+                                        React.createElement("i", null, ` lean \u00B7 n=${s.n}`)),
+                                    React.createElement("span", { className: "gsr-num" },
+                                        s.otherLean != null ? `${s.otherLean > 0 ? "+" : ""}${s.otherLean.toFixed(2)}` : "\u2014",
+                                        React.createElement("i", null, ` elsewhere \u00B7 n=${s.otherN}`)),
+                                    React.createElement("span", { className: "gsr-num" },
+                                        s.n ? `${s.modelMae.toFixed(2)} v ${s.closeMae.toFixed(2)}` : "\u2014",
+                                        React.createElement("i", null, " model v close miss")));
+                            }),
+                            React.createElement("p", { className: "ing-hint" }, (() => {
+                                const s0 = c.splits[0], s1 = c.splits[1];
+                                const ok = (s) => s.n >= 10 && s.otherN >= 10;
+                                if (!ok(s0) && !ok(s1)) return `Too few snapshot-carrying games in either segment to split yet (need 10 on each side). ${c.splits[0].withSnap} of ${c.n} closed games have a snapshot.`;
+                                const parts = [];
+                                if (ok(s0)) parts.push(`Tired-pen games lean ${s0.lean > 0 ? "+" : ""}${s0.lean.toFixed(2)} against ${s0.otherLean > 0 ? "+" : ""}${s0.otherLean.toFixed(2)} elsewhere${(s0.lean - s0.otherLean) > 0.3 ? " \u2014 the lean IS concentrated there, which points at the fatigue penalty rather than a global offset" : " \u2014 the lean is not concentrated there; fatigue is not the mechanism"}.`);
+                                if (ok(s1)) parts.push(`Weak-starter games lean ${s1.lean > 0 ? "+" : ""}${s1.lean.toFixed(2)} against ${s1.otherLean > 0 ? "+" : ""}${s1.otherLean.toFixed(2)} elsewhere.`);
+                                parts.push("The last column is the test that matters inside each segment: if the model's miss is smaller than the close's there, the model is right about that situation and the market is slow on it. If it is larger, the model is over-pricing it.");
+                                return parts.join(" ");
+                            })())));
+                })(),
                 React.createElement("div", { className: "grade-stats" + (acc.close && acc.close.ready ? " secondary" : "") },
                     React.createElement("div", null,
                         React.createElement("em", null, acc.close && acc.close.ready ? "vs finals" : "Graded"),
@@ -18750,6 +18854,16 @@ const CSS = `
 .grade-stats.close strong { color: var(--mint); }
 .grade-stats.secondary { opacity: .72; margin-top: 10px; }
 .grade-note.lead { border-left: 2px solid var(--mint); padding-left: 10px; }
+.grade-stats.verdict { margin-top: 12px; }
+.grade-stats.verdict .gs-sub { display: block; font-size: 9.5px; opacity: .55; margin-top: 2px; }
+.grade-splits { margin: 12px 0 4px; }
+.grade-splits .bc-title { display: block; margin-bottom: 8px; }
+.grade-split-row { display: grid; grid-template-columns: 1.6fr 1fr 1fr 1.1fr; gap: 8px; padding: 7px 0; border-top: 1px solid rgba(255,255,255,.06); font-size: 12px; align-items: baseline; }
+.gsr-label { opacity: .8; }
+.gsr-num { font-variant-numeric: tabular-nums; }
+.gsr-num i { font-style: normal; opacity: .5; font-size: 10px; }
+.gsr-num.warn { color: var(--amber, #e8a33d); }
+@media (max-width: 700px) { .grade-split-row { grid-template-columns: 1fr 1fr; } .grade-split-row .gsr-label { grid-column: 1 / -1; } }
 .slate-chip.dim { opacity: .6; }
 .gs-nums b.warn { color: var(--amber); }
 .gs-nums i { font-style: normal; font-size: 9.5px; color: var(--ink-dim); margin-right: 3px; }
