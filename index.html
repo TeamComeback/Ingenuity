@@ -6417,6 +6417,13 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
 // what's actually deployed. Newest first.
 // ===========================================================================
 const CHANGELOG = [
+    { date: "2026-10-19", items: [
+            "AUTO-REFRESH. Stats no longer have to be pasted. A scheduled GitHub Action (tools/fetch_stats.py, .github/workflows/stats.yml) pulls season batting, 14-day form, pitchers, player platoon splits, team OAA and catcher framing from Baseball Savant and the MLB Stats API every morning, and publishes them beside this page as data/stats/*.csv.",
+            "Every player is routed to his CURRENT club by MLB player id, read from each club's 40-man roster. That ends name-matching for those files, and it sidesteps a real gap: MLB's player list drops the current team for most players once their club is out of the postseason (512 of 662 hitters in October).",
+            "Database → Import → Check for new stats runs each file through the same planner a paste uses — same parsers, same timeframe guard, same contract checks — and shows one combined preview. Nothing writes until Apply. A refused file is reported and skipped.",
+            "The Action fails loudly: if any source is unreachable or comes back thin, nothing is published, so a half-refreshed stat set can never reach the app. Every refresh is a git commit, so the full history of what the model was fed is kept and can be reverted.",
+            "No simulation maths touched. ENGINE_VERSION stays 2.7; the graded sample is unaffected.",
+        ] },
     { date: "2026-09-02", items: [
             "THE DECIDING TEST. The close-line panel now answers the question the lean alone cannot: on the same games, who was closer to the final \u2014 the model or the close? A +0.48 lean has two opposite readings. H1: the model is miscalibrated and the close is right, in which case CALIBRATION_OFFSET is the lever. H2: the market is low and the model sees it, in which case the lean is edge and calibrating it away would destroy the one thing the model exists to find. The panel now names which, with a 0.05-run tie band so a coin-flip difference is reported as a tie rather than a verdict.",
             "Over hit rate against the close on the same games, with a \u00B1 band under p=.5. A correctly-priced market hits 50%; a market that ran low over the stretch clears the band. This is the second, independent read on H1 vs H2.",
@@ -10314,23 +10321,40 @@ function applyPitcherHands(hands, teams) {
 // Nothing in the file says which, so identity has to come from outside it:
 // MLB's own primaryPosition first, then any rotation this database already has
 // him on, and only then the ERA/xERA column heuristic.
-function makePitcherTest(pos, teams) {
-    const known = new Set();
+function makePitcherTest(pos, teams, rowsAre) {
+    // A file that declares its own role (the auto-refresh files are built pure:
+    // hitters only, or pitchers only) needs no guessing from names.
+    if (rowsAre === "pitchers")
+        return () => true;
+    if (rowsAre === "hitters")
+        return () => false;
+    // Which clubs list each name on their staff. Scoped by club because names
+    // collide across the league: normName strips "Jr.", so a Yankees hitter
+    // "Luis Garc\u00eda Jr." and a Twins pitcher "Luis Garc\u00eda" were one person
+    // here, and the hitter's batting rows were filed as pitching.
+    const known = new Map();
     for (const t of (teams || []))
         for (const pl of (t.rotation || []))
-            if (pl && pl.name)
-                known.add(normName(pl.name));
+            if (pl && pl.name) {
+                const k = normName(pl.name);
+                if (!known.has(k))
+                    known.set(k, new Set());
+                known.get(k).add(normName(t.name));
+            }
     return (r) => {
         const k = normName(r.name || "");
         if (pos && pos[k] === "P")
             return true;
-        if (known.has(k))
-            return true;
+        if (known.has(k)) {
+            const club = r.team ? (resolveTeamName(r.team) || r.team) : null;
+            if (!club || known.get(k).has(normName(club)))
+                return true;
+        }
         return r.era != null || r.xera != null || (r.barrel != null && r.woba == null && r.xwoba == null);
     };
 }
-function applyStatRows(rows, teams, mode = "season", rosterMap = null, posMap = null) {
-    const isPitcherRow = makePitcherTest(posMap, teams);
+function applyStatRows(rows, teams, mode = "season", rosterMap = null, posMap = null, rowsAre = null) {
+    const isPitcherRow = makePitcherTest(posMap, teams, rowsAre);
     // Auto-roster: figure out each player's team, then make sure he exists on
     // that team's roster before matching. This lets an import work even when
     // rosters are empty or thin. Two sources, in order: (1) the CSV's own team
@@ -10382,18 +10406,35 @@ function applyStatRows(rows, teams, mode = "season", rosterMap = null, posMap = 
         }
     }
     const byName = new Map();
+    // Rows whose team resolves to one of our clubs are also keyed by club, and
+    // a name that arrived WITH a club only ever matches that club's player.
+    // Without this, values were looked up league-wide by name, so a Twins
+    // pitcher's line was written onto a Yankees hitter who shares his
+    // normalized name. Rows with no resolvable club keep the old behaviour.
+    const clubKeys = new Set(teams.map((t) => normName(t.name)));
+    const byClubName = new Map(), clubbed = new Set();
     for (const r of rows) {
         const k = normName(r.name);
-        if (k)
-            byName.set(k, r);
+        if (!k)
+            continue;
+        byName.set(k, r);
+        if (r.team) {
+            const c = normName(resolveTeamName(r.team) || r.team);
+            if (clubKeys.has(c)) {
+                byClubName.set(c + "|" + k, r);
+                clubbed.add(k);
+            }
+        }
     }
     const lastIdx = new Map();
     for (const [k, v] of byName) {
         const ln = k.split(" ").pop();
         lastIdx.set(ln, lastIdx.has(ln) ? null : { k, v });
     }
-    const look = (nm) => {
+    const look = (nm, club) => {
         const n = normName(nm);
+        if (clubbed.has(n))
+            return club ? (byClubName.get(normName(club) + "|" + n) || null) : null;
         if (byName.has(n))
             return byName.get(n);
         const hit = lastIdx.get(n.split(" ").pop());
@@ -10405,7 +10446,7 @@ function applyStatRows(rows, teams, mode = "season", rosterMap = null, posMap = 
         const nextR = teams.map((t) => {
             let wSum = 0, paSum = 0, bbkSum = 0, bbkPA = 0, hit = 0;
             for (const pl of (t.players || [])) {
-                const st = look(pl.name);
+                const st = look(pl.name, t.name);
                 if (!st)
                     continue;
                 const pa = st.pa != null ? st.pa : 40; // short windows: assume a modest sample
@@ -10427,7 +10468,7 @@ function applyStatRows(rows, teams, mode = "season", rosterMap = null, posMap = 
             // form is written to its own fields and never over season stats.
             let arms = 0;
             const rot = (t.rotation || []).map((p) => {
-                const st = look(p.name);
+                const st = look(p.name, t.name);
                 if (!st || (st.era == null && st.xera == null && st.ip == null))
                     return p;
                 arms++;
@@ -10458,7 +10499,7 @@ function applyStatRows(rows, teams, mode = "season", rosterMap = null, posMap = 
     const next = teams.map((t) => {
         let changed = false;
         const players = (t.players || []).map((pl) => {
-            const st = look(pl.name);
+            const st = look(pl.name, t.name);
             if (!st)
                 return pl;
             let out = pl;
@@ -10476,7 +10517,7 @@ function applyStatRows(rows, teams, mode = "season", rosterMap = null, posMap = 
             return out;
         });
         const rotation = (t.rotation || []).map((pt) => {
-            const st = look(pt.name);
+            const st = look(pt.name, t.name);
             if (!st)
                 return pt;
             let out = pt;
@@ -11550,8 +11591,8 @@ const kindById = (id) => IMPORT_KINDS.find((k) => k.id === id) || IMPORT_KINDS[0
 // What does this file actually look like, independent of what it was called?
 // Uses the app's own pitcher test so the answer matches how the rows will
 // actually be routed — a second, private classifier would drift from it.
-function classifyStatRows(rows, teams, posMap) {
-    const isP = makePitcherTest(posMap, teams);
+function classifyStatRows(rows, teams, posMap, rowsAre) {
+    const isP = makePitcherTest(posMap, teams, rowsAre);
     let batters = 0, pitchers = 0;
     const pas = [], ips = [];
     for (const r of rows) {
@@ -11705,7 +11746,7 @@ function diffTeams(before, after) {
 // Returns { ok, err, warns, next, diff, headline }.
 // ---------------------------------------------------------------------------
 function planImport(o) {
-    const { kind, text, rows: preRows, teams, rosterMap, posMap, hand, deriveObpSlg, scope, penWindow } = o;
+    const { kind, text, rows: preRows, teams, rosterMap, posMap, hand, deriveObpSlg, scope, penWindow, rowsAre } = o;
     const fail = (err, warns) => ({ ok: false, err, warns: warns || [] });
     const scoped = (next) => {
         if (!scope)
@@ -11806,12 +11847,12 @@ function planImport(o) {
         const heads = parsed.headers || [];
         return fail(`no stat columns found. Keep the header row \u2014 it's what names the columns. Hitters need wOBA / xwOBA (or AB, H, 2B, 3B, HR, BB to build it); pitchers need ERA / xERA / IP.${heads.length ? ` Headers seen: ${heads.slice(0, 6).join(", ")}.` : ""}`);
     }
-    const info = classifyStatRows(rows, teams, posMap);
+    const info = classifyStatRows(rows, teams, posMap, rowsAre);
     const { errs, warns } = validateImport(kind, info);
     if (errs.length)
         return fail(errs.join(" "), warns);
     const tf = kindById(kind).tf || "season";
-    const res = applyStatRows(rows, teams, tf, rosterMap, posMap);
+    const res = applyStatRows(rows, teams, tf, rosterMap, posMap, rowsAre);
     if (res.seeded)
         warns.push(`${res.seeded} player${res.seeded === 1 ? "" : "s"} would be added to a roster for the first time.`);
     if (res.unroutable)
@@ -11928,6 +11969,74 @@ function SmartImport({ teams, saveTeams, onGameLine, statsFocus }) {
         }
         setBusy(false);
     };
+    // ---- AUTO-REFRESH (v2.8) ------------------------------------------------
+    // A scheduled GitHub Action (tools/fetch_stats.py) pulls Savant + MLB stats
+    // and publishes them beside this page as data/stats/*.csv, every player
+    // already routed to his current club by MLB player id. Each file then goes
+    // through planImport EXACTLY like a paste — same parsers, same timeframe
+    // guard, same contract checks — chained so each file sees the previous
+    // one's result. The combined change lands in the ordinary preview, and
+    // nothing writes until Apply. A file that is refused is reported and
+    // skipped; it never blocks the others.
+    const [autoInfo, setAutoInfo] = useState(null);
+    const previewAuto = async () => {
+        setBusy(true);
+        setMsg("");
+        setPlan(null);
+        try {
+            const bust = `?t=${Date.now()}`;
+            const r = await fetch(`data/stats/manifest.json${bust}`, { cache: "no-store" });
+            if (!r.ok)
+                throw new Error(r.status === 404 ? "nothing has been published next to this page yet" : `the manifest returned HTTP ${r.status}`);
+            const man = await r.json();
+            if (!man || man.app !== "ingenuity" || !Array.isArray(man.datasets))
+                throw new Error("that file isn't an Ingenuity stats manifest");
+            setAutoInfo(man);
+            let cur = teams;
+            const lines = [], refused = [];
+            let changed = 0;
+            for (const ds of man.datasets) {
+                const fr = await fetch(`data/stats/${ds.file}${bust}`, { cache: "no-store" });
+                if (!fr.ok) {
+                    refused.push(`${ds.label}: the file is missing (HTTP ${fr.status}).`);
+                    continue;
+                }
+                const p = planImport({ kind: ds.kind, text: await fr.text(), teams: cur, rosterMap, posMap: rosterPos,
+                    hand: null, deriveObpSlg: false, scope: null, penWindow: "season", rowsAre: ds.rowsAre || null });
+                if (p.ok) {
+                    cur = p.next;
+                    changed++;
+                    lines.push(`${ds.label} — ${p.headline}`);
+                    for (const w of (p.warns || []))
+                        lines.push(`${ds.label} — ${w}`);
+                }
+                else if (/nothing in it would change/.test(p.err || "")) {
+                    lines.push(`${ds.label} — already current, nothing to change.`);
+                }
+                else {
+                    refused.push(`${ds.label}: ${p.err}`);
+                }
+            }
+            const diff = diffTeams(teams, cur);
+            const when = `${man.season} season, data through ${man.dataThrough}`;
+            if (!diff.teams.length) {
+                setMsg(refused.length
+                    ? `Nothing applied from the ${when}. ${refused.join(" ")}`
+                    : `Already up to date — the ${when} matches what's stored.`);
+                logInterp("auto", !refused.length, refused.length ? `${refused.length} refused` : "no change");
+            }
+            else {
+                setPlan({ ok: true, auto: true, next: cur, diff,
+                    headline: `Auto-refresh — ${when}. ${changed} of ${man.datasets.length} files would change the database.`,
+                    warns: [...refused.map((x) => `REFUSED, nothing taken from it — ${x}`), ...lines] });
+            }
+        }
+        catch (e) {
+            setPlan({ ok: false, err: `Couldn't load the published stats — ${e.message}. Paste imports below still work exactly as before.`, warns: [] });
+            logInterp("auto", false, e.message);
+        }
+        setBusy(false);
+    };
     // Apply is the only thing that writes, and it reads storage back afterwards
     // rather than trusting that the call returned without throwing.
     const commit = async () => {
@@ -11949,7 +12058,7 @@ function SmartImport({ teams, saveTeams, onGameLine, statsFocus }) {
         // The conversion that actually happened. Without this the Brain's
         // interpreter card had no source of truth for anything imported through
         // the preview contract, which by now is everything.
-        logInterp(kind, ok, ok
+        logInterp(plan.auto ? "auto" : kind, ok, ok
             ? `${nt} team${nt === 1 ? "" : "s"}, ${n} value${n === 1 ? "" : "s"}`
             : (store.lastError || "write refused"));
     };
@@ -12282,6 +12391,13 @@ If none of these: {"kind":"unknown"}` },
             React.createElement("div", { className: "ing-imp-top" },
                 React.createElement("span", { className: "ing-imp-title" }, "Import"),
                 React.createElement("button", { className: "ing-imp-q", onClick: () => setHelp(!help), "aria-label": "About importing" }, help ? "×" : "?")),
+            React.createElement("div", { className: "ing-imp-auto" },
+                React.createElement("div", null,
+                    React.createElement("strong", null, "Auto-refresh"),
+                    React.createElement("p", null, autoInfo
+                        ? `Published ${String(autoInfo.generatedAt).slice(0, 10)} · ${autoInfo.season} season, data through ${autoInfo.dataThrough} · ${autoInfo.datasets.length} files`
+                        : "Season stats, 14-day form, pitchers, splits, OAA and framing — fetched daily, routed to clubs by MLB player id.")),
+                React.createElement("button", { className: "ing-run small", onClick: previewAuto, disabled: busy }, busy ? "Checking…" : "Check for new stats")),
             React.createElement("div", { className: "ing-imp-kinds" }, IMPORT_KINDS.map((k) => (React.createElement("button", { key: k.id, className: kind === k.id ? "on" : "", onClick: () => { setKind(k.id); setPlan(null); setMsg(""); } },
                 k.label,
                 React.createElement("i", null, k.sub))))),
@@ -19526,6 +19642,11 @@ const CSS = `
 .ing-imp-derive { display: flex; align-items: center; gap: 12px; margin-top: 15px; padding-top: 13px; border-top: 1px solid var(--line); }
 .ing-imp-derive strong { font-size: 12.5px; color: var(--ink); }
 .ing-imp-derive p { font-size: 11px; color: var(--ink-dim); line-height: 1.45; margin-top: 3px; }
+.ing-imp-auto { display: grid; gap: 10px; margin: 2px 0 13px; padding: 11px 12px; border: 1px solid var(--line); border-left: 3px solid var(--phos); border-radius: 9px; }
+.ing-imp-auto > div { min-width: 0; }
+.ing-imp-auto strong { font-size: 12.5px; color: var(--ink); }
+.ing-imp-auto p { font-size: 11px; color: var(--ink-dim); line-height: 1.45; margin-top: 3px; }
+.ing-imp-auto .ing-run.small { margin-top: 0; white-space: nowrap; justify-self: start; }
 .ing-imp-derive button { white-space: nowrap; padding: 9px 14px; font-size: 11px; }
 /* ---- preview card: what would change, before it changes ---- */
 .ing-prev { margin-top: 13px; background: rgba(52,230,168,0.05); border: 1px solid var(--line); border-left: 3px solid var(--phos); border-radius: 10px; padding: 12px 13px; }
