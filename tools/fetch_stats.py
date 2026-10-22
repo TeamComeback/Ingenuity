@@ -152,7 +152,10 @@ def write_csv(path, header, rows, quote_all=False):
         # quoted CSV; unquoted, it drops blanks and shifts later columns left.
         w = csv.writer(f, quoting=csv.QUOTE_ALL if quote_all else csv.QUOTE_MINIMAL)
         w.writerow(header)
-        w.writerows(rows)
+        # Fixed order. Savant's row order varies between identical requests,
+        # which made unchanged data look changed: a commit and a site redeploy
+        # every morning with nothing new in them.
+        w.writerows(sorted(rows, key=lambda r: [str(c) for c in r]))
 
 
 def et_today():
