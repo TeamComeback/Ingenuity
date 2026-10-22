@@ -1,0 +1,63 @@
+{
+  "app": "ingenuity",
+  "schema": 1,
+  "season": 2026,
+  "generatedAt": "2026-10-20T02:40:07Z",
+  "dataThrough": "2026-09-27",
+  "datasets": [
+    {
+      "file": "batters_season.csv",
+      "kind": "batters",
+      "rowsAre": "hitters",
+      "rows": 659,
+      "label": "Batters \u00b7 season",
+      "source": "Baseball Savant custom leaderboard (wOBA, xwOBA, BB%, K%)"
+    },
+    {
+      "file": "pitchers_season.csv",
+      "kind": "pitchers",
+      "rowsAre": "pitchers",
+      "rows": 812,
+      "label": "Pitchers \u00b7 season",
+      "source": "Savant expected stats (xwOBA, ERA, xERA) + Savant statcast (barrel%, hard-hit%) + MLB (IP, GS)"
+    },
+    {
+      "file": "batters_14d.csv",
+      "kind": "batters14",
+      "rowsAre": "hitters",
+      "rows": 445,
+      "label": "14-day hitters \u00b7 Sep 14\u2013Sep 27",
+      "window": {
+        "start": "2026-09-14",
+        "end": "2026-09-27"
+      },
+      "source": "MLB Stats API date range; wOBA built with the app's own linear weights"
+    },
+    {
+      "file": "splits_players.csv",
+      "kind": "psplits",
+      "rows": 1305,
+      "label": "Splits \u00b7 by player",
+      "source": "MLB Stats API statSplits (vs LHP / vs RHP); wOBA built with the app's weights"
+    },
+    {
+      "file": "team_defense.csv",
+      "kind": "teamstats",
+      "rows": 30,
+      "label": "Team \u00b7 OAA / framing / xwOBA",
+      "source": "Savant team OAA + team batting xwOBA + catcher framing summed by each catcher's CURRENT club (routed by player id)"
+    }
+  ],
+  "unrouted": {
+    "batters_season": 0,
+    "pitchers_season": 0,
+    "position_players_excluded_from_pitchers": 56,
+    "batters_14d": 0,
+    "splits_players": 0,
+    "framing_catchers": 0
+  },
+  "notes": [
+    "Every player is credited to his CURRENT club (MLB player id), the same rule the app's roster sync uses.",
+    "Framing is a season total, so a catcher traded mid-year is fully credited to his new club."
+  ]
+}

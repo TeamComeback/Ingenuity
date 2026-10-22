@@ -1,0 +1,53 @@
+name: Refresh stats
+
+# Pulls Savant + MLB stats every morning and publishes them to data/stats/,
+# where the app's "Check for new stats" button picks them up. Nothing in the
+# model changes until you preview and Apply inside the app.
+
+on:
+  schedule:
+    - cron: "15 11 * * *"   # 7:15 AM Eastern in summer, 6:15 AM in winter
+  workflow_dispatch:
+    inputs:
+      season:
+        description: "Season to fetch (blank = current year)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: refresh-stats
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch stats
+        run: |
+          if [ -n "${{ github.event.inputs.season }}" ]; then
+            python3 tools/fetch_stats.py --season "${{ github.event.inputs.season }}"
+          else
+            python3 tools/fetch_stats.py
+          fi
+
+      - name: Commit if the stats changed
+        run: |
+          # The manifest's timestamp changes on every run, so only the CSVs
+          # decide whether there is anything new worth a commit.
+          if [ -z "$(git status --porcelain -- data/stats ':!data/stats/manifest.json')" ] \
+             && git ls-files --error-unmatch data/stats/manifest.json >/dev/null 2>&1; then
+            echo "Stats unchanged — nothing to commit."
+            git checkout -- data/stats/manifest.json 2>/dev/null || true
+            exit 0
+          fi
+          git config user.name "ingenuity-stats-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/stats
+          git commit -m "stats: refresh through $(python3 -c "import json;print(json.load(open('data/stats/manifest.json'))['dataThrough'])")"
+          git push
