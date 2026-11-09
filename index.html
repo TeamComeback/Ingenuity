@@ -6417,6 +6417,14 @@ function GameDetail({ g, teams, dateKey, isToday, onClose }) {
 // what's actually deployed. Newest first.
 // ===========================================================================
 const CHANGELOG = [
+    { date: "2026-11-09", items: [
+            "OFFSEASON BACKTEST: the calibration change is REJECTED. The 2026 graded games are frozen read-only in data/season-2026/graded-games.json (701 graded, 489 on engine v2.7, Aug 13 to Oct 14). tools/backtest_calibration.py reruns everything below from that file.",
+            "Baseline v2.7 (CALIBRATION_OFFSET 0): bias +0.23 runs (model slightly low), MAE 3.41, RMSE 4.44, O/U direction right 52.4% of 462 decided games.",
+            "Calibrated, learned the way the Brain would (offset = average miss of all earlier games, min 50): bias -0.02 but MAE 3.42 and O/U 52.3%. Fixing the bias made the totals error and the hit rate slightly worse.",
+            "Out of sample: an offset of +0.46 fit on games before Sep 15 HURT the 162 games after it (MAE 2.96 to 3.01, O/U 53.6% to 52.9%) because late-season games ran 0.23 under the model. The +0.23 season bias sits inside its own 95% noise band (about -0.15 to +0.62), so it is not a real bias yet.",
+            "Closing lines captured: 0, so the H1/H2 close-line test still cannot run and closing-line value cannot be measured. Capture closes in 2027 before revisiting.",
+            "No parameter was changed. CALIBRATION_OFFSET stays 0, ENGINE_VERSION stays 2.7, and the live model is untouched.",
+        ] },
     { date: "2026-10-19", items: [
             "AUTO-REFRESH. Stats no longer have to be pasted. A scheduled GitHub Action (tools/fetch_stats.py, .github/workflows/stats.yml) pulls season batting, 14-day form, pitchers, player platoon splits, team OAA and catcher framing from Baseball Savant and the MLB Stats API every morning, and publishes them beside this page as data/stats/*.csv.",
             "Every player is routed to his CURRENT club by MLB player id, read from each club's 40-man roster. That ends name-matching for those files, and it sidesteps a real gap: MLB's player list drops the current team for most players once their club is out of the postseason (512 of 662 hitters in October).",

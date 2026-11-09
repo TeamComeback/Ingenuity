@@ -1,0 +1,59 @@
+{
+ "games": 489,
+ "first": "2026-08-13",
+ "last": "2026-10-14",
+ "with_line": 489,
+ "baseline_all": {
+  "n": 489,
+  "bias": 0.23,
+  "mae": 3.406,
+  "rmse": 4.441,
+  "ou_n": 462,
+  "ou_hit": 0.5238
+ },
+ "walkforward": {
+  "n": 489,
+  "bias": -0.021,
+  "mae": 3.423,
+  "rmse": 4.444,
+  "ou_n": 461,
+  "ou_hit": 0.5228
+ },
+ "walkforward_final_offset": 0.23,
+ "split": {
+  "date": "2026-09-15",
+  "train_n": 327,
+  "fit_offset": 0.46,
+  "baseline_test": {
+   "n": 162,
+   "bias": -0.228,
+   "mae": 2.963,
+   "rmse": 3.909,
+   "ou_n": 153,
+   "ou_hit": 0.5359
+  },
+  "calibrated_test": {
+   "n": 162,
+   "bias": -0.688,
+   "mae": 3.011,
+   "rmse": 3.963,
+   "ou_n": 153,
+   "ou_hit": 0.5294
+  }
+ },
+ "in_sample_offset": 0.23,
+ "in_sample": {
+  "n": 489,
+  "bias": 0.0,
+  "mae": 3.419,
+  "rmse": 4.435,
+  "ou_n": 464,
+  "ou_hit": 0.5259
+ },
+ "bias_95ci": [
+  -0.152,
+  0.616
+ ],
+ "verdict": "reject",
+ "closing_lines": 0
+}

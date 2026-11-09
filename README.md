@@ -27,3 +27,6 @@ Run it manually: **Actions → Refresh stats → Run workflow** (optionally with
 season), or locally with `python3 tools/fetch_stats.py`.
 
 No API keys are used or stored. This repository is public; never commit keys.
+
+## 2026 offseason backtest (frozen Nov 9, 2026)
+`data/season-2026/graded-games.json` is the read-only 2026 graded-games snapshot (701 graded, 489 on v2.7). `python3 tools/backtest_calibration.py data/season-2026/graded-games.json` compares baseline v2.7 with a CALIBRATION_OFFSET correction. Result (`backtest-calibration.json`): **rejected**. The offset removes the +0.23 bias, but totals error and O/U hit rate get slightly worse, and the bias is within noise. 0 closing lines were captured, so closing-line value can't be measured yet.
