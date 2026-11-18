@@ -28,7 +28,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Offseason guard (owner-approved in HQ): scheduled runs do nothing until March 1, 2027, then run
+      # every morning as before. A manual run always fetches. Keep the start date in sync with the HQ note.
+      - name: Offseason guard
+        id: guard
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "$(date -u +%Y-%m-%d)" \< "2027-03-01" ]; then
+            echo "Offseason: scheduled stats refresh starts on 2027-03-01."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Fetch stats
+        if: steps.guard.outputs.skip != 'true'
         run: |
           if [ -n "${{ github.event.inputs.season }}" ]; then
             python3 tools/fetch_stats.py --season "${{ github.event.inputs.season }}"
@@ -37,6 +50,7 @@ jobs:
           fi
 
       - name: Commit if the stats changed
+        if: steps.guard.outputs.skip != 'true'
         run: |
           # The manifest's timestamp changes on every run, so only the CSVs
           # decide whether there is anything new worth a commit.
