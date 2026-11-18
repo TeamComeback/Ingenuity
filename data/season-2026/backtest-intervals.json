@@ -1,0 +1,32 @@
+{
+ "games": 489,
+ "first": "2026-08-13",
+ "last": "2026-10-14",
+ "target": 0.8,
+ "v2.7_all": {
+  "n": 489,
+  "coverage": 0.8016,
+  "mean_width": 9.9
+ },
+ "narrow_all_in_sample": {
+  "k": 1.0,
+  "n": 489,
+  "coverage": 0.8016,
+  "mean_width": 9.9
+ },
+ "split": {
+  "date": "2026-09-15",
+  "train_n": 327,
+  "k_fit_on_train": 1.2,
+  "v2.7_test": {
+   "n": 162,
+   "coverage": 0.858,
+   "mean_width": 9.87
+  },
+  "narrow_test": {
+   "n": 162,
+   "coverage": 0.8765,
+   "mean_width": 11.84
+  }
+ }
+}
